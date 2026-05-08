@@ -52,6 +52,21 @@ describe('parseArgs', () => {
     const r = parseArgs(['--config=./foo.json', 'audit']);
     assert.equal(r.flags['--config'], './foo.json');
   });
+
+  it('rejects --cwd with no value (last token)', () => {
+    const r = parseArgs(['--cwd']);
+    assert.match(r.error ?? '', /missing value for --cwd/);
+  });
+
+  it('rejects --cwd when followed by another flag instead of a value', () => {
+    const r = parseArgs(['--cwd', '--verbose', 'audit']);
+    assert.match(r.error ?? '', /missing value for --cwd/);
+  });
+
+  it('rejects --config with no value', () => {
+    const r = parseArgs(['--config']);
+    assert.match(r.error ?? '', /missing value for --config/);
+  });
 });
 
 describe('run() in-process', () => {
@@ -84,6 +99,12 @@ describe('run() in-process', () => {
     const { code, stderr } = await runCli(['audit']);
     assert.equal(code, 70);
     assert.match(stderr, /not yet implemented/);
+  });
+
+  it('parser error (--cwd with no value) exits 64', async () => {
+    const { code, stderr } = await runCli(['--cwd']);
+    assert.equal(code, 64);
+    assert.match(stderr, /missing value for --cwd/);
   });
 });
 

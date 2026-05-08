@@ -8,6 +8,8 @@ export interface ParsedArgs {
   command: string | null;
   flags: Record<string, string | boolean>;
   positional: string[];
+  /** Set when argv could not be parsed (e.g. value-flag missing its value). */
+  error?: string;
 }
 
 const KNOWN_COMMANDS = new Set(['init', 'audit', 'apply', 'doctor']);
@@ -26,7 +28,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       if (eq !== -1) {
         flags[arg.slice(0, eq)] = arg.slice(eq + 1);
       } else if (VALUE_FLAGS.has(arg)) {
-        flags[arg] = argv[++i] ?? '';
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith('-')) {
+          return { command, flags, positional, error: `missing value for ${arg}` };
+        }
+        flags[arg] = next;
+        i += 1;
       } else {
         flags[arg] = true;
       }
@@ -83,6 +90,12 @@ export interface RunIO {
 
 export async function run(argv: readonly string[], io: RunIO): Promise<ExitCode> {
   const parsed = parseArgs(argv);
+
+  if (parsed.error !== undefined) {
+    io.stderr.write(`harness-haircut: ${parsed.error}\n`);
+    io.stderr.write(`Run 'harness-haircut --help' for usage.\n`);
+    return 64;
+  }
 
   if (parsed.flags['--version']) {
     io.stdout.write(`${await readPackageVersion()}\n`);
