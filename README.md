@@ -14,7 +14,7 @@ npx harness-haircut audit     # CI-friendly drift check
 
 ## Local development
 
-Requires Node.js 20 or later.
+Requires Node.js 24 or later.
 
 ```sh
 npm install

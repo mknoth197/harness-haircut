@@ -78,7 +78,7 @@ See §3 non-goals. Concretely the v1 release will not ship: Cursor / Windsurf / 
 
 **[draft default — open to revision]**
 
-- **v1 implementation:** Node.js 20+ in TypeScript, distributed via npm and runnable through `npx harness-haircut`.
+- **v1 implementation:** Node.js 24+ in TypeScript, distributed via npm and runnable through `npx harness-haircut`.
 - **Rationale:** the `npx` distribution channel is already a stated requirement; the four target providers' configuration files are markdown / JSON / TOML which Node parses ergonomically; and the primary user already has `node` installed (any team using Copilot or Claude Code in the modern toolchain has it).
 - **`uvx` distribution (post-v1):** either a Python rewrite or a published wheel that wraps the Node binary. Out of v1 scope.
 - **Build target:** ESM, single CLI binary entry, no native dependencies.

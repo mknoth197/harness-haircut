@@ -6,11 +6,11 @@
 **Labels:** `enhancement`, `foundation`
 
 ## Context
-Per [PRD §6](../PRD.md), v1 ships as a Node.js 20+ TypeScript package distributed via npm/npx. Nothing exists yet — this story stands up the package, build, lint, test, and CLI entry-point so every subsequent story has a place to land code.
+Per [PRD §6](../PRD.md), v1 ships as a Node.js 24+ TypeScript package distributed via npm/npx. Nothing exists yet — this story stands up the package, build, lint, test, and CLI entry-point so every subsequent story has a place to land code.
 
 ## Requirements (EARS)
 
-- **U1.** The package shall be a TypeScript ESM project targeting Node.js 20 or later.
+- **U1.** The package shall be a TypeScript ESM project targeting Node.js 24 or later.
 - **U2.** The package shall expose a single CLI binary `harness-haircut` whose entry script lives at `dist/bin.js`. The bin entry shall be a thin shim that calls into a pure `cli` module (so library consumers can `import { run }` without side-effects).
 - **U3.** The CLI shall accept the global flags listed in [PRD §7](../PRD.md) (`--cwd`, `--config`, `--json`, `--no-color`, `--verbose`, `--help`, `--version`).
 - **U4.** The CLI shall recognize the four v1 subcommand names (`init`, `audit`, `apply`, `doctor`) and dispatch to a registered handler.
