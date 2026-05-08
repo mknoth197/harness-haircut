@@ -1,0 +1,44 @@
+{
+  "name": "harness-haircut",
+  "version": "0.0.1",
+  "description": "Audit and consolidate redundant AI-provider configuration files into a single canonical source of truth.",
+  "type": "module",
+  "bin": {
+    "harness-haircut": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/postbuild.mjs",
+    "lint": "tsc --noEmit",
+    "test": "npm run build && node --test test/",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mknoth197/harness-haircut.git"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "claude",
+    "copilot",
+    "codex",
+    "gemini",
+    "configuration",
+    "cli"
+  ]
+}
