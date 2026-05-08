@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -104,21 +103,4 @@ export async function run(argv: readonly string[], io: RunIO): Promise<ExitCode>
   // Commands are stubs in F0; the real implementations land in C1/C2/C3 stories.
   io.stderr.write(`harness-haircut: '${parsed.command}' not yet implemented\n`);
   return 70;
-}
-
-const isMain = (() => {
-  try {
-    return process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
-  } catch {
-    return false;
-  }
-})();
-
-if (isMain) {
-  run(process.argv.slice(2), { stdout: process.stdout, stderr: process.stderr })
-    .then((code) => process.exit(code))
-    .catch((err: unknown) => {
-      process.stderr.write(`harness-haircut: ${err instanceof Error ? err.message : String(err)}\n`);
-      process.exit(70);
-    });
 }

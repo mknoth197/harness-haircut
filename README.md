@@ -20,22 +20,24 @@ Requires Node.js 20 or later.
 npm install
 npm run build      # tsc + shebang fixup
 npm test           # node --test against the built CLI
-npm run lint       # tsc --noEmit (ESLint will be added in a follow-up story)
+npm run lint       # ESLint
+npm run typecheck  # tsc --noEmit
 ```
 
-The compiled CLI lives at `dist/cli.js`. You can run it directly during development:
+The compiled binary lives at `dist/bin.js`. You can run it directly during development:
 
 ```sh
-node dist/cli.js --version
-node dist/cli.js --help
-node dist/cli.js audit       # exits 70 (not yet implemented)
+node dist/bin.js --version
+node dist/bin.js --help
+node dist/bin.js audit       # exits 70 (not yet implemented)
 ```
 
 ## Project layout
 
 ```
 src/             TypeScript sources
-  cli.ts         CLI entry, arg parser, dispatch
+  bin.ts         Executable entry — calls run() and exits with its code
+  cli.ts         Pure module: parseArgs(), run(), types
   index.ts       Library exports
 test/            Tests (node --test, plain ESM)
 scripts/         Build + repo helper scripts

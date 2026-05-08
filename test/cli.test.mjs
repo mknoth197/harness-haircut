@@ -8,7 +8,7 @@ import { parseArgs, run } from '../dist/index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
-const cliPath = resolve(repoRoot, 'dist', 'cli.js');
+const binPath = resolve(repoRoot, 'dist', 'bin.js');
 const pkgVersion = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')).version;
 
 class StringStream {
@@ -89,13 +89,13 @@ describe('run() in-process', () => {
 
 describe('built CLI binary', () => {
   it('--version via spawn matches package.json', () => {
-    const r = spawnSync(process.execPath, [cliPath, '--version'], { encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [binPath,'--version'], { encoding: 'utf8' });
     assert.equal(r.status, 0);
     assert.equal(r.stdout.trim(), pkgVersion);
   });
 
   it('audit via spawn exits 70', () => {
-    const r = spawnSync(process.execPath, [cliPath, 'audit'], { encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [binPath,'audit'], { encoding: 'utf8' });
     assert.equal(r.status, 70);
     assert.match(r.stderr, /not yet implemented/);
   });
