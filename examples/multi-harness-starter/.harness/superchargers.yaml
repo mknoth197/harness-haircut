@@ -1,0 +1,22 @@
+version: 1
+
+providers:
+  claude:
+    harness: "../../harnesses/claude"
+    uses:
+      skills: "../../shared/skills"
+      plugins: "../../shared/plugins"
+      methodologies: "../../shared/methodologies"
+  codex:
+    harness: "../../harnesses/codex"
+    uses:
+      skills: "../../shared/skills"
+      plugins: "../../shared/plugins"
+      methodologies: "../../shared/methodologies"
+  copilot:
+    harness: "../../harnesses/copilot"
+    uses:
+      skills: "../../shared/skills"
+      plugins: "../../shared/plugins"
+      methodologies: "../../shared/methodologies"
+
