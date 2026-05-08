@@ -15,7 +15,11 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 # The order matters for human readability of issue numbers; sort ensures stability.
-mapfile -t FILES < <(find "$STORY_DIR" -maxdepth 1 -name '[0-9][0-9]-*.md' | sort)
+# Use a portable while-read loop (mapfile is bash 4+, not on macOS /bin/bash).
+FILES=()
+while IFS= read -r line; do
+  FILES+=("$line")
+done < <(find "$STORY_DIR" -maxdepth 1 -name '[0-9][0-9]-*.md' | sort)
 
 for f in "${FILES[@]}"; do
   # Title is the H1 of the file.
