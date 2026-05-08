@@ -17,10 +17,10 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc && node scripts/postbuild.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/postbuild.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "npm run build && node --test \"test/**/*.test.mjs\"",
+    "test": "npm run build && node --test \"test/**/*.test.ts\"",
     "prepack": "npm run build"
   },
   "devDependencies": {

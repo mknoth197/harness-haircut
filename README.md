@@ -39,8 +39,8 @@ src/             TypeScript sources
   bin.ts         Executable entry — calls run() and exits with its code
   cli.ts         Pure module: parseArgs(), run(), types
   index.ts       Library exports
-test/            Tests (node --test, plain ESM)
-scripts/         Build + repo helper scripts
+test/            Tests (TypeScript, run via `node --test` with native type-stripping on Node 24)
+scripts/         Build + repo helper scripts (TypeScript)
 docs/
   PRD.md         Product requirements (v0.2 — see audit log at top)
   stories/       EARS user stories, one per planned issue

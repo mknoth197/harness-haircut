@@ -9,22 +9,25 @@ import { parseArgs, run } from '../dist/index.js';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
 const binPath = resolve(repoRoot, 'dist', 'bin.js');
-const pkgVersion = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')).version;
+const pkgVersion = (
+  JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')) as { version: string }
+).version;
 
 class StringStream {
-  constructor() {
-    this.data = '';
-  }
-  write(chunk) {
+  data = '';
+  write(chunk: string | Uint8Array): boolean {
     this.data += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
     return true;
   }
 }
 
-async function runCli(argv) {
+async function runCli(argv: readonly string[]) {
   const stdout = new StringStream();
   const stderr = new StringStream();
-  const code = await run(argv, { stdout, stderr });
+  const code = await run(argv, {
+    stdout: stdout as unknown as NodeJS.WritableStream,
+    stderr: stderr as unknown as NodeJS.WritableStream,
+  });
   return { code, stdout: stdout.data, stderr: stderr.data };
 }
 
@@ -110,13 +113,13 @@ describe('run() in-process', () => {
 
 describe('built CLI binary', () => {
   it('--version via spawn matches package.json', () => {
-    const r = spawnSync(process.execPath, [binPath,'--version'], { encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [binPath, '--version'], { encoding: 'utf8' });
     assert.equal(r.status, 0);
     assert.equal(r.stdout.trim(), pkgVersion);
   });
 
   it('audit via spawn exits 70', () => {
-    const r = spawnSync(process.execPath, [binPath,'audit'], { encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [binPath, 'audit'], { encoding: 'utf8' });
     assert.equal(r.status, 70);
     assert.match(r.stderr, /not yet implemented/);
   });
