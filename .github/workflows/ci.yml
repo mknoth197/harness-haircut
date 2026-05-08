@@ -22,8 +22,13 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Build before typecheck because test/ imports from ../dist/index.js
+      # to validate the built artifact end-to-end.
+      - name: Build
+        run: npm run build
+
       - name: Typecheck
         run: npm run typecheck
 
       - name: Test
-        run: npm test
+        run: node --test "test/**/*.test.ts"
