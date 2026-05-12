@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege token. CI only reads source; no writes, no deploys.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
