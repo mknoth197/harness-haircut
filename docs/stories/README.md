@@ -57,6 +57,7 @@ Each file in this directory is one user story written in EARS syntax (Easy Appro
 | Order | ID | Title | Depends on |
 |---|---|---|---|
 | 1 | F0 | [Project scaffold and CLI entry point](00-F0-project-scaffold.md) | — |
+| 1.5 | F0.5 | [Project standards & dogfood AGENTS.md](00b-F0.5-project-standards.md) | F0 |
 | 2 | F1 | [Canonical IR types and parser](01-F1-canonical-ir.md) | F0 |
 | 3 | F2 | [SignedSource header generator and verifier](02-F2-signedsource-header.md) | F0 |
 | 4 | F3 | [Provider adapter interface and registry](03-F3-provider-adapter-interface.md) | F0, F1 |
