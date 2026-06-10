@@ -12,7 +12,8 @@
 
 - **U1.** The module shall expose `embedHeader(body: string, sources: SourceManifest, syntax: CommentSyntax): string` and `verifyHeader(file: string, currentSources: SourceManifest): VerifyResult`.
 - **U2.** `BODY_HASH` shall be the lowercase hex of `SHA-256(body_after_header)`, truncated to the first 16 characters; `SOURCES_HASH` shall be the lowercase hex of `SHA-256(canonical(sources))`, truncated to the first 16 characters.
-- **U3.** `canonical(sources)` shall sort entries by `path` and join `<path>:<sha256>` with `\n`.
+- **U3.** `canonical(sources)` shall sort entries by `path` and join `<path>:<sha256>` with `\n`. *(Implementation note: exported as `canonicalManifest`.)*
+- **U5.** Bodies shall be normalized `\r\n` → `\n` before hashing in both embed and verify paths, so verification is EOL-insensitive (no false `edited` on Windows autocrlf checkouts).
 - **U4.** `embedHeader` shall produce, as the file's first line: `@generated SignedSource<<<BODY_HASH.SOURCES_HASH>>> harness-haircut DO NOT EDIT` wrapped in the supplied `syntax` (HTML comment, `#`, `//`, etc.).
 - **EV1.** When `verifyHeader` reads a file whose `BODY_HASH` matches the disk body and whose `SOURCES_HASH` matches the current manifest, it shall return `{ status: 'clean' }`.
 - **EV2.** When `verifyHeader` reads a file whose body does not match `BODY_HASH`, it shall return `{ status: 'edited' }` (regardless of the sources hash).

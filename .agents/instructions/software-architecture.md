@@ -17,16 +17,7 @@ The intermediate representation (IR) of canonical configuration. Pure data and p
 - **MUST NOT** call global APIs that produce nondeterminism: `Date.now()`, `crypto.randomUUID()`, `Math.random()`, `process.env`. Pass these in as parameters.
 - **MAY** export types, interfaces, branded types, and pure functions over those types (validators, comparators, transformers).
 
-Planned shape (lands with F1 [#4](https://github.com/mknoth197/harness-haircut/issues/4)):
-
-```ts
-// src/entities/ir.ts
-export interface Instruction { path: string; scope: string; body: string; }
-export interface Skill { name: string; description: string; body: string; files: Attachment[]; }
-export interface Hook { event: HookEvent; name: string; script: string; }
-export type HookEvent = 'pre-tool-use' | 'post-tool-use' | 'pre-commit' | 'session-start';
-export interface IR { instructions: Instruction[]; skills: Skill[]; hooks: Hook[]; }
-```
+The landed shape (F1 [#4](https://github.com/mknoth197/harness-haircut/issues/4)) lives in [`src/entities/ir.ts`](../../src/entities/ir.ts): `Instruction`, `Skill`, `Hook`, `Attachment`, and `IR` (which carries `attachments` alongside the three surfaces), plus the canonical nine-event `HookEvent` enum. That file is the source of truth — this document deliberately does not duplicate it.
 
 ### Layer 2 — Use cases (`src/use-cases/`)
 

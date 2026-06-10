@@ -23,6 +23,8 @@ The intermediate representation (IR) of canonical configuration. Pure data and p
 - **MUST NOT** call global APIs that produce nondeterminism: `Date.now()`, `crypto.randomUUID()`, `Math.random()`, `process.env`. Pass these in as parameters.
 - **MAY** export types, interfaces, branded types, and pure functions over those types.
 
+The landed IR shape (F1 #4) lives in `src/entities/ir.ts` (`Instruction`, `Skill`, `Hook`, `Attachment`, `IR`, and the canonical nine-event `HookEvent` enum) — that file is the source of truth.
+
 ### Layer 2 — Use cases (`src/use-cases/`)
 
 Application orchestration: `audit`, `apply`, `init`, `doctor`.
