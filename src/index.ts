@@ -22,6 +22,7 @@ export type { AdapterRegistry } from './adapters/registry.js';
 
 export { codexAdapter, CODEX_PROJECT_DOC_MAX_BYTES } from './adapters/codex.js';
 export { claudeAdapter } from './adapters/claude.js';
+export { geminiAdapter } from './adapters/gemini.js';
 export { SHIM_BODY, SHIM_IMPORT_LINE } from './adapters/shim.js';
 export { instructionSourceEntry, skillSourceEntry } from './adapters/source-manifest.js';
 
