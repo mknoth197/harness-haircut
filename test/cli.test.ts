@@ -1,0 +1,126 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { parseArgs, run } from '../dist/index.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, '..');
+const binPath = resolve(repoRoot, 'dist', 'bin.js');
+const pkgVersion = (
+  JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')) as { version: string }
+).version;
+
+class StringStream {
+  data = '';
+  write(chunk: string | Uint8Array): boolean {
+    this.data += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+    return true;
+  }
+}
+
+async function runCli(argv: readonly string[]) {
+  const stdout = new StringStream();
+  const stderr = new StringStream();
+  const code = await run(argv, {
+    stdout: stdout as unknown as NodeJS.WritableStream,
+    stderr: stderr as unknown as NodeJS.WritableStream,
+  });
+  return { code, stdout: stdout.data, stderr: stderr.data };
+}
+
+describe('parseArgs', () => {
+  it('parses a bare command', () => {
+    const r = parseArgs(['audit']);
+    assert.equal(r.command, 'audit');
+    assert.deepEqual(r.flags, {});
+    assert.deepEqual(r.positional, []);
+  });
+
+  it('parses boolean flags before a command', () => {
+    const r = parseArgs(['--verbose', 'audit']);
+    assert.equal(r.command, 'audit');
+    assert.equal(r.flags['--verbose'], true);
+  });
+
+  it('parses --cwd with value', () => {
+    const r = parseArgs(['--cwd', '/tmp/foo', 'audit']);
+    assert.equal(r.flags['--cwd'], '/tmp/foo');
+    assert.equal(r.command, 'audit');
+  });
+
+  it('parses --flag=value', () => {
+    const r = parseArgs(['--config=./foo.json', 'audit']);
+    assert.equal(r.flags['--config'], './foo.json');
+  });
+
+  it('rejects --cwd with no value (last token)', () => {
+    const r = parseArgs(['--cwd']);
+    assert.match(r.error ?? '', /missing value for --cwd/);
+  });
+
+  it('rejects --cwd when followed by another flag instead of a value', () => {
+    const r = parseArgs(['--cwd', '--verbose', 'audit']);
+    assert.match(r.error ?? '', /missing value for --cwd/);
+  });
+
+  it('rejects --config with no value', () => {
+    const r = parseArgs(['--config']);
+    assert.match(r.error ?? '', /missing value for --config/);
+  });
+});
+
+describe('run() in-process', () => {
+  it('--version prints the package version and exits 0', async () => {
+    const { code, stdout } = await runCli(['--version']);
+    assert.equal(code, 0);
+    assert.equal(stdout.trim(), pkgVersion);
+  });
+
+  it('--help prints usage and exits 0', async () => {
+    const { code, stdout } = await runCli(['--help']);
+    assert.equal(code, 0);
+    assert.match(stdout, /Usage:/);
+    assert.match(stdout, /Commands:/);
+  });
+
+  it('no args prints help and exits 0', async () => {
+    const { code, stdout } = await runCli([]);
+    assert.equal(code, 0);
+    assert.match(stdout, /Usage:/);
+  });
+
+  it('unknown command exits 64', async () => {
+    const { code, stderr } = await runCli(['frobnicate']);
+    assert.equal(code, 64);
+    assert.match(stderr, /unknown command/);
+  });
+
+  it('known but unimplemented command exits 70', async () => {
+    const { code, stderr } = await runCli(['audit']);
+    assert.equal(code, 70);
+    assert.match(stderr, /not yet implemented/);
+  });
+
+  it('parser error (--cwd with no value) exits 64', async () => {
+    const { code, stderr } = await runCli(['--cwd']);
+    assert.equal(code, 64);
+    assert.match(stderr, /missing value for --cwd/);
+  });
+});
+
+describe('built CLI binary', () => {
+  it('--version via spawn matches package.json', () => {
+    const r = spawnSync(process.execPath, [binPath, '--version'], { encoding: 'utf8' });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout.trim(), pkgVersion);
+  });
+
+  it('audit via spawn exits 70', () => {
+    const r = spawnSync(process.execPath, [binPath, 'audit'], { encoding: 'utf8' });
+    assert.equal(r.status, 70);
+    assert.match(r.stderr, /not yet implemented/);
+  });
+});
