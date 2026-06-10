@@ -347,6 +347,25 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
   const warnings: Warning[] = [];
   const skillFolders = new Map<string, FileSnapshot[]>();
 
+  // EV1 (#21): the gateway reports canonical-shaped paths a .gitignore rule
+  // excluded as data (it stays I/O, no Warning-minting in layer 3). The use
+  // case mints HH-W012 so `audit`/`apply` surface over-ignored canonical
+  // content instead of letting an empty IR drive destructive projections.
+  // Scope (PRD §16): no silent loss of canonical sources the walk reaches —
+  // a canonical file inside a fully-ignored directory (e.g. `vendor/`) is out
+  // of scope by design and not reported (see docs/warnings/HH-W012.md).
+  for (const excluded of snapshot.excludedCanonicalPaths ?? []) {
+    warnings.push({
+      code: 'HH-W012',
+      severity: 'warn',
+      message:
+        `${excluded} is a canonical source but is excluded by a .gitignore rule, ` +
+        'so it was not collected. Un-ignore it (e.g. add a "!" negation line) or ' +
+        'move the content if the exclusion is intentional.',
+      canonicalPath: excluded,
+    });
+  }
+
   for (const file of files) {
     const basename = file.path.slice(file.path.lastIndexOf('/') + 1);
     if (basename === 'AGENTS.md' && !file.path.startsWith('.agents/')) {

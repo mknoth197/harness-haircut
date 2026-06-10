@@ -337,15 +337,21 @@ describe('parseRepo — attachments and unknown files', () => {
     assert.equal(warnings[0]?.code, 'HH-W010');
   });
 
-  it('skips gitignored files entirely (no IR entry, no warning)', async () => {
+  it('does not collect a gitignored .agents/ file into the IR but surfaces HH-W012', async () => {
+    // Pre-#21 this was a silent skip; EV1 now surfaces the exclusion (a
+    // canonical-shaped path under .agents/ the walk reaches was dropped) so
+    // apply cannot run off an unexpectedly empty IR (PRD §16: no silent loss
+    // of canonical sources the walk reaches).
     const { ir, warnings } = await parseFixture({
       '.gitignore': 'notes.txt\n',
       'AGENTS.md': '# root',
       '.agents/notes.txt': 'ignored scratch content',
     });
     assert.deepEqual(ir.attachments, []);
-    assert.deepEqual(warnings, []);
     assert.equal(ir.instructions.length, 1);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]?.code, 'HH-W012');
+    assert.equal(warnings[0]?.canonicalPath, '.agents/notes.txt');
   });
 });
 
@@ -363,5 +369,44 @@ describe('parseRepo — whole-repo assembly', () => {
     assert.equal(ir.hooks.length, 1);
     assert.deepEqual(ir.attachments, []);
     assert.deepEqual(warnings, []);
+  });
+});
+
+describe('parseRepo — HH-W012 (canonical source excluded by .gitignore)', () => {
+  it('warns when *.md hides every AGENTS.md and yields an empty IR', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.gitignore': '*.md\n',
+      'AGENTS.md': '# root, ignored by *.md',
+    });
+    assert.deepEqual(ir.instructions, []);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]?.code, 'HH-W012');
+    assert.equal(warnings[0]?.severity, 'warn');
+    assert.equal(warnings[0]?.canonicalPath, 'AGENTS.md');
+    assert.match(warnings[0]?.message ?? '', /excluded by a \.gitignore rule/);
+  });
+
+  it('does NOT warn when a negation re-includes the excluded AGENTS.md', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.gitignore': '*.md\n!AGENTS.md\n',
+      'AGENTS.md': '# root, re-included',
+    });
+    assert.equal(ir.instructions.length, 1);
+    assert.equal(ir.instructions[0]?.path, 'AGENTS.md');
+    assert.deepEqual(
+      warnings.filter((w) => w.code === 'HH-W012'),
+      [],
+    );
+  });
+
+  it('warns with the .agents/ anchor when the whole canonical dir is ignored', async () => {
+    const { warnings } = await parseFixture({
+      '.gitignore': '.agents/\n',
+      'AGENTS.md': '# root survives',
+      '.agents/instructions/arch.md': '---\nscope: "src/**"\n---\nbody',
+    });
+    const w012 = warnings.filter((w) => w.code === 'HH-W012');
+    assert.equal(w012.length, 1);
+    assert.equal(w012[0]?.canonicalPath, '.agents/');
   });
 });

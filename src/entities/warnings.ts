@@ -12,7 +12,8 @@ export type WarningCode =
   | 'HH-W006'
   | 'HH-W007'
   | 'HH-W010'
-  | 'HH-W011';
+  | 'HH-W011'
+  | 'HH-W012';
 
 export type WarningSeverity = 'warn' | 'error';
 
@@ -36,6 +37,7 @@ export const WARNING_CATALOGUE: Readonly<Record<WarningCode, string>> = {
   'HH-W007': 'canonical surface unrepresentable for provider',
   'HH-W010': 'unknown attachment under .agents/',
   'HH-W011': 'frontmatter in AGENTS.md leaks verbatim into provider prompts',
+  'HH-W012': 'canonical source excluded by .gitignore',
 };
 
 export const WARNING_CODES: readonly WarningCode[] = Object.keys(

@@ -12,10 +12,11 @@ const EXPECTED_CODES = [
   'HH-W007',
   'HH-W010',
   'HH-W011',
+  'HH-W012',
 ];
 
 describe('warning catalogue', () => {
-  it('contains exactly the v0.3 codes', () => {
+  it('contains exactly the current codes', () => {
     assert.deepEqual([...WARNING_CODES].sort(), EXPECTED_CODES);
     assert.deepEqual(Object.keys(WARNING_CATALOGUE).sort(), EXPECTED_CODES);
   });
@@ -38,6 +39,7 @@ describe('warning catalogue', () => {
       parsed['HH-W011'],
       'frontmatter in AGENTS.md leaks verbatim into provider prompts',
     );
+    assert.equal(parsed['HH-W012'], 'canonical source excluded by .gitignore');
   });
 
   it('links every code to its docs/warnings page', () => {
