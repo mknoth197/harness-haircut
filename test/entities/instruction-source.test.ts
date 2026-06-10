@@ -10,6 +10,9 @@ import {
   recoverFromAgentsMd,
   recoverFromShim,
   recoverFromCopilotInstructions,
+  recoverFragmentFromCopilot,
+  recoverFragmentFromClaudeRule,
+  fragmentNameFromSource,
 } from '../../dist/index.js';
 
 describe('normalizeForCompare', () => {
@@ -64,5 +67,87 @@ describe('recoverFromCopilotInstructions', () => {
       recoverFromCopilotInstructions('# Hand-written\nUse pnpm.\n'),
       '# Hand-written\nUse pnpm.\n',
     );
+  });
+});
+
+describe('recoverFragmentFromCopilot (F1: applyTo -> scope)', () => {
+  it('parses a single applyTo glob into scope and keeps the body', () => {
+    const file = '---\napplyTo: "src/**"\n---\n# Security\nNo secrets in src.\n';
+    assert.deepEqual(recoverFragmentFromCopilot(file), {
+      scope: 'src/**',
+      body: '# Security\nNo secrets in src.\n',
+    });
+  });
+
+  it('comma-joins multiple applyTo globs into one scope', () => {
+    const file = '---\napplyTo: "src/**,test/**"\n---\nbody\n';
+    assert.equal(recoverFragmentFromCopilot(file)?.scope, 'src/**,test/**');
+  });
+
+  it('strips a SignedSource header emitted after the frontmatter (managed repo)', () => {
+    const file =
+      '---\napplyTo: "src/**"\n---\n' +
+      '<!-- @generated SignedSource<<<aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbb>>> harness-haircut DO NOT EDIT -->\n' +
+      '# Security\nNo secrets.\n';
+    assert.equal(recoverFragmentFromCopilot(file)?.body, '# Security\nNo secrets.\n');
+  });
+
+  it('takes the whole post-frontmatter body when no header is present (drifted repo)', () => {
+    const file = '---\napplyTo: "src/**"\n---\n# Hand-written\nstuff\n';
+    assert.equal(recoverFragmentFromCopilot(file)?.body, '# Hand-written\nstuff\n');
+  });
+
+  it('returns null when there is no applyTo frontmatter to derive a scope', () => {
+    assert.equal(recoverFragmentFromCopilot('# no frontmatter\nbody\n'), null);
+    assert.equal(recoverFragmentFromCopilot('---\nname: x\n---\nbody\n'), null);
+  });
+});
+
+describe('recoverFragmentFromClaudeRule (F1: paths -> scope)', () => {
+  it('parses an inline paths array into a comma-joined scope', () => {
+    const file = '---\npaths: ["src/**", "test/**"]\n---\n# Rule\nbody\n';
+    assert.deepEqual(recoverFragmentFromClaudeRule(file), {
+      scope: 'src/**,test/**',
+      body: '# Rule\nbody\n',
+    });
+  });
+
+  it('parses a block-sequence paths list into a comma-joined scope', () => {
+    const file = '---\npaths:\n  - src/**\n  - test/**\n---\nbody\n';
+    assert.equal(recoverFragmentFromClaudeRule(file)?.scope, 'src/**,test/**');
+  });
+
+  it('strips a SignedSource header after the frontmatter', () => {
+    const file =
+      '---\npaths: ["src/**"]\n---\n' +
+      '<!-- @generated SignedSource<<<aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbb>>> harness-haircut DO NOT EDIT -->\n' +
+      '# Rule\nbody\n';
+    assert.equal(recoverFragmentFromClaudeRule(file)?.body, '# Rule\nbody\n');
+  });
+
+  it('returns null when there is no paths frontmatter', () => {
+    assert.equal(recoverFragmentFromClaudeRule('# no frontmatter\nbody\n'), null);
+    assert.equal(recoverFragmentFromClaudeRule('---\nname: x\n---\nbody\n'), null);
+  });
+});
+
+describe('fragmentNameFromSource (F1: source filename -> canonical name)', () => {
+  it('strips the hh. prefix and the .instructions.md suffix (copilot)', () => {
+    assert.equal(
+      fragmentNameFromSource('.github/instructions/hh.security.instructions.md'),
+      'security',
+    );
+  });
+
+  it('strips a hand-written .instructions.md with no hh. prefix', () => {
+    assert.equal(fragmentNameFromSource('.github/instructions/security.instructions.md'), 'security');
+  });
+
+  it('strips the hh. prefix and the .md suffix (claude rule)', () => {
+    assert.equal(fragmentNameFromSource('.claude/rules/hh.testing.md'), 'testing');
+  });
+
+  it('handles a plain .md rule with no prefix', () => {
+    assert.equal(fragmentNameFromSource('.claude/rules/testing.md'), 'testing');
   });
 });

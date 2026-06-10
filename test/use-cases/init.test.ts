@@ -99,11 +99,11 @@ function runInit(root: string, options: RunInitOptions = {}): Promise<InitReport
   });
 }
 
-function runAudit(root: string) {
+function runAudit(root: string, excludeProviders: string[] = []) {
   const reader = createProviderFileReader(root);
   return audit({
     parse: () => parseRepo({ readRepo: () => readRepoSnapshot(root) }),
-    adapters: createAllAdapters(),
+    adapters: createAllAdapters().filter((adapter) => !excludeProviders.includes(adapter.id)),
     reader,
     contextFor: contextFactory(root, reader),
   });
@@ -298,6 +298,164 @@ describe('init() — skill carry-over', () => {
     // Candidates are provider-sorted: claude < codex, so index 0 is the Claude variant.
     assert.match(written, /Claude variant\./);
     assert.doesNotMatch(written, /Codex variant\./);
+  });
+});
+
+function runApply(root: string) {
+  const reader = createProviderFileReader(root);
+  const writer = createFileWriter(root);
+  const adapters = createAllAdapters();
+  return apply({
+    parse: () => parseRepo({ readRepo: () => readRepoSnapshot(root) }),
+    adapters,
+    reader,
+    writer,
+    contextFor: contextFactory(root, reader),
+    isDirty: () => Promise.resolve(false),
+    confirm: () => Promise.resolve(false),
+    readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
+    writeState: (state: ApplyState): void => writer.write(APPLY_STATE_PATH, serializeState(state)),
+    flags: { allowDirty: true, dryRun: false, nonInteractive: true },
+  });
+}
+
+describe('init() — F1 scoped fragment recovery', () => {
+  it('recovers a Copilot *.instructions.md fragment into canonical .agents/instructions/<name>.md', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    const fragmentPath = join(repo.root, '.agents', 'instructions', 'security.md');
+    assert.equal(existsSync(fragmentPath), true);
+    const written = await readFile(fragmentPath, 'utf8');
+    assert.match(written, /scope: "src\/\*\*"/);
+    assert.match(written, /Never log secrets\./);
+    // it is consolidated, no per-fragment "left in place" note for recovered ones.
+    assert.ok(!report.notes.some((n) => /could not recover/i.test(n)));
+  });
+
+  it('after recovery, audit() exits 0 and a follow-up apply does NOT clobber the orphan as unmanaged', async () => {
+    // A harness-prefixed orphan (`hh.*`) is exactly an apply-OWNED path that
+    // would otherwise be overwritten as `unmanaged` (apply.ts:224) with no
+    // prompt. Recovery gives it canonical backing so apply re-projects it.
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.github/instructions/hh.security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    await runInit(repo.root);
+
+    // Gemini cannot path-scope any fragment (HH-W007 → exit 2), which is
+    // inherent to scoped fragments and orthogonal to recovery correctness, so
+    // we exclude it to assert the recovered fragment audits clean.
+    const auditReport = await runAudit(repo.root, ['gemini']);
+    assert.equal(auditReport.exitCode, 0);
+
+    // The orphan path now has canonical backing: a second apply sees it clean,
+    // never "unmanaged" (the silent-clobber path the fix closes).
+    const followUp = await runApply(repo.root);
+    const copilotEntry = followUp.files.find(
+      (f) => f.path === '.github/instructions/hh.security.instructions.md',
+    );
+    assert.ok(copilotEntry !== undefined);
+    assert.notEqual(copilotEntry.reason, 'unmanaged');
+  });
+
+  it('surfaces ONE fragment:<name> contradiction when copilot and claude disagree on the same name', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nCopilot variant.\n',
+      '.claude/rules/security.md': '---\npaths: ["src/**"]\n---\n# Security\n\nClaude variant.\n',
+    });
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, {
+      resolverCalls,
+      resolve: { 'fragment:security': { kind: 'choose', index: 0 } },
+    });
+    assert.equal(report.exitCode, 0);
+    const fragmentSlots = report.contradictions.filter((c) => c.slot === 'fragment:security');
+    assert.equal(fragmentSlots.length, 1);
+    assert.ok(resolverCalls.includes('fragment:security'));
+    // Candidates provider-sorted: claude < copilot, so index 0 is the Claude variant.
+    const written = await readFile(
+      join(repo.root, '.agents', 'instructions', 'security.md'),
+      'utf8',
+    );
+    assert.match(written, /Claude variant\./);
+    assert.doesNotMatch(written, /Copilot variant\./);
+  });
+
+  it('does NOT prompt when same-named fragments from two providers agree (EV1)', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nShared.\n',
+      '.claude/rules/security.md': '---\npaths: ["src/**"]\n---\n# Security\n\nShared.\n',
+    });
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, { resolverCalls });
+    assert.equal(report.exitCode, 0);
+    assert.deepEqual(resolverCalls, []);
+    assert.ok(report.contradictions.every((c) => c.slot !== 'fragment:security'));
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'security.md')), true);
+  });
+
+  it('surfaces an unparseable fragment (no paths:/applyTo:) in notes rather than dropping it', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.claude/rules/x.md': '# No frontmatter here\n\nfree-floating prose.\n',
+    });
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    assert.ok(report.notes.some((n) => /could not recover/i.test(n) && /\.claude\/rules\/x\.md/.test(n)));
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'x.md')), false);
+  });
+});
+
+describe('init() — F2 non-chosen candidate backup', () => {
+  it('backs up the non-chosen (superset) candidate and reports the backup path', async () => {
+    const repo = await setup({
+      // claude (A) is a subset; copilot (B) is a superset with extra unique content.
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm test.\n',
+      '.github/copilot-instructions.md':
+        '# A\nUse npm test.\n\n## Extra B-only section\nCritical reviewer guidance.\n',
+    });
+    // Candidates provider-sorted: claude (index 0) before copilot (index 1).
+    const report = await runInit(repo.root, {
+      resolve: { 'root-instructions': { kind: 'choose', index: 0 } }, // choose A
+    });
+    assert.equal(report.exitCode, 0);
+
+    const backupPath = join(repo.root, '.harness-haircut-init-backup', '.github__copilot-instructions.md');
+    assert.equal(existsSync(backupPath), true);
+    const backedUp = await readFile(backupPath, 'utf8');
+    assert.match(backedUp, /Critical reviewer guidance\./);
+
+    // The report lists the backup so --json and the human report both surface it.
+    assert.ok(report.backups.includes('.harness-haircut-init-backup/.github__copilot-instructions.md'));
+    assert.ok(report.notes.some((n) => /backed up/i.test(n) && /copilot-instructions/.test(n)));
+
+    // The chosen candidate (A) is canonical; B's superset content is NOT in AGENTS.md.
+    const canonical = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(canonical, /Critical reviewer guidance\./);
+  });
+
+  it('does NOT write backups under --dry-run', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm test.\n',
+      '.github/copilot-instructions.md': '# A\nUse pnpm test.\n',
+    });
+    const report = await runInit(repo.root, {
+      dryRun: true,
+      resolve: { 'root-instructions': { kind: 'choose', index: 0 } },
+    });
+    assert.equal(report.exitCode, 0);
+    assert.deepEqual(report.backups, []);
+    assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
   });
 });
 

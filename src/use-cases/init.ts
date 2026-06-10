@@ -13,15 +13,21 @@
  *      `AGENTS.md` is itself a generated/projected file), fail (exit 1) and
  *      recommend `apply` — init is for onboarding a NON-canonical repo.
  *   3. build a *candidate* canonical IR by union: recover root-instruction
- *      text from each existing file (EV1 agree → no prompt) and carry skills
- *      over by name.
- *   4. identify contradictions (EV2: a slot whose candidates disagree).
+ *      text from each existing file (EV1 agree → no prompt), recover per-file
+ *      SCOPED instruction fragments (`.github/instructions/*.instructions.md`
+ *      via `applyTo:`, `.claude/rules/*.md` via `paths:`) into canonical
+ *      `.agents/instructions/<name>.md`, and carry skills over by name.
+ *   4. identify contradictions (EV2: a slot whose candidates disagree —
+ *      `root-instructions`, `skill:<name>`, or `fragment:<name>`).
  *   5. resolve them — interactively (EV3) or, under `--non-interactive`, fail
  *      on the first contradiction listing them all (OPT1, exit 1).
  *   6. OPT2 `--dry-run`: report the planned layout and STOP — write nothing,
  *      do not call `apply`.
- *   7. write canonical `AGENTS.md` (+ `.agents/skills/*`), then invoke `apply`
- *      to project everything; report the planned layout + the apply result.
+ *   7. before projecting: back up every NON-chosen contradiction candidate's
+ *      original text to `.harness-haircut-init-backup/<sanitized-path>` (F2,
+ *      no silent loss), then write canonical `AGENTS.md`, the recovered
+ *      `.agents/instructions/*` fragments, and `.agents/skills/*`, then invoke
+ *      `apply` to project everything; report the planned layout + apply result.
  *
  * Scoped deviations (documented in the C3 PR): provider HOOK configs are not
  * reverse-engineered into canonical hooks (their formats are lossy to invert)
@@ -52,10 +58,14 @@ import type {
 } from '../entities/contradiction.js';
 import type { FileWriter } from '../entities/file-writer.js';
 import {
+  fragmentNameFromSource,
   normalizeForCompare,
+  recoverFragmentFromClaudeRule,
+  recoverFragmentFromCopilot,
   recoverFromAgentsMd,
   recoverFromCopilotInstructions,
   recoverFromShim,
+  type RecoveredFragment,
 } from '../entities/instruction-source.js';
 import { detectHeaderPlacement } from '../entities/signed-source.js';
 
@@ -105,6 +115,13 @@ export interface InitReport {
    * code — it is advice, not a lossy translation.
    */
   notes: string[];
+  /**
+   * F2 (no silent loss): repo-relative paths of the backup files init wrote for
+   * non-chosen contradiction candidates (under `.harness-haircut-init-backup/`).
+   * Empty on `--dry-run` (backups are skipped there) and when nothing was
+   * displaced. `--json` surfaces this so the recovery location is machine-readable.
+   */
+  backups: string[];
   /** The `apply` result, when init proceeded to project (absent on refuse/dry-run). */
   apply?: ApplyReport;
 }
@@ -146,6 +163,49 @@ const SKILL_SOURCE_ROOTS: { prefix: string; providerId: ProviderId }[] = [
   { prefix: '.claude/skills/', providerId: 'claude' },
   { prefix: '.codex/skills/', providerId: 'codex' },
 ];
+
+/**
+ * F1 — scoped instruction fragment source roots. Each provider stores per-file
+ * scoped instructions in its own directory and frontmatter dialect; `recover`
+ * parses that dialect (Copilot `applyTo:`, Claude `paths:`) into a canonical
+ * `{ scope, body }`, or returns `null` when the file carries no scope to derive
+ * (surfaced as a note, never dropped).
+ */
+const FRAGMENT_SOURCE_ROOTS: {
+  prefix: string;
+  providerId: ProviderId;
+  matches: (path: string) => boolean;
+  recover: (content: string) => RecoveredFragment | null;
+}[] = [
+  {
+    prefix: '.github/instructions/',
+    providerId: 'copilot',
+    // Skip the nested-AGENTS.md projection (`hh.nested-*`): its canonical home
+    // is a nested AGENTS.md, not a `.agents/instructions/` fragment.
+    matches: (path) =>
+      path.startsWith('.github/instructions/') &&
+      path.endsWith('.instructions.md') &&
+      !path.slice('.github/instructions/'.length).startsWith('hh.nested-'),
+    recover: recoverFragmentFromCopilot,
+  },
+  {
+    prefix: '.claude/rules/',
+    providerId: 'claude',
+    matches: (path) => path.startsWith('.claude/rules/') && path.endsWith('.md'),
+    recover: recoverFragmentFromClaudeRule,
+  },
+];
+
+/** One recovered scoped fragment candidate, keyed under `.agents/instructions/<name>.md`. */
+interface DiscoveredFragment {
+  /** Canonical fragment name (the `.agents/instructions/<name>.md` stem). */
+  name: string;
+  providerId: ProviderId;
+  /** Repo-relative path of the source provider file. */
+  sourcePath: string;
+  scope: string;
+  body: string;
+}
 
 function byPath(a: { path: string }, b: { path: string }): number {
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
@@ -244,6 +304,71 @@ function discoverSkills(snapshot: RepoSnapshot): Map<string, DiscoveredSkill[]> 
   return byName;
 }
 
+/**
+ * F1 — discovers scoped instruction fragments across the provider fragment
+ * roots, grouped by canonical name. A name recovered from several providers
+ * with byte-identical (normalized) scope+body collapses to one (EV1); differing
+ * copies under one name become a `fragment:<name>` contradiction. Files under a
+ * fragment root with NO parseable scope are collected separately so the caller
+ * can surface them in notes rather than drop them.
+ */
+function discoverFragments(snapshot: RepoSnapshot): {
+  byName: Map<string, DiscoveredFragment[]>;
+  unparseable: string[];
+} {
+  const byName = new Map<string, DiscoveredFragment[]>();
+  const unparseable: string[] = [];
+  const sorted = [...snapshot.files].sort(byPath);
+  for (const root of FRAGMENT_SOURCE_ROOTS) {
+    for (const file of sorted) {
+      if (!root.matches(file.path)) {
+        continue;
+      }
+      const recovered = root.recover(file.content);
+      if (recovered === null) {
+        unparseable.push(file.path);
+        continue;
+      }
+      const name = fragmentNameFromSource(file.path);
+      const discovered: DiscoveredFragment = {
+        name,
+        providerId: root.providerId,
+        sourcePath: file.path,
+        scope: recovered.scope,
+        body: recovered.body,
+      };
+      const existing = byName.get(name);
+      if (existing === undefined) {
+        byName.set(name, [discovered]);
+      } else {
+        existing.push(discovered);
+      }
+    }
+  }
+  return { byName, unparseable };
+}
+
+/** Canonical `.agents/instructions/<name>.md` text: a `scope:` frontmatter over the body. */
+function fragmentCanonicalText(fragment: DiscoveredFragment): string {
+  const body = fragment.body.startsWith('\n') ? fragment.body.slice(1) : fragment.body;
+  return `---\nscope: ${JSON.stringify(fragment.scope)}\n---\n${body}`;
+}
+
+/** Comparison key for fragment agreement (EV1): scope plus the normalized body. */
+function fragmentNormalized(fragment: DiscoveredFragment): string {
+  return `${fragment.scope}\n${normalizeForCompare(fragment.body)}`;
+}
+
+/** A fragment candidate as a `CandidateText` for the shared contradiction machinery. */
+function fragmentCandidate(fragment: DiscoveredFragment): CandidateText {
+  return {
+    providerId: fragment.providerId,
+    path: fragment.sourcePath,
+    text: fragmentCanonicalText(fragment),
+    normalizedText: fragmentNormalized(fragment),
+  };
+}
+
 /** True when every candidate's normalized text is byte-identical (EV1). */
 function allAgree(candidates: CandidateText[]): boolean {
   if (candidates.length === 0) {
@@ -285,12 +410,15 @@ export async function init(deps: InitDeps): Promise<InitReport> {
           'generated root AGENTS.md). init onboards a non-canonical repo — run ' +
           '`harness-haircut apply` to refresh projections instead.',
       ],
+      backups: [],
     };
   }
 
   // ---- step 3: build candidate canonical IR by union ----
   const rootCandidates = gatherRootCandidates(deps.reader);
   const skillsByName = discoverSkills(snapshot);
+  const { byName: fragmentsByName, unparseable: unparseableFragments } =
+    discoverFragments(snapshot);
 
   // ---- step 4: identify contradictions (EV1 agree → none; EV2 disagree) ----
   const contradictions: Contradiction[] = [];
@@ -320,6 +448,24 @@ export async function init(deps: InitDeps): Promise<InitReport> {
       skillContradictions.set(name, contradiction);
     }
   }
+  // F1: scoped fragments share the contradiction machinery under their own
+  // `fragment:<name>` namespace (distinct from root/skill slots).
+  const fragmentContradictions = new Map<string, Contradiction>();
+  for (const [name, discovered] of [...fragmentsByName].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (discovered.length < 2) {
+      continue;
+    }
+    const candidates = discovered.map(fragmentCandidate).sort(byProvider);
+    if (!allAgree(candidates)) {
+      const contradiction: Contradiction = {
+        slot: `fragment:${name}`,
+        candidates,
+        plusSkip: true,
+      };
+      contradictions.push(contradiction);
+      fragmentContradictions.set(name, contradiction);
+    }
+  }
 
   // ---- step 5: OPT1 non-interactive fails on any contradiction ----
   if (flags.nonInteractive && contradictions.length > 0) {
@@ -334,6 +480,7 @@ export async function init(deps: InitDeps): Promise<InitReport> {
         `--non-interactive cannot resolve ${contradictions.length} contradiction(s); ` +
           're-run interactively or reconcile the listed files by hand.',
       ],
+      backups: [],
     };
   }
 
@@ -352,6 +499,7 @@ export async function init(deps: InitDeps): Promise<InitReport> {
         contradictions,
         planned: [],
         notes: [`contradiction "${contradiction.slot}" was left unresolved; nothing was written.`],
+        backups: [],
       };
     }
     resolutionBySlot.set(contradiction.slot, resolution);
@@ -411,10 +559,46 @@ export async function init(deps: InitDeps): Promise<InitReport> {
     }
   }
 
+  // ---- decide the canonical scoped fragments (F1) ----
+  const plannedFragmentWrites: { path: string; content: string; origin: string }[] = [];
+  for (const [name, discoveredRaw] of [...fragmentsByName].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    // Sort identically to the contradiction's candidate order so a `choose`
+    // index resolves to the same fragment the resolver was shown.
+    const discovered = [...discoveredRaw].sort((a, b) =>
+      a.providerId < b.providerId ? -1 : a.providerId > b.providerId ? 1 : 0,
+    );
+    const contradiction = fragmentContradictions.get(name);
+    let chosen: DiscoveredFragment | null;
+    let origin: string;
+    if (contradiction === undefined) {
+      // EV1: identical (or single) → carry the first/only copy, no prompt.
+      chosen = discovered[0]!;
+      origin =
+        discovered.length > 1
+          ? `agreed (${discovered.map((f) => f.providerId).join(', ')})`
+          : chosen.providerId;
+    } else {
+      const resolution = resolutionBySlot.get(`fragment:${name}`)!;
+      chosen = resolution.kind === 'choose' ? discovered[resolution.index] ?? null : null;
+      origin = resolution.kind === 'choose' ? `chose ${chosen?.providerId ?? '?'}` : 'skipped';
+    }
+    if (chosen === null) {
+      continue;
+    }
+    plannedFragmentWrites.push({
+      path: `.agents/instructions/${name}.md`,
+      content: fragmentCanonicalText(chosen),
+      origin,
+    });
+  }
+
   // ---- assemble the planned layout ----
   const planned: PlannedFile[] = [];
   if (rootText !== null) {
     planned.push({ path: 'AGENTS.md', origin: rootOrigin });
+  }
+  for (const write of plannedFragmentWrites) {
+    planned.push({ path: write.path, origin: write.origin });
   }
   for (const write of plannedSkillWrites) {
     planned.push({ path: write.path, origin: write.origin });
@@ -422,8 +606,25 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- carried-over hooks note (scoped deviation: not reverse-engineered) ----
   const notes = hookNotes(detected);
+  // F1: a fragment we could not parse a scope from is never dropped silently —
+  // it stays in place and we tell the user to give it canonical backing by hand.
+  if (unparseableFragments.length > 0) {
+    notes.push(
+      `could not recover ${unparseableFragments.length} scoped instruction file(s) ` +
+        `(${unparseableFragments.sort().join(', ')}) — no applyTo:/paths: frontmatter to derive a ` +
+        'scope from. They were left in place; add `scope:` frontmatter under .agents/instructions/ ' +
+        'by hand and re-run `harness-haircut apply` to bring them under canonical ownership.',
+    );
+  }
 
-  // ---- step 6: OPT2 dry-run stops here ----
+  // ---- F2: compute the per-contradiction backup plan (non-chosen candidates) ----
+  const backupPlan = planBackups(contradictions, resolutionBySlot);
+  const backups = backupPlan.map((b) => b.path);
+  for (const note of backupNotes(contradictions, resolutionBySlot)) {
+    notes.push(note);
+  }
+
+  // ---- step 6: OPT2 dry-run stops here (no backups written either) ----
   if (flags.dryRun) {
     return {
       exitCode: 0,
@@ -432,12 +633,21 @@ export async function init(deps: InitDeps): Promise<InitReport> {
       contradictions,
       planned,
       notes,
+      backups: [],
     };
   }
 
-  // ---- step 7: write canonical layout, then project via injected apply ----
+  // ---- step 7: back up non-chosen candidates (F2), then write + project ----
+  // Backups go OUTSIDE the canonical tree at the repo root so the parser walk
+  // (AGENTS.md + .agents/**) never reads them back into IR — see planBackups.
+  for (const backup of backupPlan) {
+    deps.writer.write(backup.path, backup.content);
+  }
   if (rootText !== null) {
     deps.writer.write('AGENTS.md', rootText);
+  }
+  for (const write of plannedFragmentWrites) {
+    deps.writer.write(write.path, write.content);
   }
   for (const write of plannedSkillWrites) {
     deps.writer.write(write.path, write.content);
@@ -452,6 +662,7 @@ export async function init(deps: InitDeps): Promise<InitReport> {
     contradictions,
     planned,
     notes,
+    backups,
     apply: applyReport,
   };
 }
@@ -489,4 +700,78 @@ function hookNotes(detected: { providerId: ProviderId; paths: string[] }[]): str
       'harness-haircut does not reverse-engineer provider hooks into canonical hooks in v1. ' +
       'Author canonical hooks under .agents/hooks/ and re-run `harness-haircut apply`.',
   ];
+}
+
+/**
+ * F2 — the backup directory lives at the REPO ROOT, deliberately OUTSIDE
+ * `.agents/`. The parser walk (`readRepoSnapshot` → `parseRepo`) only collects
+ * `AGENTS.md` at any depth plus everything under root `.agents/`, so a
+ * top-level `.harness-haircut-init-backup/` is never read back into IR or
+ * re-projected by the follow-up `apply`. (Placing backups under `.agents/`
+ * would be walked — the `.harness-state.json` skip lives in `parse-repo.ts`,
+ * which this PR must not touch — so the root location is the safe choice.)
+ */
+const INIT_BACKUP_DIR = '.harness-haircut-init-backup';
+
+/** Maps a source path to a flat, filesystem-safe backup filename. */
+function sanitizeBackupName(path: string): string {
+  return path.replace(/[/\\]/g, '__');
+}
+
+/**
+ * F2 — for every resolved contradiction, the candidates the user did NOT pick
+ * (all candidates on a skip; everyone but the chosen index otherwise) have their
+ * ORIGINAL text preserved under the repo-root backup dir, so consolidation never
+ * destroys content unrecoverably. `text` is the original candidate text.
+ */
+function planBackups(
+  contradictions: Contradiction[],
+  resolutionBySlot: Map<string, Resolution>,
+): { path: string; content: string }[] {
+  const plan: { path: string; content: string }[] = [];
+  for (const contradiction of contradictions) {
+    const resolution = resolutionBySlot.get(contradiction.slot);
+    if (resolution === undefined) {
+      continue;
+    }
+    contradiction.candidates.forEach((candidate, index) => {
+      if (resolution.kind === 'choose' && resolution.index === index) {
+        return; // the chosen candidate becomes canonical — no backup needed.
+      }
+      plan.push({
+        path: `${INIT_BACKUP_DIR}/${sanitizeBackupName(candidate.path)}`,
+        content: candidate.text,
+      });
+    });
+  }
+  return plan;
+}
+
+/** Human-readable note per resolved contradiction listing which sources were backed up. */
+function backupNotes(
+  contradictions: Contradiction[],
+  resolutionBySlot: Map<string, Resolution>,
+): string[] {
+  const notes: string[] = [];
+  for (const contradiction of contradictions) {
+    const resolution = resolutionBySlot.get(contradiction.slot);
+    if (resolution === undefined) {
+      continue;
+    }
+    const notChosen = contradiction.candidates.filter(
+      (_candidate, index) => !(resolution.kind === 'choose' && resolution.index === index),
+    );
+    if (notChosen.length === 0) {
+      continue;
+    }
+    const sources = notChosen
+      .map((c) => `${c.path} -> ${INIT_BACKUP_DIR}/${sanitizeBackupName(c.path)}`)
+      .join(', ');
+    const verb = resolution.kind === 'choose' ? 'not chosen' : 'skipped';
+    notes.push(
+      `contradiction "${contradiction.slot}": ${notChosen.length} ${verb} candidate(s) ` +
+        `had their original content backed up (${sources}).`,
+    );
+  }
+  return notes;
 }

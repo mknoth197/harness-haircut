@@ -408,12 +408,41 @@ function renderApplyReport(report: ApplyReport): string {
 }
 
 /**
+ * Multi-line candidate preview for the resolver (C3 F2): the first 12 lines
+ * (capped at ~400 chars total) of the candidate's ORIGINAL text, so the choice
+ * between contradicting candidates is informed rather than a 60-char teaser.
+ * Trailing whitespace is trimmed and a truncation marker is appended when the
+ * candidate is longer than the preview shows.
+ */
+function previewCandidate(text: string): string[] {
+  const MAX_LINES = 12;
+  const MAX_CHARS = 400;
+  const allLines = text.replace(/\s+$/, '').split('\n');
+  const shown = allLines.slice(0, MAX_LINES).map((line) => line.trimEnd());
+  let total = 0;
+  const out: string[] = [];
+  for (const line of shown) {
+    if (total + line.length > MAX_CHARS) {
+      out.push(`${line.slice(0, Math.max(0, MAX_CHARS - total))}…`);
+      total = MAX_CHARS;
+      break;
+    }
+    out.push(line);
+    total += line.length;
+  }
+  if (allLines.length > out.length || total >= MAX_CHARS) {
+    out.push('… (truncated — see the full file)');
+  }
+  return out.length === 0 ? ['(empty)'] : out;
+}
+
+/**
  * Interactive contradiction resolver for `init` (C3 EV2/EV3) over
  * `node:readline` — a numbered-choice prompt rather than the `prompts` /
  * `@inquirer/prompts` dependency the story names, to keep PRD goal 5's
  * zero-runtime-deps promise. The use case (layer 2) stays pure; this layer-4
  * function is the only place that touches stdin. It lists each candidate
- * (provider + path + a short preview) plus a final "skip / write blank"
+ * (provider + path + a multi-line preview) plus a final "skip / write blank"
  * option, reads one number, and maps it to a `Resolution`. An out-of-range
  * answer, empty input, or EOF (Ctrl-D / piped stdin exhausted) resolves to
  * `{ kind: 'unresolved' }`, which fails the run (OPT1) without writing.
@@ -425,8 +454,11 @@ function readlineResolver(io: RunIO): (contradiction: Contradiction) => Promise<
       const lines: string[] = [];
       lines.push(`Contradiction in "${contradiction.slot}" — pick the canonical answer:`);
       contradiction.candidates.forEach((candidate, index) => {
-        const preview = candidate.text.replace(/\s+/g, ' ').trim().slice(0, 60);
-        lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}): ${preview}`);
+        const preview = previewCandidate(candidate.text);
+        lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}):`);
+        for (const previewLine of preview) {
+          lines.push(`       ${previewLine}`);
+        }
       });
       const skipChoice = contradiction.candidates.length + 1;
       lines.push(`  ${skipChoice}) skip / write blank for this slot`);
@@ -561,6 +593,20 @@ function renderInitReport(report: InitReport): string {
     lines.push(`${verb} ${report.planned.length} canonical file(s):`);
     for (const file of report.planned) {
       lines.push(`  ${file.path}\t[${file.origin}]`);
+    }
+  }
+
+  if (report.backups.length > 0) {
+    const backupSet = new Set(report.backups);
+    lines.push('');
+    lines.push('preserved non-chosen candidates (originals backed up):');
+    for (const contradiction of report.contradictions) {
+      for (const candidate of contradiction.candidates) {
+        const backupPath = `.harness-haircut-init-backup/${candidate.path.replace(/[/\\]/g, '__')}`;
+        if (backupSet.has(backupPath)) {
+          lines.push(`  ${contradiction.slot}: ${candidate.path} -> ${backupPath}`);
+        }
+      }
     }
   }
 
