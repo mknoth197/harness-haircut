@@ -42,5 +42,17 @@ export type {
   DriftStatus,
 } from './use-cases/audit.js';
 
+export { apply } from './use-cases/apply.js';
+export type {
+  ApplyDeps,
+  ApplyFlags,
+  ApplyReport,
+  FileApply,
+  ApplyAction,
+} from './use-cases/apply.js';
+
+export { isWorkingTreeDirty } from './gateways/git.js';
+export { createFileWriter } from './gateways/fs-writer.js';
+
 export { loadConfig, defaultConfig, enabledProviders } from './use-cases/load-config.js';
 export type { HarnessConfig, GeminiMode } from './use-cases/load-config.js';

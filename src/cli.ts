@@ -1,9 +1,14 @@
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { DomainError, InvalidConfigError } from './entities/errors.js';
 import type { ProviderId, ProjectionContext } from './entities/adapter.js';
+import { APPLY_STATE_PATH, parseState, serializeState } from './entities/apply-state.js';
+import type { ApplyState } from './entities/apply-state.js';
 import { createProviderFileReader } from './gateways/provider-files.js';
+import { createFileWriter } from './gateways/fs-writer.js';
+import { isWorkingTreeDirty } from './gateways/git.js';
 import { createAllAdapters } from './adapters/index.js';
 import { parseRepo } from './use-cases/parse-repo.js';
 import { readRepoSnapshot } from './gateways/filesystem.js';
@@ -11,6 +16,8 @@ import { loadConfig, enabledProviders } from './use-cases/load-config.js';
 import type { HarnessConfig } from './use-cases/load-config.js';
 import { audit } from './use-cases/audit.js';
 import type { AuditReport, FileAudit } from './use-cases/audit.js';
+import { apply } from './use-cases/apply.js';
+import type { ApplyReport } from './use-cases/apply.js';
 
 export type ExitCode = 0 | 1 | 2 | 3 | 64 | 70;
 
@@ -90,6 +97,11 @@ function helpText(): string {
     '  -h, --help          Show help',
     '  --version           Show version',
     '',
+    'apply options:',
+    '  --dry-run           Print the would-emit plan and exit without writing',
+    '  --allow-dirty       Run even when the git working tree is dirty',
+    '  --non-interactive   Never prompt; fail (exit 1) on a user-edited file',
+    '',
     'See https://github.com/mknoth197/harness-haircut for documentation.',
   ].join('\n');
 }
@@ -128,7 +140,11 @@ export async function run(argv: readonly string[], io: RunIO): Promise<ExitCode>
     return runAudit(parsed, io);
   }
 
-  // init / apply / doctor are stubs until C2/C3/their stories land.
+  if (parsed.command === 'apply') {
+    return runApply(parsed, io);
+  }
+
+  // init / doctor are stubs until their stories land.
   io.stderr.write(`harness-haircut: '${parsed.command}' not yet implemented\n`);
   return 70;
 }
@@ -245,4 +261,131 @@ function renderAuditReport(report: AuditReport): string {
 
   lines.push('');
   return `${lines.join('\n')}`;
+}
+
+/**
+ * Interactive overwrite prompt for an `edited` file (UN1). Reads a single
+ * y/N answer from stdin; anything other than `y`/`yes` (case-insensitive)
+ * declines, so a bare Enter is safe. `--non-interactive` bypasses this
+ * entirely (the use case auto-declines), so this is only constructed for an
+ * interactive run.
+ */
+function readlineConfirm(io: RunIO): (path: string) => Promise<boolean> {
+  return (path: string) =>
+    new Promise<boolean>((resolveAnswer) => {
+      const rl = createInterface({ input: process.stdin, output: io.stdout });
+      rl.question(
+        `harness-haircut: ${path} was edited since it was generated. Overwrite? [y/N] `,
+        (answer) => {
+          rl.close();
+          const normalized = answer.trim().toLowerCase();
+          resolveAnswer(normalized === 'y' || normalized === 'yes');
+        },
+      );
+    });
+}
+
+async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
+  const cwdFlag = parsed.flags['--cwd'];
+  const cwd = typeof cwdFlag === 'string' ? resolve(cwdFlag) : process.cwd();
+  const configFlag =
+    typeof parsed.flags['--config'] === 'string' ? (parsed.flags['--config'] as string) : undefined;
+  const json = parsed.flags['--json'] === true;
+  const dryRun = parsed.flags['--dry-run'] === true;
+  const allowDirty = parsed.flags['--allow-dirty'] === true;
+  const nonInteractive = parsed.flags['--non-interactive'] === true;
+
+  let report: ApplyReport;
+  try {
+    const config = await readConfig(cwd, configFlag);
+    const reader = createProviderFileReader(cwd);
+    const writer = createFileWriter(cwd);
+    const enabled = enabledProviders(config);
+    const adapters = createAllAdapters().filter((adapter) => enabled.includes(adapter.id));
+    const contextFor = (id: ProviderId): ProjectionContext => {
+      const ctx: ProjectionContext = { cwd, providerFiles: reader };
+      if (id === 'gemini') {
+        ctx.providerConfig = { mode: config.gemini.mode };
+      }
+      return ctx;
+    };
+    report = await apply({
+      parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd) }),
+      adapters,
+      reader,
+      writer,
+      contextFor,
+      isDirty: () => isWorkingTreeDirty(cwd),
+      // Under --non-interactive the use case never calls confirm, so a
+      // no-prompt stub is correct; otherwise wire the readline prompt.
+      confirm: nonInteractive ? () => Promise.resolve(false) : readlineConfirm(io),
+      readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
+      writeState: (state: ApplyState): void => writer.write(APPLY_STATE_PATH, serializeState(state)),
+      flags: { allowDirty, dryRun, nonInteractive },
+    });
+  } catch (err) {
+    if (err instanceof DomainError) {
+      io.stderr.write(`harness-haircut: ${err.message}\n`);
+      return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
+    }
+    throw err;
+  }
+
+  if (json) {
+    io.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    io.stdout.write(renderApplyReport(report));
+  }
+  return report.exitCode;
+}
+
+function renderApplyReport(report: ApplyReport): string {
+  const lines: string[] = [];
+
+  if (report.refused === 'dirty-tree') {
+    lines.push(
+      'refused — the git working tree has uncommitted changes. Commit or stash ' +
+        'them, or re-run with --allow-dirty.',
+    );
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  const verb = report.dryRun ? 'would write' : 'wrote';
+  if (report.written.length === 0 && report.blocked.length === 0) {
+    lines.push('nothing to do');
+  } else {
+    if (report.written.length > 0) {
+      lines.push(`${verb} ${report.written.length} file(s):`);
+      for (const file of report.files.filter((f) => f.action === 'written')) {
+        const keyNote = file.mergeKey !== undefined ? ` (key: ${file.mergeKey})` : '';
+        lines.push(`  ${file.reason}\t${file.path} [${file.providerId}]${keyNote}`);
+      }
+    }
+    if (report.blocked.length > 0) {
+      lines.push(`blocked ${report.blocked.length} edited file(s) (not overwritten):`);
+      for (const file of report.files.filter((f) => f.action === 'blocked')) {
+        lines.push(`  edited\t${file.path} [${file.providerId}]`);
+      }
+    }
+  }
+  if (report.skipped.length > 0) {
+    lines.push(`skipped ${report.skipped.length} unchanged file(s)`);
+  }
+  if (report.dryRun) {
+    lines.push('(dry run — no files written)');
+  }
+
+  if (report.warnings.length > 0) {
+    lines.push('');
+    lines.push(`${report.warnings.length} warning(s):`);
+    for (const warning of report.warnings) {
+      const where = warning.canonicalPath ?? warning.providerId ?? '';
+      const suffix = where === '' ? '' : ` (${where})`;
+      lines.push(`  ${warning.code}\t${warning.message}${suffix}`);
+    }
+  }
+
+  lines.push('');
+  return lines.join('\n');
 }
