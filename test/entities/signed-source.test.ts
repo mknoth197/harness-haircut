@@ -7,7 +7,9 @@ import {
   InvalidSourcePathError,
   canonicalManifest,
   embedHeader,
+  embedHeaderAfterFrontmatter,
   verifyHeader,
+  verifyHeaderAfterFrontmatter,
 } from '../../dist/index.js';
 import type { SourceManifest } from '../../dist/index.js';
 
@@ -148,6 +150,76 @@ describe('EOL normalization (CRLF → LF before hashing)', () => {
     assert.deepEqual(verifyHeader(emitted, sources), { status: 'clean' });
     const headerLine = emitted.split('\n', 1)[0] ?? '';
     assert.deepEqual(verifyHeader(`${headerLine}\n${lfBody}`, sources), { status: 'clean' });
+  });
+});
+
+describe('embedHeaderAfterFrontmatter / verifyHeaderAfterFrontmatter', () => {
+  const content = '---\npaths: ["test/**/*.ts"]\n---\n# Testing rules\n\nUse node:test.\n';
+
+  it('inserts the header line immediately after the closing ---', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    const lines = file.split('\n');
+    assert.equal(lines[0], '---');
+    assert.equal(lines[1], 'paths: ["test/**/*.ts"]');
+    assert.equal(lines[2], '---');
+    assert.match(
+      lines[3] ?? '',
+      /^<!-- @generated SignedSource<<<[0-9a-f]{16}\.[0-9a-f]{16}>>> harness-haircut DO NOT EDIT -->$/,
+    );
+    assert.equal(lines.slice(4).join('\n'), '# Testing rules\n\nUse node:test.\n');
+  });
+
+  it('round-trips clean', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    assert.deepEqual(verifyHeaderAfterFrontmatter(file, sources), { status: 'clean' });
+  });
+
+  it('reports edited when a frontmatter glob line is changed (BODY_HASH binds frontmatter)', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    const tampered = file.replace('paths: ["test/**/*.ts"]', 'paths: ["**"]');
+    assert.notEqual(tampered, file);
+    assert.deepEqual(verifyHeaderAfterFrontmatter(tampered, sources), { status: 'edited' });
+  });
+
+  it('reports edited when the body is changed', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    assert.deepEqual(verifyHeaderAfterFrontmatter(`${file}\nuser-added line\n`, sources), {
+      status: 'edited',
+    });
+  });
+
+  it('reports stale when content is intact but canonical sources changed', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    assert.deepEqual(verifyHeaderAfterFrontmatter(file, otherSources), { status: 'stale' });
+  });
+
+  it('reports edited over stale when both mismatch', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    assert.deepEqual(
+      verifyHeaderAfterFrontmatter(`${file}\nuser-added line\n`, otherSources),
+      { status: 'edited' },
+    );
+  });
+
+  it('reports unmanaged without a frontmatter block or without a header after it', () => {
+    assert.deepEqual(verifyHeaderAfterFrontmatter('# no frontmatter\n', sources), {
+      status: 'unmanaged',
+    });
+    assert.deepEqual(verifyHeaderAfterFrontmatter(content, sources), { status: 'unmanaged' });
+  });
+
+  it('verifies clean across CRLF round-trips (EOL-insensitive)', () => {
+    const file = embedHeaderAfterFrontmatter(content, sources);
+    const crlf = file.replace(/\n/g, '\r\n');
+    assert.deepEqual(verifyHeaderAfterFrontmatter(crlf, sources), { status: 'clean' });
+  });
+
+  it('throws when content does not begin with a frontmatter block (internal misuse)', () => {
+    assert.throws(() => embedHeaderAfterFrontmatter('# plain markdown\n', sources), /frontmatter/);
+    assert.throws(
+      () => embedHeaderAfterFrontmatter('---\nunterminated\n', sources),
+      /frontmatter/,
+    );
   });
 });
 

@@ -20,6 +20,14 @@ export {
 } from './adapters/registry.js';
 export type { AdapterRegistry } from './adapters/registry.js';
 
+export { codexAdapter, CODEX_PROJECT_DOC_MAX_BYTES } from './adapters/codex.js';
+export { claudeAdapter } from './adapters/claude.js';
+export { geminiAdapter } from './adapters/gemini.js';
+export { copilotAdapter, COPILOT_HOOKS_PATH, COPILOT_HOOK_NOTES } from './adapters/copilot.js';
+export { createAllAdapters } from './adapters/index.js';
+export { SHIM_BODY, SHIM_IMPORT_LINE } from './adapters/shim.js';
+export { instructionSourceEntry, skillSourceEntry } from './adapters/source-manifest.js';
+
 export { readRepoSnapshot } from './gateways/filesystem.js';
 
 export { parseRepo } from './use-cases/parse-repo.js';

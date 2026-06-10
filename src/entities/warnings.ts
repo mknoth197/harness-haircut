@@ -10,6 +10,7 @@ export type WarningCode =
   | 'HH-W004'
   | 'HH-W005'
   | 'HH-W006'
+  | 'HH-W007'
   | 'HH-W010'
   | 'HH-W011';
 
@@ -30,8 +31,9 @@ export const WARNING_CATALOGUE: Readonly<Record<WarningCode, string>> = {
   'HH-W001': 'lossy glob downgrade',
   'HH-W003': 'hook event unmappable for a provider',
   'HH-W004': 'provider size cap exceeded',
-  'HH-W005': 'duplicate hook sources detected in provider config',
+  'HH-W005': 'conflicting or duplicate provider configuration source detected',
   'HH-W006': 'deprecated provider config key detected',
+  'HH-W007': 'canonical surface unrepresentable for provider',
   'HH-W010': 'unknown attachment under .agents/',
   'HH-W011': 'frontmatter in AGENTS.md leaks verbatim into provider prompts',
 };

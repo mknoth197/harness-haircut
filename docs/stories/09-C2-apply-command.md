@@ -27,5 +27,9 @@
 - [ ] Tests cover: clean run, user-edited file prompt path, `--non-interactive` failure path, `--allow-dirty`, `--dry-run`, merge-key into existing JSON preserves foreign keys, conflict between adapters fails fast.
 - [ ] Git status check uses `git status --porcelain` shelled out (not a libgit dependency).
 
+## Design note — headerless fully-owned JSON files (PRD §9 carve-out 2)
+
+`.codex/hooks.json` and `.github/hooks/*.json` carry no SignedSource header (JSON has no comments), so verification for them is full-content comparison against the current projection — which cannot distinguish `edited` (user touched the file) from `stale` (canonical sources changed). To restore the distinction for the UN1 prompt flow, `apply` should record the prior emission (e.g. content hash in a tool-state file) and compare three ways: disk == current projection → clean; disk == recorded prior emission → stale (safe overwrite); otherwise → edited (prompt). Until that lands, treat any difference as `edited` (the conservative side).
+
 ## Out of scope
 - Initial onboarding / interactive merge from drifted state (covered by C3).

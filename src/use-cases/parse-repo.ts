@@ -222,9 +222,23 @@ function isHookShaped(basename: string): boolean {
   );
 }
 
+/**
+ * B3: hook basenames end up interpolated into provider shell commands
+ * (e.g. Claude's `$CLAUDE_PROJECT_DIR/<path>`), so any shell metacharacter
+ * — space, backtick, `$(`, quotes, … — would be a command-injection vector.
+ */
+const HOOK_BASENAME_UNSAFE_RE = /[^A-Za-z0-9._-]/;
+
 /** F1 EV4 + UN4: hook-shaped filenames follow `<event>.<name>.<ext>` with a canonical event. */
 function parseHook(file: FileSnapshot): Hook {
   const basename = file.path.slice(file.path.lastIndexOf('/') + 1);
+  if (HOOK_BASENAME_UNSAFE_RE.test(basename)) {
+    throw new ParseError(
+      file.path,
+      'hook filenames are restricted to [A-Za-z0-9._-] because they are embedded in ' +
+        'provider shell commands',
+    );
+  }
   const segments = basename.split('.');
   const event = segments[0] ?? '';
   if (!isHookEvent(event)) {
@@ -256,6 +270,14 @@ function recordUnknownAttachment(
   });
 }
 
+/**
+ * B2: Agent Skills standard name shape. Also a security boundary — the name
+ * becomes an emit path segment (`.claude/skills/<name>/…`), so path
+ * traversal (`../`) and YAML-breaking characters (`:`, quotes) must be
+ * rejected, not just frowned upon.
+ */
+const SKILL_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
 /** F1 EV3 + UN3: skills come from SKILL.md frontmatter; names must be unique. */
 function assembleSkills(
   skillFolders: ReadonlyMap<string, FileSnapshot[]>,
@@ -279,6 +301,14 @@ function assembleSkills(
     const description = fm.data['description'];
     if (!fm.present || typeof name !== 'string' || name === '') {
       throw new ParseError(entry.path, 'SKILL.md frontmatter requires a "name" string');
+    }
+    if (!SKILL_NAME_RE.test(name)) {
+      throw new ParseError(
+        entry.path,
+        `invalid skill name ${JSON.stringify(name)}: names must match ` +
+          '^[a-z0-9]+(-[a-z0-9]+)*$ (lowercase alphanumeric segments separated by ' +
+          'single hyphens, per the Agent Skills standard)',
+      );
     }
     if (typeof description !== 'string' || description === '') {
       throw new ParseError(entry.path, 'SKILL.md frontmatter requires a "description" string');
