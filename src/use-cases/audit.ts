@@ -186,8 +186,15 @@ function auditMergeKeyFile(file: EmittedFile, reader: ProviderFileReader): Drift
   }
   // The merge-key file's body is the JSON of *only* the owned value (the
   // adapter renders `JSON.stringify(ownedValue, …)`). Parse both and compare
-  // the owned key. A disk file that cannot be parsed, or whose owned key is
-  // absent, drifts — audit never writes, so it does not attempt a merge.
+  // the owned key. A disk file whose owned key is absent drifts — audit never
+  // writes, so it does not attempt a merge.
+  //
+  // Note: for providers that pre-read the co-owned file during projection
+  // (claude/gemini read `.claude`/`.gemini/settings.json` to merge), a
+  // syntactically malformed file surfaces earlier as MalformedProviderConfigError
+  // (exit 3) from `project()`, before this verifier runs. The unparseable-disk
+  // branch below is the backstop for any merge-key emit whose adapter does not
+  // pre-read.
   let diskJson: unknown;
   try {
     diskJson = JSON.parse(disk);

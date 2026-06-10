@@ -306,6 +306,25 @@ describe('audit() — lossy warnings (EV4, OPT1)', () => {
     assert.equal(report.drift, false);
     assert.equal(report.exitCode, 1);
   });
+
+  // The §9 v0.3.1 amendment exists so an edit to an emitted frontmatter glob
+  // line (applyTo:/paths:) is detected. The entity-level test pins this on
+  // verifyHeaderAfterFrontmatter; this pins the headline scenario end-to-end
+  // through audit() on a real Copilot .instructions.md.
+  it('reports drift:edited when an emitted applyTo: glob line is hand-edited (§9 v0.3.1)', async () => {
+    const repo = await setup(LOSSY);
+    const path = join(repo.root, '.github', 'instructions', 'hh.testing.instructions.md');
+    const original = await readFile(path, 'utf8');
+    assert.match(original, /applyTo:/);
+    await writeFile(path, original.replace('test/**/*.ts', 'src/**/*.ts'), 'utf8');
+    const report = await runAudit(repo.root, { disabled: ['gemini'] });
+    assert.equal(report.drift, true);
+    assert.equal(report.exitCode, 1);
+    const entry = report.files.find(
+      (f) => f.path === '.github/instructions/hh.testing.instructions.md',
+    );
+    assert.equal(entry?.status, 'drift:edited');
+  });
 });
 
 describe('audit() — invalid canonical sources (UN1)', () => {
@@ -318,6 +337,19 @@ describe('audit() — invalid canonical sources (UN1)', () => {
       },
       { emit: false },
     );
+    await assert.rejects(
+      () => runAudit(repo.root),
+      (err: unknown) => err instanceof Error && (err as { exitCode?: number }).exitCode === 3,
+    );
+  });
+
+  // A co-owned provider file that is syntactically malformed surfaces during
+  // projection (claude reads .claude/settings.json to merge the hooks key) as
+  // exit 3 — before the merge-key verifier runs. Pins the behavior the
+  // auditMergeKeyFile comment describes.
+  it('propagates exit 3 when a co-owned settings file is malformed JSON', async () => {
+    const repo = await setup(CANONICAL);
+    await writeRel(repo.root, '.claude/settings.json', '{ not valid json');
     await assert.rejects(
       () => runAudit(repo.root),
       (err: unknown) => err instanceof Error && (err as { exitCode?: number }).exitCode === 3,
