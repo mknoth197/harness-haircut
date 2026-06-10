@@ -16,9 +16,10 @@
  *                             `init` (C3) resolves interactively
  */
 import type { EmittedFile, ProviderFileReader } from '../entities/adapter.js';
+import { AGENTS_IMPORT_LINE } from '../entities/ir.js';
 import type { Warning } from '../entities/warnings.js';
 
-export const SHIM_IMPORT_LINE = '@AGENTS.md';
+export const SHIM_IMPORT_LINE = AGENTS_IMPORT_LINE;
 export const SHIM_BODY = `${SHIM_IMPORT_LINE}\n`;
 
 export interface ShimProjection {

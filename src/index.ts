@@ -29,6 +29,18 @@ export { SHIM_BODY, SHIM_IMPORT_LINE } from './adapters/shim.js';
 export { instructionSourceEntry, skillSourceEntry } from './adapters/source-manifest.js';
 
 export { readRepoSnapshot } from './gateways/filesystem.js';
+export { createProviderFileReader } from './gateways/provider-files.js';
 
 export { parseRepo } from './use-cases/parse-repo.js';
 export type { ParseRepoDeps, ParseRepoResult } from './use-cases/parse-repo.js';
+
+export { audit } from './use-cases/audit.js';
+export type {
+  AuditDeps,
+  AuditReport,
+  FileAudit,
+  DriftStatus,
+} from './use-cases/audit.js';
+
+export { loadConfig, defaultConfig, enabledProviders } from './use-cases/load-config.js';
+export type { HarnessConfig, GeminiMode } from './use-cases/load-config.js';

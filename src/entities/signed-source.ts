@@ -48,6 +48,10 @@ function sha256Hex(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex');
 }
 
+function normalizeEol(content: string): string {
+  return content.replace(/\r\n/g, '\n');
+}
+
 /**
  * Sorts entries by path and joins `<path>:<sha256>` with `\n` (F2 U3).
  * Throws `InvalidSourcePathError` if a path contains `\n` — such a path
@@ -68,11 +72,71 @@ export function canonicalManifest(sources: SourceManifest): string {
 function bodyHash(body: string): string {
   // CRLF → LF before hashing: verification stays EOL-insensitive, so a
   // Windows autocrlf checkout does not produce false 'edited' results.
-  return sha256Hex(body.replace(/\r\n/g, '\n')).slice(0, HASH_LEN);
+  return sha256Hex(normalizeEol(body)).slice(0, HASH_LEN);
 }
 
 function sourcesHash(sources: SourceManifest): string {
   return sha256Hex(canonicalManifest(sources)).slice(0, HASH_LEN);
+}
+
+/** A header recognized in a file, plus the content its BODY_HASH covers. */
+interface ExtractedHeader {
+  bodyHash: string;
+  sourcesHash: string;
+  /** The file minus the header line (frontmatter included for the after-frontmatter placement). */
+  body: string;
+}
+
+/** Recognizes the header on the file's first line (PRD §9). */
+function extractFirstLineHeader(file: string): ExtractedHeader | null {
+  const newlineAt = file.indexOf('\n');
+  const firstLine = newlineAt === -1 ? file : file.slice(0, newlineAt);
+  const match = HEADER_RE.exec(firstLine);
+  if (match === null) {
+    return null;
+  }
+  return {
+    bodyHash: match[1] ?? '',
+    sourcesHash: match[2] ?? '',
+    body: newlineAt === -1 ? '' : file.slice(newlineAt + 1),
+  };
+}
+
+/**
+ * Recognizes the header on the first line after the closing `---` of a
+ * leading frontmatter block (PRD §9 "Header placement and carve-outs").
+ */
+function extractAfterFrontmatterHeader(file: string): ExtractedHeader | null {
+  const end = frontmatterEnd(file);
+  if (end === null || end >= file.length) {
+    return null;
+  }
+  const rest = file.slice(end);
+  const newlineAt = rest.indexOf('\n');
+  const headerLine = newlineAt === -1 ? rest : rest.slice(0, newlineAt);
+  const match = HEADER_RE.exec(headerLine);
+  if (match === null) {
+    return null;
+  }
+  return {
+    bodyHash: match[1] ?? '',
+    sourcesHash: match[2] ?? '',
+    body: file.slice(0, end) + (newlineAt === -1 ? '' : rest.slice(newlineAt + 1)),
+  };
+}
+
+/** Shared four-state verdict; `edited` wins over `stale` when both hashes mismatch. */
+function verdict(extracted: ExtractedHeader | null, currentSources: SourceManifest): VerifyResult {
+  if (extracted === null) {
+    return { status: 'unmanaged' };
+  }
+  if (extracted.bodyHash !== bodyHash(extracted.body)) {
+    return { status: 'edited' };
+  }
+  if (extracted.sourcesHash !== sourcesHash(currentSources)) {
+    return { status: 'stale' };
+  }
+  return { status: 'clean' };
 }
 
 /**
@@ -94,20 +158,7 @@ export function embedHeader(
  * `stale` when both hashes mismatch.
  */
 export function verifyHeader(file: string, currentSources: SourceManifest): VerifyResult {
-  const newlineAt = file.indexOf('\n');
-  const firstLine = newlineAt === -1 ? file : file.slice(0, newlineAt);
-  const match = HEADER_RE.exec(firstLine);
-  if (match === null) {
-    return { status: 'unmanaged' };
-  }
-  const body = newlineAt === -1 ? '' : file.slice(newlineAt + 1);
-  if (match[1] !== bodyHash(body)) {
-    return { status: 'edited' };
-  }
-  if (match[2] !== sourcesHash(currentSources)) {
-    return { status: 'stale' };
-  }
-  return { status: 'clean' };
+  return verdict(extractFirstLineHeader(file), currentSources);
 }
 
 /**
@@ -166,23 +217,63 @@ export function verifyHeaderAfterFrontmatter(
   file: string,
   currentSources: SourceManifest,
 ): VerifyResult {
-  const end = frontmatterEnd(file);
-  if (end === null || end >= file.length) {
+  return verdict(extractAfterFrontmatterHeader(file), currentSources);
+}
+
+export type HeaderPlacement = 'first-line' | 'after-frontmatter' | 'none';
+
+/**
+ * Detects where a SignedSource header sits in `content`, distinguishing the
+ * line-1 convention from the frontmatter-bearing convention (PRD §9 v0.3.1).
+ * Audit derives the verification method for each emitted file from the
+ * freshly projected body, so the §9 placement rules need no per-file
+ * bookkeeping.
+ */
+export function detectHeaderPlacement(content: string): HeaderPlacement {
+  if (extractFirstLineHeader(content) !== null) {
+    return 'first-line';
+  }
+  if (extractAfterFrontmatterHeader(content) !== null) {
+    return 'after-frontmatter';
+  }
+  return 'none';
+}
+
+/**
+ * Audit-time verifier: compares a disk file against the expected emission
+ * freshly projected from the current canonical sources. No source manifest
+ * is needed — the expected emission already embeds the current
+ * `SOURCES_HASH`, so EOL-normalized byte equality is equivalent to both
+ * hashes matching:
+ *
+ * - disk ≡ expected (CRLF-insensitive)            → 'clean'
+ * - no header at the expected placement on disk    → 'unmanaged'
+ * - disk BODY_HASH ≠ hash of the disk body         → 'edited'
+ * - header intact but file ≠ current projection    → 'stale'
+ *
+ * `expected` MUST carry a header (callers route headerless classes — shims,
+ * merge-key targets, owned JSON, attachments — elsewhere per §9), so a
+ * violation is an internal bug.
+ */
+export function verifyAgainstExpected(disk: string, expected: string): VerifyResult {
+  const placement = detectHeaderPlacement(expected);
+  if (placement === 'none') {
+    throw new Error(
+      'verifyAgainstExpected requires an expected emission carrying a SignedSource header',
+    );
+  }
+  if (normalizeEol(disk) === normalizeEol(expected)) {
+    return { status: 'clean' };
+  }
+  const extracted =
+    placement === 'first-line'
+      ? extractFirstLineHeader(disk)
+      : extractAfterFrontmatterHeader(disk);
+  if (extracted === null) {
     return { status: 'unmanaged' };
   }
-  const rest = file.slice(end);
-  const newlineAt = rest.indexOf('\n');
-  const headerLine = newlineAt === -1 ? rest : rest.slice(0, newlineAt);
-  const match = HEADER_RE.exec(headerLine);
-  if (match === null) {
-    return { status: 'unmanaged' };
-  }
-  const body = file.slice(0, end) + (newlineAt === -1 ? '' : rest.slice(newlineAt + 1));
-  if (match[1] !== bodyHash(body)) {
+  if (extracted.bodyHash !== bodyHash(extracted.body)) {
     return { status: 'edited' };
   }
-  if (match[2] !== sourcesHash(currentSources)) {
-    return { status: 'stale' };
-  }
-  return { status: 'clean' };
+  return { status: 'stale' };
 }
