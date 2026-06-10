@@ -135,6 +135,12 @@ async function walk(
       } catch (err) {
         throw new FileSystemError(join(absDir, entry.name), err);
       }
+      // Strip a leading UTF-8 BOM (common from Windows editors) so parsers
+      // downstream see clean content — a BOM before `---` would otherwise
+      // hide frontmatter.
+      if (content.charCodeAt(0) === 0xfeff) {
+        content = content.slice(1);
+      }
       out.push({ path: rel, content });
     }
   }
@@ -142,9 +148,11 @@ async function walk(
 
 /**
  * Snapshots every canonical source under `root`: `AGENTS.md` files at any
- * depth plus all files under the root `.agents/` directory. Always skips
- * `.git/`, `node_modules/`, and `dist/`; honors the root `.gitignore`
- * subset documented above. Paths are repo-relative POSIX, sorted.
+ * depth plus all files under the **root** `.agents/` directory (nested
+ * `<dir>/.agents/` directories are not collected). Always skips `.git/`,
+ * `node_modules/`, and `dist/`; honors the root `.gitignore` subset
+ * documented above. Paths are repo-relative POSIX, sorted; a leading UTF-8
+ * BOM is stripped from file contents.
  */
 export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);

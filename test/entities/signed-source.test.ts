@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import {
   HASH_LEN,
   HEADER_TAG,
+  InvalidSourcePathError,
   canonicalManifest,
   embedHeader,
   verifyHeader,
@@ -63,6 +64,31 @@ describe('embedHeader', () => {
     assert.equal(match?.[1]?.length, HASH_LEN);
     assert.equal(match?.[2]?.length, HASH_LEN);
   });
+
+  it('embeds exactly the independently computed body and manifest hashes', () => {
+    // Recompute both hashes from the spec (F2 U2/U3) without going through
+    // the module's helpers: kills any internally-consistent-but-wrong formula.
+    const expectedBodyHash = createHash('sha256').update(body).digest('hex').slice(0, HASH_LEN);
+    const manifest = [...sources]
+      .sort((a, b) => (a.path < b.path ? -1 : 1))
+      .map((entry) => `${entry.path}:${entry.sha256}`)
+      .join('\n');
+    const expectedSourcesHash = createHash('sha256')
+      .update(manifest)
+      .digest('hex')
+      .slice(0, HASH_LEN);
+    const file = embedHeader(body, sources, 'hash');
+    assert.equal(
+      file.split('\n', 1)[0],
+      `# ${HEADER_TAG}<<<${expectedBodyHash}.${expectedSourcesHash}>>> harness-haircut DO NOT EDIT`,
+    );
+  });
+
+  it('throws InvalidSourcePathError when a manifest path contains a newline', () => {
+    const ambiguous: SourceManifest = [{ path: 'AGENTS.md\nevil.md', sha256: sha('x') }];
+    assert.throws(() => embedHeader(body, ambiguous, 'html'), InvalidSourcePathError);
+    assert.throws(() => canonicalManifest(ambiguous), InvalidSourcePathError);
+  });
 });
 
 describe('verifyHeader', () => {
@@ -99,6 +125,29 @@ describe('verifyHeader', () => {
   it('reports unmanaged when the header is not on the first line', () => {
     const file = embedHeader(body, sources, 'html');
     assert.deepEqual(verifyHeader(`\n${file}`, sources), { status: 'unmanaged' });
+  });
+
+  it('round-trips an empty body with an empty manifest', () => {
+    const file = embedHeader('', [], 'hash');
+    assert.deepEqual(verifyHeader(file, []), { status: 'clean' });
+  });
+});
+
+describe('EOL normalization (CRLF → LF before hashing)', () => {
+  const lfBody = '# Title\nline one\nline two\n';
+  const crlfBody = '# Title\r\nline one\r\nline two\r\n';
+
+  it('verifies a CRLF body clean against an LF emit (Windows autocrlf checkout)', () => {
+    const emitted = embedHeader(lfBody, sources, 'html');
+    const headerLine = emitted.split('\n', 1)[0] ?? '';
+    assert.deepEqual(verifyHeader(`${headerLine}\n${crlfBody}`, sources), { status: 'clean' });
+  });
+
+  it('verifies an LF body clean against a CRLF emit (and the CRLF emit itself)', () => {
+    const emitted = embedHeader(crlfBody, sources, 'html');
+    assert.deepEqual(verifyHeader(emitted, sources), { status: 'clean' });
+    const headerLine = emitted.split('\n', 1)[0] ?? '';
+    assert.deepEqual(verifyHeader(`${headerLine}\n${lfBody}`, sources), { status: 'clean' });
   });
 });
 

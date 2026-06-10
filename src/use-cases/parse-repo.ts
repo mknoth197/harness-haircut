@@ -33,16 +33,20 @@ interface Frontmatter {
  * for `scope` / `name` / `description`:
  *   - `key: scalar` — scalars may be single- or double-quoted (quotes are
  *     stripped; no escape processing inside them)
- *   - `key: [a, b]` inline arrays of scalars
+ *   - `key: [a, b]` inline arrays of unquoted scalars
  *   - `key:` followed by `- item` block-sequence lines
  *   - blank lines and full-line `#` comments
- * Anything else (nested maps, multi-line scalars, anchors, …) is malformed
- * and fails with exit code 3 (F1 UN2).
+ * Rejected (exit code 3, F1 UN2) rather than silently mis-parsed:
+ *   - values containing ` #` — YAML trailing comments are outside the
+ *     supported subset
+ *   - inline array items containing `"` or `'` — quoted items may embed
+ *     commas, which the comma-split cannot handle faithfully
+ *   - anything else (nested maps, multi-line scalars, anchors, …)
  */
 function parseFrontmatter(content: string, filePath: string): Frontmatter {
   const lines = content.split('\n');
   if ((lines[0] ?? '').trimEnd() !== '---') {
-    return { present: false, data: {}, body: content };
+    return { present: false, data: emptyData(), body: content };
   }
   let end = -1;
   for (let i = 1; i < lines.length; i++) {
@@ -55,7 +59,7 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
     throw new ParseError(filePath, 'unterminated frontmatter block (missing closing "---")');
   }
 
-  const data: Record<string, FrontmatterValue> = {};
+  const data = emptyData();
   let i = 1;
   while (i < end) {
     const line = (lines[i] ?? '').trimEnd();
@@ -70,6 +74,7 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
     }
     const key = keyMatch[1] ?? '';
     const rest = (keyMatch[2] ?? '').trim();
+    rejectTrailingComment(rest, key, lineNo, filePath);
     if (rest === '') {
       const items: string[] = [];
       while (i < end) {
@@ -77,7 +82,9 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
         if (itemMatch === null) {
           break;
         }
-        items.push(unquote((itemMatch[1] ?? '').trim()));
+        const item = (itemMatch[1] ?? '').trim();
+        rejectTrailingComment(item, key, i + 1, filePath);
+        items.push(unquote(item));
         i += 1;
       }
       if (items.length === 0) {
@@ -89,12 +96,42 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
         throw new ParseError(filePath, `malformed inline array for frontmatter key "${key}" (line ${lineNo})`);
       }
       const inner = rest.slice(1, -1).trim();
-      data[key] = inner === '' ? [] : inner.split(',').map((item) => unquote(item.trim()));
+      data[key] =
+        inner === ''
+          ? []
+          : inner.split(',').map((item) => {
+              const trimmed = item.trim();
+              if (trimmed.includes('"') || trimmed.includes("'")) {
+                throw new ParseError(
+                  filePath,
+                  `inline array for frontmatter key "${key}" (line ${lineNo}) contains quoted ` +
+                    'items, which are outside the supported subset (quotes may embed commas ' +
+                    'the comma-split cannot handle faithfully)',
+                );
+              }
+              return trimmed;
+            });
     } else {
       data[key] = unquote(rest);
     }
   }
   return { present: true, data, body: lines.slice(end + 1).join('\n') };
+}
+
+/** Prototype-pollution insurance: frontmatter keys land on a null-prototype record. */
+function emptyData(): Record<string, FrontmatterValue> {
+  return Object.create(null) as Record<string, FrontmatterValue>;
+}
+
+/** The subset has no trailing-comment support; silently keeping the text would mis-parse. */
+function rejectTrailingComment(value: string, key: string, lineNo: number, filePath: string): void {
+  if (value.includes(' #')) {
+    throw new ParseError(
+      filePath,
+      `value for frontmatter key "${key}" (line ${lineNo}) contains " #": ` +
+        'YAML comments are outside the supported subset',
+    );
+  }
 }
 
 function unquote(value: string): string {
@@ -110,8 +147,7 @@ function unquote(value: string): string {
 
 /** F1 EV1 + UN1: AGENTS.md is pure markdown; frontmatter warns and stays literal. */
 function parseAgentsMd(file: FileSnapshot, warnings: Warning[]): Instruction {
-  const firstLine = file.content.split('\n', 1)[0] ?? '';
-  if (firstLine.trimEnd() === '---') {
+  if (hasFrontmatterBlock(file.content)) {
     warnings.push({
       code: 'HH-W011',
       severity: 'warn',
@@ -131,6 +167,25 @@ function parseAgentsMd(file: FileSnapshot, warnings: Warning[]): Instruction {
   };
 }
 
+/**
+ * HH-W011 only fires for a real frontmatter block: a closing `---` must
+ * exist (a lone leading `---` is a markdown thematic break, not frontmatter)
+ * and the block must be non-empty (`---\n---` carries nothing that could
+ * leak into provider prompts).
+ */
+function hasFrontmatterBlock(content: string): boolean {
+  const lines = content.split('\n');
+  if ((lines[0] ?? '').trimEnd() !== '---') {
+    return false;
+  }
+  for (let i = 1; i < lines.length; i++) {
+    if ((lines[i] ?? '').trimEnd() === '---') {
+      return i > 1;
+    }
+  }
+  return false;
+}
+
 /** F1 EV2 + UN5: scoped fragments require `scope:` frontmatter. */
 function parseInstructionFragment(file: FileSnapshot): Instruction {
   const fm = parseFrontmatter(file.content, file.path);
@@ -147,7 +202,27 @@ function parseInstructionFragment(file: FileSnapshot): Instruction {
   return { path: file.path, scope, body: fm.body };
 }
 
-/** F1 EV4 + UN4: hook filenames follow `<event>.<name>.<ext>` with a canonical event. */
+const HOOK_SCRIPT_EXTENSIONS: ReadonlySet<string> = new Set(['sh', 'js']);
+
+/**
+ * A file in `.agents/hooks/` is **hook-shaped** iff its basename has at
+ * least three dot-segments (`<event>.<name>.<ext>`), its final extension is
+ * a script extension (`sh`/`js`), and no segment is empty (rejects dotfiles
+ * like `.DS_Store` and trailing-dot names like `pre-tool-use.lint.`).
+ * Everything else — READMEs, `.gitkeep`, `*.bak`, and `.toml`/`.json` files
+ * (reserved for the future sibling-metadata convention, PRD §8, which is not
+ * yet designed) — is an opaque attachment + HH-W010 (F1 EV5).
+ */
+function isHookShaped(basename: string): boolean {
+  const segments = basename.split('.');
+  return (
+    segments.length >= 3 &&
+    HOOK_SCRIPT_EXTENSIONS.has(segments[segments.length - 1] ?? '') &&
+    segments.every((segment) => segment !== '')
+  );
+}
+
+/** F1 EV4 + UN4: hook-shaped filenames follow `<event>.<name>.<ext>` with a canonical event. */
 function parseHook(file: FileSnapshot): Hook {
   const basename = file.path.slice(file.path.lastIndexOf('/') + 1);
   const segments = basename.split('.');
@@ -158,11 +233,9 @@ function parseHook(file: FileSnapshot): Hook {
       `unknown hook event "${event}"; valid events: ${HOOK_EVENTS.join(', ')}`,
     );
   }
-  if (segments.length < 3 || segments[1] === '') {
-    throw new ParseError(file.path, 'hook filename must follow <event>.<name>.<ext>');
-  }
   return {
     event,
+    // Hook names may contain dots: `pre-tool-use.my.fancy.sh` → `my.fancy`.
     name: segments.slice(1, -1).join('.'),
     path: file.path,
     script: file.content,
@@ -263,7 +336,7 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
       } else {
         folderFiles.push(file);
       }
-    } else if (segments[1] === 'hooks' && segments.length === 3) {
+    } else if (segments[1] === 'hooks' && segments.length === 3 && isHookShaped(basename)) {
       hooks.push(parseHook(file));
     } else {
       recordUnknownAttachment(file, attachments, warnings);

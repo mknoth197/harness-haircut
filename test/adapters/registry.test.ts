@@ -79,16 +79,16 @@ describe('createAdapterRegistry', () => {
   });
 });
 
-describe('Projection serialization', () => {
-  it('per-surface summary values round-trip through JSON (for --json output)', () => {
-    const projection: Projection = {
-      files: [
-        { path: '.claude/settings.json', body: '{}', mode: 'merge-key', mergeKey: 'hooks' },
-      ],
-      warnings: [{ code: 'HH-W003', severity: 'warn', message: 'unmappable', providerId: 'gemini' }],
-      surfaces: { instructions: 'emitted', skills: 'native', hooks: 'merged' },
-    };
-    assert.deepEqual(JSON.parse(JSON.stringify(projection)), projection);
+describe('registry serialization', () => {
+  it('listAdapters() output serializes with the expected adapter ids (for --json output)', () => {
+    const registry = createAdapterRegistry([fakeAdapter('claude'), fakeAdapter('codex')]);
+    const serialized = JSON.parse(JSON.stringify(registry.listAdapters())) as Array<
+      Record<string, unknown>
+    >;
+    assert.deepEqual(
+      serialized.map((entry) => entry['id']),
+      ['claude', 'codex'],
+    );
   });
 });
 

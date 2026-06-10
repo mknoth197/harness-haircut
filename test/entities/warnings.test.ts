@@ -29,8 +29,14 @@ describe('warning catalogue', () => {
     }
   });
 
-  it('survives a JSON round-trip unchanged', () => {
-    assert.deepEqual(JSON.parse(JSON.stringify(WARNING_CATALOGUE)), WARNING_CATALOGUE);
+  it('serializes to JSON with every code mapped to its summary', () => {
+    const parsed = JSON.parse(JSON.stringify(WARNING_CATALOGUE)) as Record<string, string>;
+    assert.deepEqual(Object.keys(parsed).sort(), EXPECTED_CODES);
+    assert.equal(parsed['HH-W010'], 'unknown attachment under .agents/');
+    assert.equal(
+      parsed['HH-W011'],
+      'frontmatter in AGENTS.md leaks verbatim into provider prompts',
+    );
   });
 
   it('links every code to its docs/warnings page', () => {
@@ -39,14 +45,26 @@ describe('warning catalogue', () => {
 });
 
 describe('Warning objects', () => {
-  it('survive a JSON round-trip unchanged (for --json output)', () => {
+  it('serializes a catalogue-derived Warning with field-level fidelity (for --json output)', () => {
     const warning: Warning = {
       code: 'HH-W010',
       severity: 'warn',
-      message: 'unknown attachment under .agents/: .agents/notes.txt',
+      message: `${WARNING_CATALOGUE['HH-W010']}: .agents/notes.txt`,
       canonicalPath: '.agents/notes.txt',
       providerId: 'claude',
     };
-    assert.deepEqual(JSON.parse(JSON.stringify(warning)), warning);
+    const parsed = JSON.parse(JSON.stringify(warning)) as Record<string, unknown>;
+    assert.equal(parsed['code'], 'HH-W010');
+    assert.equal(parsed['severity'], 'warn');
+    assert.equal(parsed['message'], 'unknown attachment under .agents/: .agents/notes.txt');
+    assert.equal(parsed['canonicalPath'], '.agents/notes.txt');
+    assert.equal(parsed['providerId'], 'claude');
+    assert.deepEqual(Object.keys(parsed).sort(), [
+      'canonicalPath',
+      'code',
+      'message',
+      'providerId',
+      'severity',
+    ]);
   });
 });

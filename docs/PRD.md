@@ -159,14 +159,14 @@ Global options:
 - **This location is native** for Codex, Gemini CLI, and Copilot (verified 2026-06-10) — no projection emitted for them. Claude Code is the only provider needing a `.claude/skills/` projection.
 - Provider-specific frontmatter extras (Claude's `allowed-tools`/`context`/`hooks`, Codex's `agents/openai.yaml`, …) are out of the canonical core; if present they are passed through to providers that understand them and trigger a lossy warning for the rest.
 
-### Hooks: `.agents/hooks/<event>.<name>.{sh,js,toml,json}`
+### Hooks: `.agents/hooks/<event>.<name>.{sh,js}`
 
 - Filename convention: `<event>.<name>.<ext>`, where `<event>` is one of the **canonical event enum** — a canonical superset chosen for cross-provider mappability (verified against all four providers' current taxonomies; not every provider has every event — gaps trigger `HH-W003` per provider):
   `session-start`, `session-end`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`, `stop`, `subagent-start`, `subagent-stop`, `pre-compact`.
   *(v0.3 correction: `pre-commit` removed — no provider has an agent-hook event for it; git-level pre-commit enforcement is I1's job.)*
 - Canonical events map to provider-native names via per-adapter translation tables (e.g., `pre-tool-use` → Claude `PreToolUse` / Codex `PreToolUse` / Gemini `BeforeTool` / Copilot `preToolUse`). Events a provider lacks trigger `HH-W003` for that provider only.
 - The file body is the executable hook content. `harness-haircut` does not run hooks; it only projects them into provider-specific configs.
-- A sibling `.agents/hooks/<event>.<name>.toml` may declare matchers / metadata.
+- Hook scripts are `.{sh,js}`. `.toml`/`.json` files in `.agents/hooks/` are **reserved** for a future sibling-metadata convention (matchers / metadata declared next to the script — not yet designed) and are treated as opaque attachments (`HH-W010`) until that convention lands.
 - Projection stability matters: Codex requires per-user hash-pinned trust of each hook definition, re-prompted whenever the definition changes — so adapters should emit thin, stable commands (e.g., invoke a repo script) rather than inlining hook bodies that churn.
 
 ### Config: `harness-haircut.config.json` (optional)
@@ -202,7 +202,7 @@ Every file `harness-haircut` emits begins with one of:
 1. **One-line import shims** (`CLAUDE.md`, and `GEMINI.md` in shim mode): their first line MUST be `@AGENTS.md` for the provider to resolve the import, and their content never derives from canonical sources (it *references* them), so drift is structurally impossible. Ownership rule instead: the tool owns only the first line; `verify` for shims = "first line is exactly `@AGENTS.md`"; everything below it is user content and is always preserved.
 2. **Merge-key targets** (`.claude/settings.json`, `.gemini/settings.json`, `.codex/config.toml`): JSON has no comments and the file is co-owned. Drift detection for these compares the owned key's value against the expected projection (F3 merge policy), not a header.
 
-- **`BODY_HASH`** = lowercase hex of `SHA-256(content_after_header_line)`, truncated to 16 chars. Binds the emitted body.
+- **`BODY_HASH`** = lowercase hex of `SHA-256(content_after_header_line)`, truncated to 16 chars. Binds the emitted body. Bodies are normalized `\r\n` → `\n` before hashing (in both embed and verify), so verification is EOL-insensitive and Windows autocrlf checkouts do not produce false `edited` results.
 - **`SOURCES_HASH`** = lowercase hex of `SHA-256(sources_manifest)`, truncated to 16 chars. Binds the canonical inputs.
 - **`sources_manifest`** = `<canonical_path>:<sha256_of_content>` lines for every canonical file that contributed to this projection, sorted by path, joined with `\n`.
 

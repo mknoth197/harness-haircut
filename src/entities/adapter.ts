@@ -53,6 +53,12 @@ export interface FileSnapshot {
   content: string;
 }
 
+/**
+ * Snapshot of a repo's configuration files. Currently contains canonical
+ * sources only — `AGENTS.md` files (any depth) plus the root `.agents/`
+ * tree (nested `<dir>/.agents/` directories are not collected). Detection
+ * of provider-owned files widens this as the A1–A4 adapters land.
+ */
 export interface RepoSnapshot {
   /** Absolute path of the repo root the snapshot was taken from. */
   root: string;

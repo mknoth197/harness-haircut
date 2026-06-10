@@ -113,4 +113,28 @@ describe('readRepoSnapshot', () => {
       await repo.cleanup();
     }
   });
+
+  it('does not collect nested .agents/ directories (root .agents/ only)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      '.agents/skills/deploy/SKILL.md': '---\nname: deploy\ndescription: d\n---\n',
+      'pkg/.agents/skills/nested/SKILL.md': 'nested .agents trees are not canonical today',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/deploy/SKILL.md', 'AGENTS.md']);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('strips a leading UTF-8 BOM from file contents', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '\uFEFF# root' });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.equal(snapshot.files[0]?.content, '# root');
+    } finally {
+      await repo.cleanup();
+    }
+  });
 });

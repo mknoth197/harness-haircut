@@ -95,6 +95,58 @@ describe('parseRepo — instructions', () => {
     ));
 });
 
+describe('parseRepo — frontmatter subset honesty', () => {
+  it('fails with exit code 3 on a scalar containing a YAML trailing comment', () =>
+    assertParseError(
+      { '.agents/instructions/c.md': '---\nscope: src/** # applies to source\n---\nbody\n' },
+      /YAML comments are outside the supported subset/,
+    ));
+
+  it('fails with exit code 3 on inline array items containing quotes', () =>
+    assertParseError(
+      { '.agents/instructions/q.md': '---\nscope: "src/**"\ntags: ["a", "b"]\n---\nbody\n' },
+      /contains quoted items, which are outside the supported subset/,
+    ));
+
+  it('fails with exit code 3 when a fragment has an empty frontmatter block (scope still missing)', () =>
+    assertParseError(
+      { '.agents/instructions/empty.md': '---\n---\nbody\n' },
+      /missing required "scope:"/,
+    ));
+
+  it('fails with exit code 3 when scope: is a list instead of a string glob', () =>
+    assertParseError(
+      { '.agents/instructions/list.md': '---\nscope:\n- src/**\n---\nbody\n' },
+      /"scope:" must be a non-empty glob string/,
+    ));
+
+  it('parses a BOM-prefixed fragment with valid scope', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/instructions/bom.md': '\uFEFF---\nscope: "src/**"\n---\nbody\n',
+    });
+    assert.deepEqual(ir.instructions, [
+      { path: '.agents/instructions/bom.md', scope: 'src/**', body: 'body\n' },
+    ]);
+    assert.deepEqual(warnings, []);
+  });
+});
+
+describe('parseRepo — HH-W011 boundaries', () => {
+  it('does not warn for a lone leading --- without a closing delimiter (thematic break)', async () => {
+    const content = '---\n# Standards\n\nNo closing delimiter anywhere.\n';
+    const { ir, warnings } = await parseFixture({ 'AGENTS.md': content });
+    assert.deepEqual(warnings, []);
+    assert.equal(ir.instructions[0]?.body, content);
+  });
+
+  it('does not warn for an empty frontmatter block (---\\n---: nothing can leak)', async () => {
+    const content = '---\n---\n# Standards\n';
+    const { ir, warnings } = await parseFixture({ 'AGENTS.md': content });
+    assert.deepEqual(warnings, []);
+    assert.equal(ir.instructions[0]?.body, content);
+  });
+});
+
 describe('parseRepo — skills', () => {
   it('lifts a skill folder with name/description frontmatter and sibling attachments', async () => {
     const { ir, warnings } = await parseFixture({
@@ -155,11 +207,56 @@ describe('parseRepo — hooks', () => {
       /unknown hook event "pre-commit"; valid events: session-start, session-end, user-prompt-submit, pre-tool-use, post-tool-use, stop, subagent-start, subagent-stop, pre-compact/,
     ));
 
-  it('fails with exit code 3 when a hook filename lacks the <name> segment', () =>
-    assertParseError(
-      { '.agents/hooks/pre-tool-use.sh': 'echo hi\n' },
-      /hook filename must follow <event>\.<name>\.<ext>/,
-    ));
+  it('lifts a hook whose name contains dots (<name> may have dot segments)', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/hooks/pre-tool-use.my.fancy.sh': 'echo hi\n',
+    });
+    assert.equal(ir.hooks.length, 1);
+    assert.equal(ir.hooks[0]?.event, 'pre-tool-use');
+    assert.equal(ir.hooks[0]?.name, 'my.fancy');
+    assert.deepEqual(warnings, []);
+  });
+
+  it('treats non-hook-shaped files in .agents/hooks/ as attachments with HH-W010', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/hooks/.DS_Store': 'finder junk',
+      '.agents/hooks/README.md': '# about these hooks\n',
+      '.agents/hooks/.gitkeep': '',
+      '.agents/hooks/x.toml': 'matcher = "Bash(*)"\n',
+      '.agents/hooks/pre-tool-use.lint.sh.bak': 'echo old\n',
+    });
+    assert.deepEqual(ir.hooks, []);
+    assert.deepEqual(
+      ir.attachments.map((a) => a.path),
+      [
+        '.agents/hooks/.DS_Store',
+        '.agents/hooks/.gitkeep',
+        '.agents/hooks/README.md',
+        '.agents/hooks/pre-tool-use.lint.sh.bak',
+        '.agents/hooks/x.toml',
+      ],
+    );
+    assert.equal(warnings.length, 5);
+    assert.equal(warnings.every((warning) => warning.code === 'HH-W010'), true);
+  });
+
+  it('treats a trailing-dot hook filename as a non-hook-shaped attachment', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/hooks/pre-tool-use.lint.': 'echo hi\n',
+    });
+    assert.deepEqual(ir.hooks, []);
+    assert.deepEqual(ir.attachments.map((a) => a.path), ['.agents/hooks/pre-tool-use.lint.']);
+    assert.equal(warnings[0]?.code, 'HH-W010');
+  });
+
+  it('treats a two-segment hooks file (no <name>) as a non-hook-shaped attachment', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/hooks/pre-tool-use.sh': 'echo hi\n',
+    });
+    assert.deepEqual(ir.hooks, []);
+    assert.deepEqual(ir.attachments.map((a) => a.path), ['.agents/hooks/pre-tool-use.sh']);
+    assert.equal(warnings[0]?.code, 'HH-W010');
+  });
 });
 
 describe('parseRepo — attachments and unknown files', () => {

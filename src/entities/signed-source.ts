@@ -12,6 +12,7 @@
  * header and are governed elsewhere, not by this module.
  */
 import { createHash } from 'node:crypto';
+import { InvalidSourcePathError } from './errors.js';
 
 export const HEADER_TAG = '@generated SignedSource';
 export const HASH_LEN = 16;
@@ -47,16 +48,27 @@ function sha256Hex(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex');
 }
 
-/** Sorts entries by path and joins `<path>:<sha256>` with `\n` (F2 U3). */
+/**
+ * Sorts entries by path and joins `<path>:<sha256>` with `\n` (F2 U3).
+ * Throws `InvalidSourcePathError` if a path contains `\n` — such a path
+ * would make the newline-joined manifest ambiguous.
+ */
 export function canonicalManifest(sources: SourceManifest): string {
   return [...sources]
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
-    .map((entry) => `${entry.path}:${entry.sha256}`)
+    .map((entry) => {
+      if (entry.path.includes('\n')) {
+        throw new InvalidSourcePathError(entry.path);
+      }
+      return `${entry.path}:${entry.sha256}`;
+    })
     .join('\n');
 }
 
 function bodyHash(body: string): string {
-  return sha256Hex(body).slice(0, HASH_LEN);
+  // CRLF → LF before hashing: verification stays EOL-insensitive, so a
+  // Windows autocrlf checkout does not produce false 'edited' results.
+  return sha256Hex(body.replace(/\r\n/g, '\n')).slice(0, HASH_LEN);
 }
 
 function sourcesHash(sources: SourceManifest): string {

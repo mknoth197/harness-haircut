@@ -26,6 +26,20 @@ export class ParseError extends DomainError {
   }
 }
 
+/**
+ * A SignedSource manifest entry path contains a newline (F2). Manifest lines
+ * are `\n`-joined, so such a path would make the manifest ambiguous; callers
+ * construct entries from walked repo paths, making this an internal bug.
+ */
+export class InvalidSourcePathError extends DomainError {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(`SignedSource manifest path contains a newline: ${JSON.stringify(path)}`, 70);
+    this.path = path;
+  }
+}
+
 /** Two adapters registered the same provider id (F3 UN1 — an internal wiring bug). */
 export class DuplicateAdapterError extends DomainError {
   readonly providerId: string;
