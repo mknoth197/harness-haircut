@@ -32,14 +32,19 @@ export function projectImportShim(
   reader: ProviderFileReader | undefined,
   providerId: string,
 ): ShimProjection {
-  const existing = reader?.read(path) ?? null;
-  if (existing === null) {
+  const raw = reader?.read(path) ?? null;
+  // An empty or whitespace-only file carries no user content to preserve and
+  // no conflicting instructions — treat it as absent and emit the shim.
+  if (raw === null || raw.trim() === '') {
     return {
       file: { path, body: SHIM_BODY, mode: 'overwrite' },
       warning: null,
       status: 'emitted',
     };
   }
+  // Strip a leading UTF-8 BOM before the first-line check: editors add it
+  // invisibly and it would otherwise mask a correct import shim.
+  const existing = raw.startsWith('\uFEFF') ? raw.slice(1) : raw;
   const newlineAt = existing.indexOf('\n');
   const firstLine = (newlineAt === -1 ? existing : existing.slice(0, newlineAt)).trimEnd();
   if (firstLine === SHIM_IMPORT_LINE) {

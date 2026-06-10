@@ -18,8 +18,9 @@
  *   convert s → ms here.
  *
  * Scoped fragments (`.agents/instructions/*.md`) have no Gemini projection
- * target (no rules/paths equivalent) and are not emitted — a known gap to
- * codify in a follow-up story.
+ * target (no rules/paths equivalent) and are not emitted; each one fires
+ * HH-W007 (canonical surface unrepresentable) in both settings and shim
+ * modes so the gap is never silent.
  */
 import type {
   EmittedFile,
@@ -86,6 +87,8 @@ export const geminiAdapter: ProviderAdapter = {
     // also fires UN2 (HH-W006) when the deprecated flat v1 key is present.
     // A malformed file throws MalformedProviderConfigError on first need
     // (UN1) — never consulted, never thrown (e.g. shim mode without hooks).
+    // Consequence (intentional): HH-W006 also does not fire in shim mode
+    // without hooks — the file is never touched, so its legacy key is moot.
     let settingsLoaded = false;
     let settings: Record<string, unknown> | null = null;
     const loadSettings = (): Record<string, unknown> | null => {
@@ -108,6 +111,24 @@ export const geminiAdapter: ProviderAdapter = {
     };
 
     // ---- instructions (EV1 settings mode / EV2 shim mode) ----
+    // HH-W007: scoped fragments are unrepresentable for Gemini in BOTH
+    // modes — context files have no path-scoping mechanism, so dropping a
+    // fragment must never be silent (PRD goal: zero silent data loss).
+    const fragments = ir.instructions
+      .filter((instruction) => !isAgentsMd(instruction))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    for (const fragmentInstruction of fragments) {
+      warnings.push({
+        code: 'HH-W007',
+        severity: 'warn',
+        message:
+          `scoped fragment ${fragmentInstruction.path} (scope "${fragmentInstruction.scope}") ` +
+          'cannot be projected for Gemini: Gemini context files have no path-scoping ' +
+          'mechanism, so the fragment is not emitted for this provider',
+        canonicalPath: fragmentInstruction.path,
+        providerId: 'gemini',
+      });
+    }
     const agentsInstructions = ir.instructions.filter(isAgentsMd);
     let instructionsStatus: SurfaceStatus = 'skipped';
     if (mode === 'settings') {

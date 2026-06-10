@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  EmitPathCollisionError,
   MalformedProviderConfigError,
   claudeAdapter,
   parseRepo,
@@ -18,7 +19,8 @@ interface HandlerEntry {
 }
 
 interface MatcherGroup {
-  matcher: string;
+  /** B5: deliberately absent — omitted matcher means match-all. */
+  matcher?: string;
   hooks: HandlerEntry[];
 }
 
@@ -80,6 +82,30 @@ describe('claudeAdapter — CLAUDE.md import shim (EV1/UN2)', () => {
     assert.equal(projection.warnings[0]?.providerId, 'claude');
     assert.match(projection.warnings[0]?.message ?? '', /^CLAUDE\.md exists/);
     assert.equal(projection.surfaces.instructions, 'skipped');
+  });
+
+  it('treats an empty or whitespace-only CLAUDE.md as absent and emits the shim', () => {
+    for (const existing of ['', '\n', '  \n\t\n']) {
+      const projection = claudeAdapter.project(
+        ir({ instructions: [rootInstruction()] }),
+        ctxWith({ 'CLAUDE.md': existing }),
+      );
+      assert.deepEqual(projection.files, [
+        { path: 'CLAUDE.md', body: '@AGENTS.md\n', mode: 'overwrite' },
+      ]);
+      assert.deepEqual(projection.warnings, []);
+      assert.equal(projection.surfaces.instructions, 'emitted');
+    }
+  });
+
+  it('strips a leading UTF-8 BOM before the first-line check (BOM shim is merged, not conflicting)', () => {
+    const projection = claudeAdapter.project(
+      ir({ instructions: [rootInstruction()] }),
+      ctxWith({ 'CLAUDE.md': '\uFEFF@AGENTS.md\n\nuser notes\n' }),
+    );
+    assert.deepEqual(projection.files, []);
+    assert.deepEqual(projection.warnings, []);
+    assert.equal(projection.surfaces.instructions, 'merged');
   });
 });
 
@@ -151,6 +177,41 @@ describe('claudeAdapter — scoped fragments → .claude/rules (EV2/OPT1)', () =
     assert.match(projection.warnings[0]?.message ?? '', /downgraded to "\*\*"/);
     assert.match(projection.files[0]?.body ?? '', /paths: \["\*\*"\]/);
   });
+
+  it('warns HH-W001 and downgrades a negated glob to "**" (B6)', () => {
+    const projection = claudeAdapter.project(
+      ir({ instructions: [fragment('no-vendor', '!vendor/**')] }),
+      ctxWith(),
+    );
+    assert.equal(projection.warnings.length, 1);
+    assert.equal(projection.warnings[0]?.code, 'HH-W001');
+    assert.equal(projection.warnings[0]?.providerId, 'claude');
+    assert.match(projection.warnings[0]?.message ?? '', /negation/);
+    assert.match(projection.files[0]?.body ?? '', /paths: \["\*\*"\]/);
+  });
+
+  it('names the loss in an HTML comment right after the header line (PRD §11 step 2)', () => {
+    const projection = claudeAdapter.project(
+      ir({ instructions: [fragment('no-vendor', '!vendor/**', '# Body\n')] }),
+      ctxWith(),
+    );
+    const lines = (projection.files[0]?.body ?? '').split('\n');
+    assert.match(lines[3] ?? '', HEADER_RE);
+    assert.equal(
+      lines[4],
+      '<!-- harness-haircut: glob downgraded from "!vendor/**" (HH-W001) -->',
+    );
+    assert.equal(lines.slice(5).join('\n'), '# Body\n');
+  });
+
+  it('passes parenthesized path segments through unwarned (legal in real paths)', () => {
+    const projection = claudeAdapter.project(
+      ir({ instructions: [fragment('marketing', 'app/(marketing)/**')] }),
+      ctxWith(),
+    );
+    assert.deepEqual(projection.warnings, []);
+    assert.match(projection.files[0]?.body ?? '', /paths: \["app\/\(marketing\)\/\*\*"\]/);
+  });
 });
 
 describe('claudeAdapter — skills → .claude/skills (EV4)', () => {
@@ -181,10 +242,39 @@ describe('claudeAdapter — skills → .claude/skills (EV4)', () => {
     assert.equal(copy?.body, script);
     assert.equal(copy?.mode, 'overwrite');
   });
+
+  it('throws EmitPathCollisionError when flattened attachment paths collide (unreachable via parseRepo)', () => {
+    // Only hand-constructed IR can hold attachments outside the skill folder,
+    // which is what forces the basename fallback into a collision.
+    assert.throws(
+      () =>
+        claudeAdapter.project(
+          ir({
+            skills: [
+              skill('deploy', [
+                { path: 'elsewhere/a/run.sh', content: 'a' },
+                { path: 'elsewhere/b/run.sh', content: 'b' },
+              ]),
+            ],
+          }),
+          ctxWith(),
+        ),
+      (err: unknown) => {
+        assert.equal(err instanceof EmitPathCollisionError, true);
+        const collision = err as EmitPathCollisionError;
+        assert.equal(collision.targetPath, '.claude/skills/deploy/run.sh');
+        assert.deepEqual(
+          [...collision.sourcePaths].sort(),
+          ['elsewhere/a/run.sh', 'elsewhere/b/run.sh'],
+        );
+        return true;
+      },
+    );
+  });
 });
 
 describe('claudeAdapter — hooks → .claude/settings.json merge-key (EV5/UN1)', () => {
-  it('emits the hooks key as merge-key with PascalCase events and canonical-path commands', () => {
+  it('emits the hooks key as merge-key with PascalCase events and $CLAUDE_PROJECT_DIR-anchored commands', () => {
     const projection = claudeAdapter.project(
       ir({ hooks: [hook('pre-tool-use', 'lint'), hook('pre-compact', 'save')] }),
       ctxWith(),
@@ -195,7 +285,11 @@ describe('claudeAdapter — hooks → .claude/settings.json merge-key (EV5/UN1)'
     const groups = hooksGroups(file?.body ?? '');
     assert.deepEqual(Object.keys(groups).sort(), ['PreCompact', 'PreToolUse']);
     assert.deepEqual(groups['PreToolUse'], [
-      { matcher: '*', hooks: [{ type: 'command', command: '.agents/hooks/pre-tool-use.lint.sh' }] },
+      {
+        hooks: [
+          { type: 'command', command: '$CLAUDE_PROJECT_DIR/.agents/hooks/pre-tool-use.lint.sh' },
+        ],
+      },
     ]);
     assert.equal(projection.surfaces.hooks, 'merged');
   });

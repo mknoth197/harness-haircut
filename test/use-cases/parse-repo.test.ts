@@ -184,6 +184,45 @@ describe('parseRepo — skills', () => {
     ));
 });
 
+describe('parseRepo — skill name validation (B2)', () => {
+  it('fails with exit code 3 on a path-traversal skill name', () =>
+    assertParseError(
+      {
+        '.agents/skills/evil/SKILL.md':
+          '---\nname: ../../.github/workflows/pwn\ndescription: nope\n---\nbody\n',
+      },
+      /\.agents\/skills\/evil\/SKILL\.md: invalid skill name "\.\.\/\.\.\/\.github\/workflows\/pwn".*\[a-z0-9\]/,
+    ));
+
+  it('fails with exit code 3 on a YAML-breaking skill name', () =>
+    assertParseError(
+      {
+        '.agents/skills/colon/SKILL.md':
+          '---\nname: "foo: bar"\ndescription: nope\n---\nbody\n',
+      },
+      /invalid skill name "foo: bar"/,
+    ));
+
+  it('accepts a hyphenated alphanumeric name per the Agent Skills standard', async () => {
+    const { ir } = await parseFixture({
+      '.agents/skills/ok/SKILL.md':
+        '---\nname: valid-skill-2\ndescription: fine\n---\nbody\n',
+    });
+    assert.equal(ir.skills[0]?.name, 'valid-skill-2');
+  });
+
+  it('rejects uppercase, leading/trailing, and doubled hyphens', async () => {
+    for (const name of ['Deploy', '-lead', 'trail-', 'a--b']) {
+      await assertParseError(
+        {
+          '.agents/skills/bad/SKILL.md': `---\nname: ${name}\ndescription: d\n---\nbody\n`,
+        },
+        /invalid skill name/,
+      );
+    }
+  });
+});
+
 describe('parseRepo — hooks', () => {
   it('lifts a valid hook file into event, name, and script', async () => {
     const script = '#!/bin/sh\nnpm run lint\n';
@@ -216,6 +255,24 @@ describe('parseRepo — hooks', () => {
     assert.equal(ir.hooks[0]?.name, 'my.fancy');
     assert.deepEqual(warnings, []);
   });
+
+  it('fails with exit code 3 on a hook-shaped filename containing a space (B3)', () =>
+    assertParseError(
+      { '.agents/hooks/pre-tool-use.lint all.sh': 'echo hi\n' },
+      /hook filenames are restricted to \[A-Za-z0-9\._-\] because they are embedded in provider shell commands/,
+    ));
+
+  it('fails with exit code 3 on a hook-shaped filename containing a backtick (B3)', () =>
+    assertParseError(
+      { '.agents/hooks/pre-tool-use.`evil`.sh': 'echo hi\n' },
+      /hook filenames are restricted to/,
+    ));
+
+  it('fails with exit code 3 on a hook-shaped filename containing $( (B3)', () =>
+    assertParseError(
+      { '.agents/hooks/pre-tool-use.$(whoami).sh': 'echo hi\n' },
+      /hook filenames are restricted to/,
+    ));
 
   it('treats non-hook-shaped files in .agents/hooks/ as attachments with HH-W010', async () => {
     const { ir, warnings } = await parseFixture({

@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { MalformedProviderConfigError, geminiAdapter } from '../../dist/index.js';
 import type { EmittedFile } from '../../dist/index.js';
-import { ctxWith, hook, ir, nestedInstruction, rootInstruction, skill } from '../_helpers/ir.ts';
+import { ctxWith, fragment, hook, ir, nestedInstruction, rootInstruction, skill } from '../_helpers/ir.ts';
 
 interface HandlerEntry {
   type: string;
@@ -11,7 +11,8 @@ interface HandlerEntry {
 }
 
 interface MatcherGroup {
-  matcher: string;
+  /** B5: deliberately absent — omitted matcher means match-all on every provider. */
+  matcher?: string;
   hooks: HandlerEntry[];
 }
 
@@ -152,9 +153,18 @@ describe('geminiAdapter — hooks (EV4/OPT1)', () => {
       'PreCompress',
     ]);
     assert.deepEqual(groups['BeforeTool'], [
-      { matcher: '*', hooks: [{ type: 'command', command: '.agents/hooks/pre-tool-use.lint.sh' }] },
+      { hooks: [{ type: 'command', command: '.agents/hooks/pre-tool-use.lint.sh' }] },
     ]);
     assert.equal(projection.surfaces.hooks, 'merged');
+  });
+
+  it('omits the matcher key entirely — absent means match-all; "*" is undocumented for Gemini (B5)', () => {
+    const projection = geminiAdapter.project(ir({ hooks: [hook('stop', 'notify')] }), ctxWith());
+    const groups = JSON.parse(mergeFileFor(projection.files, 'hooks')?.body ?? '') as Record<
+      string,
+      Record<string, unknown>[]
+    >;
+    assert.equal(groups['AfterAgent']?.[0] !== undefined && 'matcher' in (groups['AfterAgent'][0] ?? {}), false);
   });
 
   it('omits the timeout field — canonical hook metadata carries none (ms conversion deferred)', () => {
@@ -190,6 +200,56 @@ describe('geminiAdapter — hooks (EV4/OPT1)', () => {
     const projection = geminiAdapter.project(ir({ hooks: [hook('subagent-start', 'track')] }), ctxWith());
     assert.deepEqual(projection.files, []);
     assert.equal(projection.surfaces.hooks, 'skipped');
+  });
+});
+
+describe('geminiAdapter — scoped fragments are unrepresentable (B1 / HH-W007)', () => {
+  it('warns HH-W007 per fragment with canonicalPath and providerId in settings mode', () => {
+    const projection = geminiAdapter.project(
+      ir({
+        instructions: [
+          fragment('testing', 'test/**/*.ts'),
+          fragment('arch', 'src/**'),
+        ],
+      }),
+      ctxWith(),
+    );
+    assert.deepEqual(projection.files, []);
+    const w007 = projection.warnings.filter((warning) => warning.code === 'HH-W007');
+    assert.equal(w007.length, 2);
+    assert.deepEqual(
+      w007.map((warning) => warning.canonicalPath),
+      ['.agents/instructions/arch.md', '.agents/instructions/testing.md'],
+    );
+    assert.equal(w007[0]?.providerId, 'gemini');
+    assert.equal(w007[0]?.severity, 'warn');
+    assert.match(w007[0]?.message ?? '', /no path-scoping mechanism/);
+    assert.match(w007[1]?.message ?? '', /\.agents\/instructions\/testing\.md/);
+    // Surface status logic is unchanged: no AGENTS.md content → skipped.
+    assert.equal(projection.surfaces.instructions, 'skipped');
+  });
+
+  it('warns HH-W007 alongside the context.fileName merge emit when AGENTS.md is also present', () => {
+    const projection = geminiAdapter.project(
+      ir({ instructions: [rootInstruction(), fragment('testing', 'test/**/*.ts')] }),
+      ctxWith(),
+    );
+    assert.equal(mergeFileFor(projection.files, 'context.fileName')?.path, '.gemini/settings.json');
+    assert.equal(projection.surfaces.instructions, 'merged');
+    const w007 = projection.warnings.filter((warning) => warning.code === 'HH-W007');
+    assert.equal(w007.length, 1);
+    assert.equal(w007[0]?.canonicalPath, '.agents/instructions/testing.md');
+  });
+
+  it('warns HH-W007 in shim mode too (the gap is mode-independent)', () => {
+    const projection = geminiAdapter.project(
+      ir({ instructions: [rootInstruction(), fragment('testing', 'test/**/*.ts')] }),
+      ctxWith({}, { mode: 'shim' }),
+    );
+    assert.deepEqual(projection.files.map((file) => file.path), ['GEMINI.md']);
+    const w007 = projection.warnings.filter((warning) => warning.code === 'HH-W007');
+    assert.equal(w007.length, 1);
+    assert.equal(w007[0]?.canonicalPath, '.agents/instructions/testing.md');
   });
 });
 

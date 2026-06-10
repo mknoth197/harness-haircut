@@ -10,8 +10,9 @@
  *   SignedSource header on line 1, then an HTML comment explaining the
  *   file exists for code review and AGENTS.md is authoritative),
  * - scoped fragments → `.github/instructions/hh.<name>.instructions.md`
- *   with `applyTo:` frontmatter (header after the frontmatter — same
- *   flagged convention as A2),
+ *   with `applyTo:` frontmatter (header after the frontmatter via
+ *   `embedHeaderAfterFrontmatter` — PRD §9 "Header placement and
+ *   carve-outs", same convention as A2),
  * - nested AGENTS.md → `.github/instructions/hh.nested-<dir-with-dashes>
  *   .instructions.md` with `applyTo: "<dir>/**"` so review still sees
  *   nested content (EV2b); other surfaces read nested AGENTS.md natively
@@ -21,8 +22,8 @@
  * Hooks go to fully-owned `.github/hooks/harness-haircut.json` pinned to
  * the conservative cross-surface entry schema
  * `{type: "command", bash, powershell}` (PRD §14 risk 3). JSON carries no
- * comments, so this owned file takes NO SignedSource header (flagged §9
- * gap — drift detection falls back to full-content comparison) and the
+ * comments, so this owned file takes NO SignedSource header (PRD §9
+ * carve-out — drift detection falls back to full-content comparison) and the
  * two operational caveats below are exported as `COPILOT_HOOK_NOTES` for
  * the C-series to surface (the adapter is pure and cannot see the current
  * git branch, so A4 UN2's "non-default branch" note is emitted by the
@@ -39,7 +40,7 @@ import type {
 } from '../entities/adapter.js';
 import { EmitPathCollisionError } from '../entities/errors.js';
 import type { IR, Instruction } from '../entities/ir.js';
-import { embedHeader } from '../entities/signed-source.js';
+import { embedHeader, embedHeaderAfterFrontmatter } from '../entities/signed-source.js';
 import type { Warning } from '../entities/warnings.js';
 import { COPILOT_EVENT_MAP } from './event-maps.js';
 import { groupHooksByProviderEvent } from './hook-projection.js';
@@ -95,13 +96,36 @@ function expandBraces(glob: string): string[] {
 }
 
 /**
+ * Nested braces (a `{` opening before the matching `}` of an already-open
+ * brace) defeat `expandBraces`' naive first-`}` matching — the expansion
+ * would be broken, so the whole glob is downgraded instead.
+ */
+function hasNestedBraces(glob: string): boolean {
+  let depth = 0;
+  for (const char of glob) {
+    if (char === '{') {
+      depth += 1;
+      if (depth > 1) {
+        return true;
+      }
+    } else if (char === '}') {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  return false;
+}
+
+/**
  * A4 OPT1 / HH-W001. Copilot's documented `applyTo` dialect supports
  * comma-separated `*`/`**` globs — no negation, no braces. Downgrade rules:
  * - leading `!` (negation): inverting cannot be expressed; fall back to
  *   `**` (the instruction applies everywhere — over-matching keeps it
  *   visible, silently dropping it would lose content),
- * - brace expansion: expand into the equivalent comma-separated glob list
- *   (closest expressible form; still warned per the story).
+ * - nested braces: cannot be expanded faithfully; fall back to `**` rather
+ *   than emitting a broken expansion,
+ * - single-level brace expansion: expand into the equivalent
+ *   comma-separated glob list (closest expressible form; still warned per
+ *   the story).
  */
 function copilotApplyTo(instruction: Instruction): { globs: string[]; warning: Warning | null } {
   const scope = instruction.scope;
@@ -114,6 +138,21 @@ function copilotApplyTo(instruction: Instruction): { globs: string[]; warning: W
         message:
           `scope glob "${scope}" uses negation, which Copilot's applyTo dialect cannot ` +
           'express; downgraded to "**" (instructions apply to every file)',
+        canonicalPath: instruction.path,
+        providerId: 'copilot',
+      },
+    };
+  }
+  if (hasNestedBraces(scope)) {
+    return {
+      globs: ['**'],
+      warning: {
+        code: 'HH-W001',
+        severity: 'warn',
+        message:
+          `scope glob "${scope}" uses nested brace expansion, which cannot be expanded ` +
+          'faithfully for Copilot\'s applyTo dialect; downgraded to "**" (instructions ' +
+          'apply to every file)',
         canonicalPath: instruction.path,
         providerId: 'copilot',
       },
@@ -137,10 +176,28 @@ function copilotApplyTo(instruction: Instruction): { globs: string[]; warning: W
   return { globs: [scope], warning: null };
 }
 
-function instructionsFile(targetPath: string, applyToGlobs: string[], instruction: Instruction): EmittedFile {
-  const frontmatter = `---\napplyTo: ${JSON.stringify(applyToGlobs.join(', '))}\n---\n`;
-  const body = embedHeader(instruction.body, [instructionSourceEntry(instruction)], 'html');
-  return { path: targetPath, body: frontmatter + body, mode: 'overwrite' };
+/** PRD §11 step 2: a lossy downgrade is named inside the emitted file (see A2's twin). */
+function lossComment(originalGlob: string): string {
+  return `<!-- harness-haircut: glob downgraded from ${JSON.stringify(originalGlob)} (HH-W001) -->\n`;
+}
+
+function instructionsFile(
+  targetPath: string,
+  applyToGlobs: string[],
+  instruction: Instruction,
+  downgraded = false,
+): EmittedFile {
+  // No space after the comma: Copilot's applyTo examples are not documented
+  // to tolerate whitespace between comma-separated globs (B4).
+  const frontmatter = `---\napplyTo: ${JSON.stringify(applyToGlobs.join(','))}\n---\n`;
+  const loss = downgraded ? lossComment(instruction.scope) : '';
+  return {
+    path: targetPath,
+    body: embedHeaderAfterFrontmatter(frontmatter + loss + instruction.body, [
+      instructionSourceEntry(instruction),
+    ]),
+    mode: 'overwrite',
+  };
 }
 
 const REVIEW_NOTE =
@@ -192,7 +249,7 @@ export const copilotAdapter: ProviderAdapter = {
         if (warning !== null) {
           warnings.push(warning);
         }
-        files.push(instructionsFile(target, globs, instruction));
+        files.push(instructionsFile(target, globs, instruction, warning !== null));
       }
     }
     const instructionsStatus: SurfaceStatus = ir.instructions.length > 0 ? 'emitted' : 'skipped';

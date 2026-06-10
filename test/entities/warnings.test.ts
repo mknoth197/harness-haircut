@@ -9,6 +9,7 @@ const EXPECTED_CODES = [
   'HH-W004',
   'HH-W005',
   'HH-W006',
+  'HH-W007',
   'HH-W010',
   'HH-W011',
 ];

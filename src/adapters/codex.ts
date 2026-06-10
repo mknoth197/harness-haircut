@@ -35,20 +35,19 @@ function isAgentsMd(instruction: Instruction): boolean {
 
 /**
  * Minimal `[hooks]` table detection over the TOML line grammar (zero npm
- * deps): a `[hooks]` / `[hooks.<sub>]` / `[[hooks…]]` header line outside of
- * full-line comments. Values containing such text on key-value lines are not
- * misdetected because table headers must start the (trimmed) line.
+ * deps): a `[hooks]` / `[ hooks ]` / `["hooks"]` / `[hooks.<sub>]` /
+ * `[[hooks…]]` header line outside of full-line comments (TOML allows
+ * whitespace inside brackets and quoted keys). Values containing such text
+ * on key-value lines are not misdetected because table headers must start
+ * the (trimmed) line. Known false positive: a multi-line TOML string
+ * containing a line that itself looks like a `[hooks]` header is misdetected
+ * — the line grammar cannot track string state; acceptable for a warn-only
+ * signal.
  */
 function hasHooksTable(toml: string): boolean {
-  return toml.split('\n').some((line) => {
-    const trimmed = line.trim();
-    return (
-      trimmed === '[hooks]' ||
-      trimmed.startsWith('[hooks.') ||
-      trimmed === '[[hooks]]' ||
-      trimmed.startsWith('[[hooks.')
-    );
-  });
+  return toml
+    .split('\n')
+    .some((line) => /^\[{1,2}\s*(?:"hooks"|'hooks'|hooks)\s*[\].]/.test(line.trim()));
 }
 
 function renderHooksJson(byEvent: ReadonlyMap<string, readonly Hook[]>): string {
@@ -79,7 +78,9 @@ export const codexAdapter: ProviderAdapter = {
         message:
           `combined AGENTS.md content is ${chainBytes} bytes, over Codex's ` +
           `${CODEX_PROJECT_DOC_MAX_BYTES}-byte project_doc_max_bytes default; ` +
-          'Codex silently stops loading files past the cap',
+          'Codex silently stops loading files past the cap (note: this sum is an ' +
+          'over-approximation — it adds every AGENTS.md body in the repo, while ' +
+          'Codex applies the cap per root→cwd chain)',
         providerId: 'codex',
       });
     }

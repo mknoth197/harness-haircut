@@ -17,7 +17,8 @@ interface HandlerEntry {
 }
 
 interface MatcherGroup {
-  matcher: string;
+  /** B5: deliberately absent — omitted matcher means match-all. */
+  matcher?: string;
   hooks: HandlerEntry[];
 }
 
@@ -69,13 +70,21 @@ describe('codexAdapter — hooks projection (EV2/EV3)', () => {
       hooks: {
         PreToolUse: [
           {
-            matcher: '*',
             hooks: [{ type: 'command', command: '.agents/hooks/pre-tool-use.lint.sh' }],
           },
         ],
       },
     });
     assert.equal(projection.surfaces.hooks, 'emitted');
+  });
+
+  it('omits the matcher key — absent means match-all; "*" is undocumented for Codex (B5)', () => {
+    const projection = codexAdapter.project(ir({ hooks: [hook('stop', 'notify')] }), ctxWith());
+    const doc = JSON.parse(projection.files[0]?.body ?? '') as {
+      hooks: Record<string, Record<string, unknown>[]>;
+    };
+    const group = doc.hooks['Stop']?.[0];
+    assert.equal(group !== undefined && 'matcher' in group, false);
   });
 
   it('emits a stable thin command referencing the canonical script path, never the body (EV3)', () => {
@@ -99,7 +108,7 @@ describe('codexAdapter — hooks projection (EV2/EV3)', () => {
     assert.deepEqual(Object.keys(doc.hooks).sort(), ['PreCompact', 'SessionStart', 'UserPromptSubmit']);
   });
 
-  it('groups multiple hooks for one event into a single "*" matcher group, sorted by path', () => {
+  it('groups multiple hooks for one event into a single match-all group, sorted by path', () => {
     const projection = codexAdapter.project(
       ir({ hooks: [hook('pre-tool-use', 'zebra'), hook('pre-tool-use', 'alpha')] }),
       ctxWith(),
@@ -186,6 +195,28 @@ describe('codexAdapter — existing [hooks] table (UN2 / HH-W005)', () => {
     const projection = codexAdapter.project(
       ir({ hooks: [hook('stop', 'notify')] }),
       ctxWith({ '.codex/config.toml': '[features]\nhooks = false\n' }),
+    );
+    assert.deepEqual(projection.warnings, []);
+  });
+
+  it('detects whitespace and quoted-key table-header forms ([ hooks ], ["hooks"])', () => {
+    for (const header of ['[ hooks ]', '["hooks"]', "['hooks']", '[ hooks . pre ]', '[[ hooks ]]']) {
+      const projection = codexAdapter.project(
+        ir({ hooks: [hook('stop', 'notify')] }),
+        ctxWith({ '.codex/config.toml': `${header}\nfoo = "bar"\n` }),
+      );
+      assert.deepEqual(
+        projection.warnings.map((warning) => warning.code),
+        ['HH-W005'],
+        `expected HH-W005 for header form ${header}`,
+      );
+    }
+  });
+
+  it('does not misdetect hooks-prefixed table names or key-value lines', () => {
+    const projection = codexAdapter.project(
+      ir({ hooks: [hook('stop', 'notify')] }),
+      ctxWith({ '.codex/config.toml': '[hooks_extra]\nnote = "[hooks]"\n' }),
     );
     assert.deepEqual(projection.warnings, []);
   });

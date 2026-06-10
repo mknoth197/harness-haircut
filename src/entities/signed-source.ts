@@ -109,3 +109,80 @@ export function verifyHeader(file: string, currentSources: SourceManifest): Veri
   }
   return { status: 'clean' };
 }
+
+/**
+ * Returns the offset just past the closing `---` delimiter line (i.e. the
+ * start of the first body line) of a leading frontmatter block, or `null`
+ * when the content does not begin with a complete `---`-delimited block.
+ */
+function frontmatterEnd(content: string): number | null {
+  const lines = content.split('\n');
+  if ((lines[0] ?? '').trimEnd() !== '---') {
+    return null;
+  }
+  let offset = (lines[0] ?? '').length + 1;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (line.trimEnd() === '---') {
+      return Math.min(offset + line.length + 1, content.length);
+    }
+    offset += line.length + 1;
+  }
+  return null;
+}
+
+/**
+ * Frontmatter-bearing variant of `embedHeader` (PRD §9 "Header placement and
+ * carve-outs"): providers need YAML frontmatter on line 1 to parse
+ * `paths:` / `applyTo:` / `name:`, so the header line cannot be first.
+ * Instead it is inserted immediately after the closing `---`, and
+ * `BODY_HASH` covers the **entire** content — frontmatter and body
+ * (CRLF-normalized) — so an edit to a frontmatter glob line still verifies
+ * as 'edited'. `content` MUST begin with a `---`-delimited frontmatter
+ * block; adapters construct that block themselves, so a violation is an
+ * internal bug.
+ */
+export function embedHeaderAfterFrontmatter(content: string, sources: SourceManifest): string {
+  const end = frontmatterEnd(content);
+  if (end === null) {
+    throw new Error(
+      'embedHeaderAfterFrontmatter requires content beginning with a "---"-delimited frontmatter block',
+    );
+  }
+  const line = `${HEADER_TAG}<<<${bodyHash(content)}.${sourcesHash(sources)}>>> harness-haircut DO NOT EDIT`;
+  const head = content.slice(0, end);
+  const separator = head.endsWith('\n') ? '' : '\n';
+  return `${head}${separator}${COMMENT_WRAPPERS.html(line)}\n${content.slice(end)}`;
+}
+
+/**
+ * Counterpart verifier for `embedHeaderAfterFrontmatter`: recognizes the
+ * header on the first line after the closing `---` of a leading frontmatter
+ * block, strips that header line, and hashes the remainder (frontmatter +
+ * body). Same four-state verdict as `verifyHeader`; `edited` wins over
+ * `stale`.
+ */
+export function verifyHeaderAfterFrontmatter(
+  file: string,
+  currentSources: SourceManifest,
+): VerifyResult {
+  const end = frontmatterEnd(file);
+  if (end === null || end >= file.length) {
+    return { status: 'unmanaged' };
+  }
+  const rest = file.slice(end);
+  const newlineAt = rest.indexOf('\n');
+  const headerLine = newlineAt === -1 ? rest : rest.slice(0, newlineAt);
+  const match = HEADER_RE.exec(headerLine);
+  if (match === null) {
+    return { status: 'unmanaged' };
+  }
+  const body = file.slice(0, end) + (newlineAt === -1 ? '' : rest.slice(newlineAt + 1));
+  if (match[1] !== bodyHash(body)) {
+    return { status: 'edited' };
+  }
+  if (match[2] !== sourcesHash(currentSources)) {
+    return { status: 'stale' };
+  }
+  return { status: 'clean' };
+}

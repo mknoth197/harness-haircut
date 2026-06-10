@@ -14,11 +14,10 @@
  *
  * SignedSource convention for files with frontmatter (`.claude/rules/`,
  * `.claude/skills/<n>/SKILL.md`): Claude needs YAML frontmatter on line 1
- * to parse `paths:` / `name:`, but PRD §9 puts the header on line 1 —
- * the two cannot both hold. Resolution: frontmatter first, header as the
- * first line *after* the closing `---`. This needs a §9 amendment and a
- * frontmatter-aware `verifyHeader` before C1 can verify these files
- * (`verifyHeader` currently reports them 'unmanaged').
+ * to parse `paths:` / `name:`, so the header goes on the first line *after*
+ * the closing `---` via `embedHeaderAfterFrontmatter`, with BODY_HASH
+ * covering frontmatter + body (PRD §9 "Header placement and carve-outs";
+ * C1 verifies with `verifyHeaderAfterFrontmatter`).
  *
  * Skill sibling attachments are copied verbatim with NO header: a header
  * would corrupt shebang lines, JSON, and binary-ish assets. Drift detection
@@ -36,8 +35,9 @@ import type {
   RepoSnapshot,
   SurfaceStatus,
 } from '../entities/adapter.js';
+import { EmitPathCollisionError } from '../entities/errors.js';
 import type { IR, Instruction, Skill } from '../entities/ir.js';
-import { embedHeader } from '../entities/signed-source.js';
+import { embedHeaderAfterFrontmatter } from '../entities/signed-source.js';
 import type { Warning } from '../entities/warnings.js';
 import { CLAUDE_EVENT_MAP } from './event-maps.js';
 import { buildMatcherHookGroups, groupHooksByProviderEvent } from './hook-projection.js';
@@ -62,13 +62,30 @@ function fragmentName(path: string): string {
 
 /**
  * A2 OPT1 / HH-W001. Claude's `paths:` dialect supports `*`/`**` globs and
- * brace expansion; regex-like syntax (alternation, anchors, groups,
- * escapes) is not a glob and would silently never match. Downgrade rule:
- * unsupported syntax falls back to `**` (the rule loads for every file) —
- * over-matching keeps the instruction visible, under-matching would lose it.
+ * brace expansion; regex-like syntax (alternation, anchors, escapes) is not
+ * a glob and would silently never match, and leading-`!` negation cannot be
+ * expressed either. Bare parens/`+` are NOT treated as regex-like — they are
+ * legal in real path names (e.g. Next.js `app/(marketing)/`). Downgrade
+ * rule: unsupported syntax falls back to `**` (the rule loads for every
+ * file) — over-matching keeps the instruction visible, under-matching would
+ * lose it.
  */
 function claudePathsGlob(instruction: Instruction): { glob: string; warning: Warning | null } {
-  if (/[()|^$+]|\\/.test(instruction.scope)) {
+  if (instruction.scope.startsWith('!')) {
+    return {
+      glob: '**',
+      warning: {
+        code: 'HH-W001',
+        severity: 'warn',
+        message:
+          `scope glob "${instruction.scope}" uses negation, which Claude's paths: ` +
+          'dialect cannot express; downgraded to "**" (rule loads for every file)',
+        canonicalPath: instruction.path,
+        providerId: 'claude',
+      },
+    };
+  }
+  if (/[|^$\\]/.test(instruction.scope)) {
     return {
       glob: '**',
       warning: {
@@ -85,22 +102,45 @@ function claudePathsGlob(instruction: Instruction): { glob: string; warning: War
   return { glob: instruction.scope, warning: null };
 }
 
-function ruleFile(instruction: Instruction, glob: string): EmittedFile {
+/**
+ * PRD §11 step 2: a lossy downgrade is named inside the emitted file. The
+ * comment sits between the frontmatter and the body, so the header inserted
+ * by `embedHeaderAfterFrontmatter` lands directly above it and BODY_HASH
+ * covers it.
+ */
+function lossComment(originalGlob: string): string {
+  return `<!-- harness-haircut: glob downgraded from ${JSON.stringify(originalGlob)} (HH-W001) -->\n`;
+}
+
+function ruleFile(instruction: Instruction, glob: string, downgraded: boolean): EmittedFile {
   const frontmatter = `---\npaths: [${JSON.stringify(glob)}]\n---\n`;
-  const body = embedHeader(instruction.body, [instructionSourceEntry(instruction)], 'html');
+  const loss = downgraded ? lossComment(instruction.scope) : '';
   return {
     path: `.claude/rules/hh.${fragmentName(instruction.path)}.md`,
-    body: frontmatter + body,
+    body: embedHeaderAfterFrontmatter(frontmatter + loss + instruction.body, [
+      instructionSourceEntry(instruction),
+    ]),
     mode: 'overwrite',
   };
 }
 
 function skillFiles(skill: Skill): EmittedFile[] {
   const frontmatter = `---\nname: ${skill.name}\ndescription: ${JSON.stringify(skill.description)}\n---\n`;
-  const body = embedHeader(skill.body, [skillSourceEntry(skill)], 'html');
   const files: EmittedFile[] = [
-    { path: `.claude/skills/${skill.name}/SKILL.md`, body: frontmatter + body, mode: 'overwrite' },
+    {
+      path: `.claude/skills/${skill.name}/SKILL.md`,
+      body: embedHeaderAfterFrontmatter(frontmatter + skill.body, [skillSourceEntry(skill)]),
+      mode: 'overwrite',
+    },
   ];
+  // Collision guard for flattened attachment paths (mirrors A4 UN1).
+  // Currently unreachable through parseRepo: skill.files only ever contains
+  // paths under the skill's own folder, so the basename fallback — the only
+  // route to a collision — fires only for hand-constructed IR. Guarded
+  // anyway so a future parser change cannot introduce a silent overwrite.
+  const sourceByTarget = new Map<string, string>([
+    [`.claude/skills/${skill.name}/SKILL.md`, skill.path],
+  ]);
   const skillDir = dirOf(skill.path);
   const attachments = [...skill.files].sort((a, b) =>
     a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
@@ -109,11 +149,13 @@ function skillFiles(skill: Skill): EmittedFile[] {
     const relative = attachment.path.startsWith(`${skillDir}/`)
       ? attachment.path.slice(skillDir.length + 1)
       : attachment.path.slice(attachment.path.lastIndexOf('/') + 1);
-    files.push({
-      path: `.claude/skills/${skill.name}/${relative}`,
-      body: attachment.content,
-      mode: 'overwrite',
-    });
+    const target = `.claude/skills/${skill.name}/${relative}`;
+    const existing = sourceByTarget.get(target);
+    if (existing !== undefined) {
+      throw new EmitPathCollisionError(target, existing, attachment.path);
+    }
+    sourceByTarget.set(target, attachment.path);
+    files.push({ path: target, body: attachment.content, mode: 'overwrite' });
   }
   return files;
 }
@@ -154,7 +196,7 @@ export const claudeAdapter: ProviderAdapter = {
         if (warning !== null) {
           warnings.push(warning);
         }
-        files.push(ruleFile(instruction, glob));
+        files.push(ruleFile(instruction, glob, warning !== null));
         emitted += 1;
       }
     }
@@ -182,9 +224,12 @@ export const claudeAdapter: ProviderAdapter = {
       // UN1: validate before targeting the co-owned file; a malformed
       // settings.json cannot be merged into without risking user content.
       readProviderJson(reader, '.claude/settings.json');
+      // Claude docs: project-relative hook commands should be anchored with
+      // $CLAUDE_PROJECT_DIR (the session cwd can differ from the repo root).
+      // Safe to interpolate: B3 restricts hook basenames to [A-Za-z0-9._-].
       const groups = buildMatcherHookGroups(byEvent, (hook) => ({
         type: 'command',
-        command: hook.path,
+        command: `$CLAUDE_PROJECT_DIR/${hook.path}`,
       }));
       files.push({
         path: '.claude/settings.json',

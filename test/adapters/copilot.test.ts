@@ -125,16 +125,18 @@ describe('copilotAdapter — filename collisions (UN1)', () => {
 });
 
 describe('copilotAdapter — lossy applyTo globs (OPT1 / HH-W001)', () => {
-  it('expands brace globs into comma-separated applyTo entries and warns', () => {
+  it('expands brace globs into comma-separated applyTo entries (no space, B4) and warns', () => {
     const projection = copilotAdapter.project(
       ir({ instructions: [fragment('web', 'src/**/*.{ts,tsx}')] }),
       ctxWith(),
     );
     assert.equal(projection.warnings.length, 1);
     assert.equal(projection.warnings[0]?.code, 'HH-W001');
+    // The human-readable message keeps the ", " separator …
     assert.match(projection.warnings[0]?.message ?? '', /src\/\*\*\/\*\.ts, src\/\*\*\/\*\.tsx/);
+    // … but the emitted applyTo value joins with a bare comma.
     const file = fileAt(projection.files, '.github/instructions/hh.web.instructions.md');
-    assert.match(file?.body ?? '', /applyTo: "src\/\*\*\/\*\.ts, src\/\*\*\/\*\.tsx"/);
+    assert.match(file?.body ?? '', /applyTo: "src\/\*\*\/\*\.ts,src\/\*\*\/\*\.tsx"/);
   });
 
   it('downgrades a negated glob to "**" and warns', () => {
@@ -150,12 +152,41 @@ describe('copilotAdapter — lossy applyTo globs (OPT1 / HH-W001)', () => {
     );
   });
 
-  it('passes plain globs through without warning', () => {
+  it('downgrades a nested-brace glob to "**" instead of emitting a broken expansion (D)', () => {
+    const projection = copilotAdapter.project(
+      ir({ instructions: [fragment('odd', 'src/{a,{b,c}}/**')] }),
+      ctxWith(),
+    );
+    assert.equal(projection.warnings.length, 1);
+    assert.equal(projection.warnings[0]?.code, 'HH-W001');
+    assert.match(projection.warnings[0]?.message ?? '', /nested brace/);
+    const file = fileAt(projection.files, '.github/instructions/hh.odd.instructions.md');
+    assert.match(file?.body ?? '', /applyTo: "\*\*"/);
+    assert.doesNotMatch(file?.body ?? '', /applyTo: "[^"]*\{/);
+  });
+
+  it('names the loss in an HTML comment right after the header line (PRD §11 step 2)', () => {
+    const projection = copilotAdapter.project(
+      ir({ instructions: [fragment('no-vendor', '!vendor/**', '# Body\n')] }),
+      ctxWith(),
+    );
+    const file = fileAt(projection.files, '.github/instructions/hh.no-vendor.instructions.md');
+    const lines = (file?.body ?? '').split('\n');
+    assert.match(lines[3] ?? '', HEADER_RE);
+    assert.equal(
+      lines[4],
+      '<!-- harness-haircut: glob downgraded from "!vendor/**" (HH-W001) -->',
+    );
+    assert.equal(lines.slice(5).join('\n'), '# Body\n');
+  });
+
+  it('passes plain globs through without warning or loss comment', () => {
     const projection = copilotAdapter.project(
       ir({ instructions: [fragment('api', 'src/api/**')] }),
       ctxWith(),
     );
     assert.deepEqual(projection.warnings, []);
+    assert.doesNotMatch(projection.files[0]?.body ?? '', /glob downgraded/);
   });
 });
 

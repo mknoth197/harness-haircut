@@ -204,7 +204,7 @@ Every file `harness-haircut` emits begins with one of:
 
 - **`BODY_HASH`** = lowercase hex of `SHA-256(content_after_header_line)`, truncated to 16 chars. Binds the emitted body. Bodies are normalized `\r\n` → `\n` before hashing (in both embed and verify), so verification is EOL-insensitive and Windows autocrlf checkouts do not produce false `edited` results.
 - **`SOURCES_HASH`** = lowercase hex of `SHA-256(sources_manifest)`, truncated to 16 chars. Binds the canonical inputs.
-- **`sources_manifest`** = `<canonical_path>:<sha256_of_content>` lines for every canonical file that contributed to this projection, sorted by path, joined with `\n`.
+- **`sources_manifest`** = `<canonical_path>:<sha256_of_ir_serialization>` lines for every canonical source that contributed to this projection, sorted by path, joined with `\n`. The per-source hash covers the **IR-visible serialization** exported by `src/adapters/source-manifest.ts` (e.g. `scope` + body for an instruction, `name` + `description` + body for a skill), **not** the raw file bytes — adapters see the parsed IR, and a frontmatter-only edit (say, a `scope:` change) must still flip `SOURCES_HASH`. Embed and verify go through the same helpers, so the choice of serialization is self-consistent.
 
 Verification takes the disk file **and** the current canonical sources, and returns one of four states:
 
@@ -217,6 +217,17 @@ Verification takes the disk file **and** the current canonical sources, and retu
 
 - On `apply`: `clean` → skip; `stale` → overwrite; `edited` → prompt; `unmanaged` at a target path → refuse with error.
 - On `audit`: any state other than `clean` for an expected emitted file is reported (`stale`/`edited` → drift, exit 1; `unmanaged` → drift with a distinct message).
+
+### Header placement and carve-outs (v0.3.1)
+
+The adapter work (A1–A4) surfaced emitted-file classes the line-1 rule cannot govern. The complete placement policy:
+
+1. **Frontmatter-bearing emitted files** (`.claude/rules/hh.*.md`, `.claude/skills/<name>/SKILL.md`, `.github/instructions/hh.*.instructions.md`): the provider requires YAML frontmatter on line 1 to parse `paths:` / `name:` / `applyTo:`, so the header is placed **immediately after the closing `---` of the frontmatter block**, and `BODY_HASH` covers the **entire content — frontmatter and body** (CRLF-normalized). An edit to a frontmatter glob line therefore verifies as `edited`, exactly like a body edit. Implemented by `embedHeaderAfterFrontmatter` / `verifyHeaderAfterFrontmatter` in `src/entities/signed-source.ts`.
+2. **Fully-owned headerless JSON files** (`.codex/hooks.json`, `.github/hooks/*.json`): JSON carries no comments, so no header. Drift detection is **full-content comparison** against the current projection. This collapses `edited` and `stale` into one "differs" state; distinguishing them for this class requires comparing against a recorded prior emission — a C2 design concern (see the design note in the C2 story), not a header concern.
+3. **Skill sibling attachments** (`.claude/skills/<name>/<relative>` copies of non-`SKILL.md` skill files): copied **verbatim with no header** — a header would corrupt shebang lines, JSON, and binary-ish assets. Drift detection is full-content comparison against the canonical attachment.
+4. **`SOURCES_HASH` input**: computed over the IR-visible serialization exported by `src/adapters/source-manifest.ts`, not raw canonical file bytes (see the amended `sources_manifest` definition above).
+
+Carve-outs 1–2 of the original list (one-line import shims, merge-key targets) are unchanged.
 
 ## 10. Provider mapping & merge policy *(new)*
 

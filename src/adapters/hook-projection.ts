@@ -63,10 +63,13 @@ export function groupHooksByProviderEvent(
 }
 
 /**
- * Builds the `{"<Event>": [{"matcher": "*", "hooks": [entry…]}]}` object
- * shared by the Claude / Codex / Gemini hook schemas: one `"*"` matcher
- * group per event carrying all of that event's handlers. `entryFor` supplies
- * the provider-specific handler shape.
+ * Builds the `{"<Event>": [{"hooks": [entry…]}]}` object shared by the
+ * Claude / Codex / Gemini hook schemas: one match-all group per event
+ * carrying all of that event's handlers. The `matcher` key is deliberately
+ * omitted — an absent matcher means "match all" across all four provider
+ * schemas, whereas the `"*"` value is undocumented for Gemini and Codex
+ * (provider matrix). `entryFor` supplies the provider-specific handler
+ * shape.
  */
 export function buildMatcherHookGroups(
   byEvent: ReadonlyMap<string, readonly Hook[]>,
@@ -74,7 +77,7 @@ export function buildMatcherHookGroups(
 ): Record<string, unknown> {
   const groups: Record<string, unknown> = {};
   for (const [event, eventHooks] of byEvent) {
-    groups[event] = [{ matcher: '*', hooks: eventHooks.map(entryFor) }];
+    groups[event] = [{ hooks: eventHooks.map(entryFor) }];
   }
   return groups;
 }
