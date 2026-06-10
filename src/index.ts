@@ -20,6 +20,8 @@ export {
 } from './adapters/registry.js';
 export type { AdapterRegistry } from './adapters/registry.js';
 
+export { codexAdapter, CODEX_PROJECT_DOC_MAX_BYTES } from './adapters/codex.js';
+
 export { readRepoSnapshot } from './gateways/filesystem.js';
 
 export { parseRepo } from './use-cases/parse-repo.js';
