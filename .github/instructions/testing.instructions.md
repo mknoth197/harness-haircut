@@ -18,10 +18,12 @@ ships (C2 #12), this projection is regenerated automatically.
 2. **Integration** — exercise a use case end-to-end against a real filesystem in `os.tmpdir()`. Per-test setup + teardown. No AI-provider runtimes.
 3. **End-to-end** — `spawnSync(process.execPath, [binPath, ...])` against the built `dist/bin.js`. Assert on exit code, stdout, stderr.
 
+Build-artifact tests (assertions on built output, e.g. shebang/exec bit) are also allowed; gate platform-specific assertions with `{ skip: ... }`.
+
 ## File layout
 
 - All test files: `test/**/*.test.ts`.
-- Mirror source layout: `src/use-cases/audit.ts` → `test/use-cases/audit.test.ts`.
+- Mirror source layout: `src/use-cases/audit.ts` → `test/use-cases/audit.test.ts`; script tests under `test/scripts/`.
 - Top-level `test/cli.test.ts` allowed for cross-cutting concerns.
 - Shared helpers go in `test/_helpers/*.ts`.
 
