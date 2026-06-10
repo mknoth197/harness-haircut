@@ -340,7 +340,7 @@ Both artifacts are documentation + simple scripts in v1; no GitHub App, no marke
 - A repo using all 4 providers maintains content in **1** logical location (per scope) instead of 4.
 - `audit` exits 0 on a clean repo in **<100ms**.
 - `apply` is **idempotent**: `apply && audit` exits 0.
-- **Zero** silent data loss. Every lossy translation produces a warning the user can act on.
+- **No silent loss of canonical sources the tool reaches.** Every lossy translation produces a warning the user can act on, and a canonical source excluded by a *file-level* `.gitignore` rule surfaces as `HH-W012` rather than vanishing. The one documented exception: a canonical file inside a directory you have fully gitignored is honored as out-of-scope and not reported (see [`docs/warnings/HH-W012.md`](warnings/HH-W012.md) "Scope / known limit").
 - Onboarding (running `init` for the first time) takes **<5 minutes** for a typical multi-tool repo.
 
 ---
