@@ -24,5 +24,29 @@
 - [ ] Tests cover: zero-contradiction repo (auto-merges), single-contradiction repo (prompts and resolves), `--non-interactive` failure, "already canonical" fast-fail, integration test that ends with `audit` exit 0.
 - [ ] Prompt UX uses `prompts` or `@inquirer/prompts` (no custom TTY code).
 
+## Data-loss hardening (PR #25 review — no silent loss, PRD goal 3)
+
+Two consolidation-time data-loss gaps were closed after the initial implementation:
+
+### F1 — scoped instruction fragments are recovered into canonical
+
+Beyond root instructions and skills, `init` now recovers **per-file scoped instruction fragments** so their unique content is consolidated instead of dropped (and the orphan file later clobbered by `apply`):
+
+- `.github/instructions/*.instructions.md` — `applyTo:` frontmatter (comma-separated globs) becomes the canonical `scope`. The `hh.nested-*` projection is skipped (its canonical home is a nested `AGENTS.md`, not a fragment).
+- `.claude/rules/*.md` — `paths:` frontmatter (inline `[...]` array, block sequence, or scalar) becomes the canonical `scope`.
+- Each recovered fragment is written to `.agents/instructions/<name>.md` with a `scope:` frontmatter and the recovered body **before** `apply` runs, so `apply` re-projects it and the formerly-orphan provider file gains canonical backing (closing the `unmanaged → overwrite` clobber path in `apply`). `<name>` is the source filename with any `hh.` prefix and the `.instructions`/`.md` suffix stripped.
+- A harness-emitted `SignedSource` header after the frontmatter is stripped on recovery; a hand-written drifted fragment with no header keeps its whole post-frontmatter body.
+- **Contradictions:** same canonical fragment name recovered from multiple providers with byte-identical (normalized) scope+body collapses to one (EV1); differing copies surface a `fragment:<name>` contradiction resolved like the others. Fragment names are their own namespace under `.agents/instructions/` — a fragment named `foo` never collides with a root or skill slot.
+- A fragment under a fragment root with **no** `applyTo:`/`paths:` frontmatter cannot yield a scope; rather than drop it, `init` surfaces it in `InitReport.notes` (mirroring the hooks note) and leaves the file in place.
+- Note: a scoped fragment with **Gemini enabled** still produces `HH-W007` at audit (Gemini has no path-scoping), so `audit` after recovery is exit 2 unless Gemini is disabled — this is inherent to scoped fragments, not a recovery defect.
+
+### F2 — non-chosen contradiction candidates are preserved and reported
+
+When a contradiction is resolved by choosing one candidate (or skipping), the other candidates' unique content would be destroyed by the subsequent `apply`. `init` now:
+
+- **Backs up** every non-chosen candidate's original text to `<repo-root>/.harness-haircut-init-backup/<sanitized-source-path>` (e.g. `.github__copilot-instructions.md`) before calling `apply`. The backup directory sits **outside** `.agents/` at the repo root deliberately: the parser walk (`readRepoSnapshot` → `parseRepo`) only collects `AGENTS.md` at any depth plus everything under root `.agents/`, so the backup is never read back into IR or re-projected. (Under `.agents/` it would be walked — the `.harness-state.json` skip lives in `parse-repo.ts`, out of scope for this fix.) Backups are skipped under `--dry-run`.
+- **Reports** the backups: `InitReport.backups: string[]` carries the backup paths (surfaced by `--json`), `renderInitReport` lists which source paths were preserved and the backup directory, and per-contradiction notes name them.
+- The interactive resolver preview was widened from 60 chars to the first ~12 lines (≤~400 chars, with a truncation marker) so the choice between candidates is informed.
+
 ## Out of scope
 - Migration commands from specific tools (`migrate-from cursor`) — listed in PRD §15 future scope.

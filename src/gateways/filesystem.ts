@@ -233,6 +233,30 @@ function dirIsCanonicalAnchor(relPath: string): boolean {
   return relPath === '.agents' || relPath.startsWith('.agents/');
 }
 
+/**
+ * Wider inclusion for `init` (C3): canonical sources PLUS the provider-owned
+ * instruction and skill files `detectExisting` and candidate recovery need —
+ * `CLAUDE.md` / `GEMINI.md` shims, the Copilot review files, and the Claude /
+ * Codex / Gemini / Copilot config trees that hold skills and hook configs.
+ * `RepoSnapshot` is documented to allow callers to widen collection this way.
+ */
+function isInitPath(relPath: string): boolean {
+  if (isCanonicalPath(relPath)) {
+    return true;
+  }
+  const basename = relPath.slice(relPath.lastIndexOf('/') + 1);
+  return (
+    basename === 'CLAUDE.md' ||
+    basename === 'GEMINI.md' ||
+    relPath === '.github/copilot-instructions.md' ||
+    relPath.startsWith('.github/instructions/') ||
+    relPath.startsWith('.github/hooks/') ||
+    relPath.startsWith('.claude/') ||
+    relPath.startsWith('.codex/') ||
+    relPath.startsWith('.gemini/')
+  );
+}
+
 async function loadRootGitignore(root: string): Promise<IgnorePattern[]> {
   let content: string;
   try {
@@ -256,6 +280,7 @@ async function walk(
   absDir: string,
   relDir: string,
   patterns: readonly IgnorePattern[],
+  include: (relPath: string) => boolean,
   state: WalkState,
 ): Promise<void> {
   let entries;
@@ -284,17 +309,20 @@ async function walk(
         }
         continue;
       }
-      await walk(join(absDir, entry.name), rel, patterns, state);
+      await walk(join(absDir, entry.name), rel, patterns, include, state);
     } else if (entry.isFile()) {
       // Symlinks and special files are skipped: following links could
       // escape the repo or cycle, and canonical sources are plain files.
-      if (!isCanonicalPath(rel)) {
-        continue;
-      }
       if (isIgnored(rel, false, patterns)) {
         // A canonical source the user asked git to ignore: surface it (EV1)
-        // rather than silently dropping it from the IR.
-        state.excludedCanonical.push(rel);
+        // rather than silently dropping it from the IR. Tracking is keyed to
+        // canonical paths regardless of the (possibly wider) include filter.
+        if (isCanonicalPath(rel)) {
+          state.excludedCanonical.push(rel);
+        }
+        continue;
+      }
+      if (!include(rel)) {
         continue;
       }
       let content: string;
@@ -341,10 +369,28 @@ function recordExcludedCanonicalDir(rel: string, state: WalkState): void {
 export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
   const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, state);
-  state.out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  const excludedCanonicalPaths = [...new Set(state.excludedCanonical)].sort((a, b) =>
-    a < b ? -1 : a > b ? 1 : 0,
-  );
+  await walk(root, '', patterns, isCanonicalPath, state);
+  return finishSnapshot(root, state);
+}
+
+/**
+ * Wider snapshot for `init` (C3 onboarding): canonical sources PLUS the
+ * provider-owned instruction/skill/hook files needed for `detectExisting` and
+ * candidate recovery (see `isInitPath`). Same `.gitignore`/skip rules and
+ * sorting as `readRepoSnapshot`; paths are repo-relative POSIX, BOM stripped.
+ * Excluded canonical sources are still reported in `excludedCanonicalPaths`.
+ */
+export async function readInitSnapshot(root: string): Promise<RepoSnapshot> {
+  const patterns = await loadRootGitignore(root);
+  const state: WalkState = { out: [], excludedCanonical: [] };
+  await walk(root, '', patterns, isInitPath, state);
+  return finishSnapshot(root, state);
+}
+
+/** Sort the collected files + deduped excluded-canonical paths into a snapshot. */
+function finishSnapshot(root: string, state: WalkState): RepoSnapshot {
+  const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  state.out.sort((a, b) => cmp(a.path, b.path));
+  const excludedCanonicalPaths = [...new Set(state.excludedCanonical)].sort(cmp);
   return { root, files: state.out, excludedCanonicalPaths };
 }

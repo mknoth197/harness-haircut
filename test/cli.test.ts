@@ -102,12 +102,10 @@ describe('run() in-process', () => {
     assert.match(stderr, /unknown command/);
   });
 
-  it('unimplemented commands (init/doctor) exit 70', async () => {
-    for (const command of ['init', 'doctor']) {
-      const { code, stderr } = await runCli([command]);
-      assert.equal(code, 70);
-      assert.match(stderr, /not yet implemented/);
-    }
+  it('unimplemented command (doctor) exits 70', async () => {
+    const { code, stderr } = await runCli(['doctor']);
+    assert.equal(code, 70);
+    assert.match(stderr, /not yet implemented/);
   });
 
   it('parser error (--cwd with no value) exits 64', async () => {
@@ -124,8 +122,8 @@ describe('built CLI binary', () => {
     assert.equal(r.stdout.trim(), pkgVersion);
   });
 
-  it('init via spawn exits 70 (still a stub)', () => {
-    const r = spawnSync(process.execPath, [binPath, 'init'], { encoding: 'utf8' });
+  it('doctor via spawn exits 70 (still a stub)', () => {
+    const r = spawnSync(process.execPath, [binPath, 'doctor'], { encoding: 'utf8' });
     assert.equal(r.status, 70);
     assert.match(r.stderr, /not yet implemented/);
   });
@@ -329,5 +327,63 @@ describe('apply E2E (spawn dist/bin.js)', () => {
     assert.equal(r.status, 0);
     assert.match(r.stdout, /dry run/);
     assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
+  });
+});
+
+describe('init E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('init --non-interactive on a zero-contradiction repo exits 0, then audit exits 0', async () => {
+    const body = '@AGENTS.md\n\n# Project standards\n\nUse npm test.\n';
+    const repo = await mkTempRepo({ 'CLAUDE.md': body, 'GEMINI.md': body });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'init', '--cwd', repo.root, '--non-interactive'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), true);
+    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), true);
+
+    const auditRun = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(auditRun.status, 0);
+    assert.match(auditRun.stdout, /clean/);
+  });
+
+  it('init on an already-canonical repo fast-fails (exit 1), recommends apply', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'init', '--cwd', repo.root, '--non-interactive'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /apply/);
+  });
+
+  it('init --non-interactive exits 1 on a contradiction', async () => {
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm test.\n',
+      '.github/copilot-instructions.md': '# A\nUse pnpm test.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'init', '--cwd', repo.root, '--non-interactive'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /contradiction/i);
   });
 });

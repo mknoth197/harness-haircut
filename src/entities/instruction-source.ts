@@ -1,0 +1,256 @@
+/**
+ * Pure helpers for recovering candidate canonical text from existing provider
+ * instruction files — C3 (#13), layer 1 (entities). No I/O: callers (the
+ * `init` use case) read the bytes through an injected reader and hand them in.
+ *
+ * Each provider stores "root instruction" content differently, and most wrap
+ * the real text in a header the canonical `AGENTS.md` must not carry:
+ *
+ *   - `AGENTS.md`                         → verbatim (already canonical shape)
+ *   - `CLAUDE.md` / `GEMINI.md`           → strip a leading `@AGENTS.md` import
+ *                                           line if present (the shim carve-out)
+ *   - `.github/copilot-instructions.md`   → strip a leading SignedSource header
+ *                                           line and the code-review HTML note
+ *
+ * `normalizeForCompare` is applied only when deciding whether two candidates
+ * AGREE (EV1) — the recovered original text is what gets written.
+ */
+import { AGENTS_IMPORT_LINE } from './ir.js';
+
+/** The HTML comment the Copilot adapter prepends to `.github/copilot-instructions.md`. */
+const COPILOT_REVIEW_NOTE_RE =
+  /^<!--\s*This file exists for Copilot code review[\s\S]*?-->\n?/;
+
+/** A SignedSource header line (any comment syntax) at the very start of a file. */
+const SIGNED_SOURCE_LINE_RE = /^.*@generated SignedSource<<<[0-9a-f.]+>>>.*\n?/;
+
+/**
+ * Trailing-whitespace-insensitive, trailing-newline-insensitive comparison
+ * key. Each line is right-trimmed and the whole text collapsed to a single
+ * (absent) final newline, so cosmetically-different copies of the same content
+ * compare equal (EV1) without a real content difference being masked.
+ */
+export function normalizeForCompare(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/\s+$/, ''))
+    .join('\n')
+    .replace(/\n+$/, '');
+}
+
+/** Root `AGENTS.md` is already canonical shape — its text is taken verbatim. */
+export function recoverFromAgentsMd(content: string): string {
+  return content;
+}
+
+/**
+ * Strips a leading `@AGENTS.md` import line from a `CLAUDE.md` / `GEMINI.md`
+ * shim, returning the user content below it. When the file is not a shim (no
+ * leading import) the whole content is returned — it is genuine instruction
+ * text the user kept in that file.
+ */
+export function recoverFromShim(content: string): string {
+  const newlineAt = content.indexOf('\n');
+  const firstLine = (newlineAt === -1 ? content : content.slice(0, newlineAt)).trimEnd();
+  if (firstLine === AGENTS_IMPORT_LINE) {
+    return newlineAt === -1 ? '' : content.slice(newlineAt + 1);
+  }
+  return content;
+}
+
+/**
+ * Strips a leading SignedSource header line (if present) and the code-review
+ * HTML note the Copilot adapter emits, returning the instruction body.
+ */
+export function recoverFromCopilotInstructions(content: string): string {
+  let body = content.replace(SIGNED_SOURCE_LINE_RE, '');
+  // The adapter emits "<note>\n\n<body>"; drop a leading blank line left after
+  // the header line was removed, then the note, then its trailing blank lines.
+  body = body.replace(/^\n+/, '');
+  body = body.replace(COPILOT_REVIEW_NOTE_RE, '');
+  body = body.replace(/^\n+/, '');
+  return body;
+}
+
+/**
+ * A recovered scoped instruction fragment — C3 F1. `scope` is a single glob
+ * string (the canonical `.agents/instructions/<name>.md` shape uses one
+ * `scope:` per fragment); when a provider file lists several globs they are
+ * comma-joined into one canonical scope. `body` is the instruction text below
+ * the frontmatter (and below any emitted SignedSource header), ready to write
+ * verbatim under a fresh `scope:` frontmatter.
+ */
+export interface RecoveredFragment {
+  /** Comma-joined glob(s) for the canonical `scope:` key. */
+  scope: string;
+  /** Instruction body below the frontmatter / header. */
+  body: string;
+}
+
+/** Recognizes a leading `---`-delimited frontmatter block; returns its inner lines + body. */
+interface SplitFrontmatter {
+  /** Raw lines between the opening and closing `---` (frontmatter omitted when null). */
+  fmLines: string[] | null;
+  /** Everything after the closing `---` (or the whole content when no frontmatter). */
+  body: string;
+}
+
+/**
+ * Splits a leading `---`-delimited frontmatter block from the body. Returns
+ * `fmLines: null` when the content does not begin with a complete block (a
+ * lone leading `---` with no closing fence is treated as no frontmatter).
+ */
+function splitLeadingFrontmatter(content: string): SplitFrontmatter {
+  const lines = content.split('\n');
+  if ((lines[0] ?? '').trimEnd() !== '---') {
+    return { fmLines: null, body: content };
+  }
+  for (let i = 1; i < lines.length; i++) {
+    if ((lines[i] ?? '').trimEnd() === '---') {
+      return { fmLines: lines.slice(1, i), body: lines.slice(i + 1).join('\n') };
+    }
+  }
+  return { fmLines: null, body: content };
+}
+
+/**
+ * Strips a leading SignedSource header line from a recovered fragment body.
+ * Provider fragments emitted by `apply` carry the header on the FIRST line of
+ * the body (after the frontmatter); a hand-written drifted fragment carries
+ * none. Either way the body below the header is what we recover.
+ */
+function stripFragmentHeader(body: string): string {
+  if (SIGNED_SOURCE_LINE_RE.test(body)) {
+    return body.replace(SIGNED_SOURCE_LINE_RE, '');
+  }
+  return body;
+}
+
+/**
+ * Recovers a scoped fragment from a Copilot `*.instructions.md` file: parses
+ * the `applyTo:` frontmatter (a single comma-separated glob string) into the
+ * canonical `scope`, then strips an optional SignedSource header from the body.
+ * Returns `null` when there is no `applyTo:` frontmatter to derive a scope from
+ * (the caller surfaces such a file as an un-recoverable note rather than
+ * dropping it silently).
+ */
+export function recoverFragmentFromCopilot(content: string): RecoveredFragment | null {
+  const { fmLines, body } = splitLeadingFrontmatter(content);
+  if (fmLines === null) {
+    return null;
+  }
+  const scope = parseApplyTo(fmLines);
+  if (scope === null) {
+    return null;
+  }
+  return { scope, body: stripFragmentHeader(body) };
+}
+
+/**
+ * Recovers a scoped fragment from a Claude `.claude/rules/*.md` file: parses
+ * the `paths:` frontmatter (a YAML list OR an inline `[...]` array) into the
+ * canonical `scope`, then strips an optional SignedSource header from the body.
+ * Returns `null` when there is no `paths:` frontmatter (surfaced as a note).
+ */
+export function recoverFragmentFromClaudeRule(content: string): RecoveredFragment | null {
+  const { fmLines, body } = splitLeadingFrontmatter(content);
+  if (fmLines === null) {
+    return null;
+  }
+  const scope = parsePaths(fmLines);
+  if (scope === null) {
+    return null;
+  }
+  return { scope, body: stripFragmentHeader(body) };
+}
+
+/** Reads a single-line `applyTo: "<glob>,<glob>"` (or unquoted) into a comma-joined scope. */
+function parseApplyTo(fmLines: string[]): string | null {
+  for (const raw of fmLines) {
+    const match = /^applyTo:\s*(.*)$/.exec(raw.trim());
+    if (match === null) {
+      continue;
+    }
+    const value = unquoteScalar((match[1] ?? '').trim());
+    const globs = value
+      .split(',')
+      .map((g) => g.trim())
+      .filter((g) => g !== '');
+    return globs.length === 0 ? null : globs.join(',');
+  }
+  return null;
+}
+
+/**
+ * Reads `paths:` from Claude-rule frontmatter — either an inline
+ * `paths: ["a", "b"]` array or a block sequence of `- a` lines — into a
+ * comma-joined scope. Returns `null` when no `paths:` key is present.
+ */
+function parsePaths(fmLines: string[]): string | null {
+  for (let i = 0; i < fmLines.length; i++) {
+    const raw = (fmLines[i] ?? '').trim();
+    const match = /^paths:\s*(.*)$/.exec(raw);
+    if (match === null) {
+      continue;
+    }
+    const rest = (match[1] ?? '').trim();
+    if (rest.startsWith('[') && rest.endsWith(']')) {
+      const inner = rest.slice(1, -1).trim();
+      const globs = inner === ''
+        ? []
+        : inner.split(',').map((g) => unquoteScalar(g.trim())).filter((g) => g !== '');
+      return globs.length === 0 ? null : globs.join(',');
+    }
+    if (rest !== '') {
+      // `paths: <glob>` scalar form.
+      const scalar = unquoteScalar(rest);
+      return scalar === '' ? null : scalar;
+    }
+    // Block sequence: collect following `- item` lines.
+    const globs: string[] = [];
+    for (let j = i + 1; j < fmLines.length; j++) {
+      const item = /^-\s+(.+)$/.exec((fmLines[j] ?? '').trim());
+      if (item === null) {
+        break;
+      }
+      const glob = unquoteScalar((item[1] ?? '').trim());
+      if (glob !== '') {
+        globs.push(glob);
+      }
+    }
+    return globs.length === 0 ? null : globs.join(',');
+  }
+  return null;
+}
+
+/** Strips matching single/double quotes from a scalar (no escape processing). */
+function unquoteScalar(value: string): string {
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+/**
+ * Derives the canonical fragment name from a provider source filename: strips
+ * the directory, the harness-emitted `hh.` prefix if present, and the
+ * `.instructions.md` / `.md` suffix. `.github/instructions/hh.security.instructions.md`
+ * → `security`; `.claude/rules/testing.md` → `testing`.
+ */
+export function fragmentNameFromSource(path: string): string {
+  let base = path.slice(path.lastIndexOf('/') + 1);
+  if (base.startsWith('hh.')) {
+    base = base.slice('hh.'.length);
+  }
+  if (base.endsWith('.instructions.md')) {
+    return base.slice(0, -'.instructions.md'.length);
+  }
+  if (base.endsWith('.md')) {
+    return base.slice(0, -'.md'.length);
+  }
+  return base;
+}

@@ -11,13 +11,16 @@ import { createFileWriter } from './gateways/fs-writer.js';
 import { isWorkingTreeDirty } from './gateways/git.js';
 import { createAllAdapters } from './adapters/index.js';
 import { parseRepo } from './use-cases/parse-repo.js';
-import { readRepoSnapshot } from './gateways/filesystem.js';
+import { readRepoSnapshot, readInitSnapshot } from './gateways/filesystem.js';
 import { loadConfig, enabledProviders } from './use-cases/load-config.js';
 import type { HarnessConfig } from './use-cases/load-config.js';
 import { audit } from './use-cases/audit.js';
 import type { AuditReport, FileAudit } from './use-cases/audit.js';
 import { apply } from './use-cases/apply.js';
 import type { ApplyReport } from './use-cases/apply.js';
+import { init } from './use-cases/init.js';
+import type { InitReport } from './use-cases/init.js';
+import type { Contradiction, Resolution } from './entities/contradiction.js';
 
 export type ExitCode = 0 | 1 | 2 | 3 | 64 | 70;
 
@@ -97,6 +100,10 @@ function helpText(): string {
     '  -h, --help          Show help',
     '  --version           Show version',
     '',
+    'init options:',
+    '  --dry-run           Print the planned canonical layout and exit without writing',
+    '  --non-interactive   Never prompt; fail (exit 1) on any unresolved contradiction',
+    '',
     'apply options:',
     '  --dry-run           Print the would-emit plan and exit without writing',
     '  --allow-dirty       Run even when the git working tree is dirty',
@@ -144,7 +151,11 @@ export async function run(argv: readonly string[], io: RunIO): Promise<ExitCode>
     return runApply(parsed, io);
   }
 
-  // init / doctor are stubs until their stories land.
+  if (parsed.command === 'init') {
+    return runInit(parsed, io);
+  }
+
+  // doctor is a stub until its story lands.
   io.stderr.write(`harness-haircut: '${parsed.command}' not yet implemented\n`);
   return 70;
 }
@@ -390,6 +401,234 @@ function renderApplyReport(report: ApplyReport): string {
       const suffix = where === '' ? '' : ` (${where})`;
       lines.push(`  ${warning.code}\t${warning.message}${suffix}`);
     }
+  }
+
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * Multi-line candidate preview for the resolver (C3 F2): the first 12 lines
+ * (capped at ~400 chars total) of the candidate's ORIGINAL text, so the choice
+ * between contradicting candidates is informed rather than a 60-char teaser.
+ * Trailing whitespace is trimmed and a truncation marker is appended when the
+ * candidate is longer than the preview shows.
+ */
+function previewCandidate(text: string): string[] {
+  const MAX_LINES = 12;
+  const MAX_CHARS = 400;
+  const allLines = text.replace(/\s+$/, '').split('\n');
+  const shown = allLines.slice(0, MAX_LINES).map((line) => line.trimEnd());
+  let total = 0;
+  const out: string[] = [];
+  for (const line of shown) {
+    if (total + line.length > MAX_CHARS) {
+      out.push(`${line.slice(0, Math.max(0, MAX_CHARS - total))}…`);
+      total = MAX_CHARS;
+      break;
+    }
+    out.push(line);
+    total += line.length;
+  }
+  if (allLines.length > out.length || total >= MAX_CHARS) {
+    out.push('… (truncated — see the full file)');
+  }
+  return out.length === 0 ? ['(empty)'] : out;
+}
+
+/**
+ * Interactive contradiction resolver for `init` (C3 EV2/EV3) over
+ * `node:readline` — a numbered-choice prompt rather than the `prompts` /
+ * `@inquirer/prompts` dependency the story names, to keep PRD goal 5's
+ * zero-runtime-deps promise. The use case (layer 2) stays pure; this layer-4
+ * function is the only place that touches stdin. It lists each candidate
+ * (provider + path + a multi-line preview) plus a final "skip / write blank"
+ * option, reads one number, and maps it to a `Resolution`. An out-of-range
+ * answer, empty input, or EOF (Ctrl-D / piped stdin exhausted) resolves to
+ * `{ kind: 'unresolved' }`, which fails the run (OPT1) without writing.
+ */
+function readlineResolver(io: RunIO): (contradiction: Contradiction) => Promise<Resolution> {
+  return (contradiction: Contradiction): Promise<Resolution> =>
+    new Promise<Resolution>((resolveAnswer) => {
+      const rl = createInterface({ input: process.stdin, output: io.stdout });
+      const lines: string[] = [];
+      lines.push(`Contradiction in "${contradiction.slot}" — pick the canonical answer:`);
+      contradiction.candidates.forEach((candidate, index) => {
+        const preview = previewCandidate(candidate.text);
+        lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}):`);
+        for (const previewLine of preview) {
+          lines.push(`       ${previewLine}`);
+        }
+      });
+      const skipChoice = contradiction.candidates.length + 1;
+      lines.push(`  ${skipChoice}) skip / write blank for this slot`);
+      io.stdout.write(`${lines.join('\n')}\n`);
+      rl.question(`Choice [1-${skipChoice}]: `, (answer) => {
+        rl.close();
+        const n = Number.parseInt(answer.trim(), 10);
+        if (!Number.isInteger(n) || n < 1 || n > skipChoice) {
+          resolveAnswer({ kind: 'unresolved' });
+          return;
+        }
+        if (n === skipChoice) {
+          resolveAnswer({ kind: 'skip' });
+          return;
+        }
+        resolveAnswer({ kind: 'choose', index: n - 1 });
+      });
+    });
+}
+
+async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
+  const cwdFlag = parsed.flags['--cwd'];
+  const cwd = typeof cwdFlag === 'string' ? resolve(cwdFlag) : process.cwd();
+  const configFlag =
+    typeof parsed.flags['--config'] === 'string' ? (parsed.flags['--config'] as string) : undefined;
+  const json = parsed.flags['--json'] === true;
+  const dryRun = parsed.flags['--dry-run'] === true;
+  const nonInteractive = parsed.flags['--non-interactive'] === true;
+
+  let report: InitReport;
+  try {
+    const config = await readConfig(cwd, configFlag);
+    const reader = createProviderFileReader(cwd);
+    const writer = createFileWriter(cwd);
+    const enabled = enabledProviders(config);
+    const adapters = createAllAdapters().filter((adapter) => enabled.includes(adapter.id));
+    const contextFor = (id: ProviderId): ProjectionContext => {
+      const ctx: ProjectionContext = { cwd, providerFiles: reader };
+      if (id === 'gemini') {
+        ctx.providerConfig = { mode: config.gemini.mode };
+      }
+      return ctx;
+    };
+    report = await init({
+      snapshot: () => readInitSnapshot(cwd),
+      reader,
+      writer,
+      adapters,
+      // --non-interactive never reaches a prompt (the use case fails first on
+      // any contradiction), so a no-prompt stub is correct there; otherwise
+      // wire the readline numbered-choice prompt.
+      resolveContradiction: nonInteractive
+        ? () => Promise.resolve<Resolution>({ kind: 'unresolved' })
+        : readlineResolver(io),
+      // C3 reuses C2. init has just written canonical files, so the tree is
+      // expected dirty during onboarding — apply runs with allowDirty so the
+      // freshly-written canonical layout is projected. The init-level prompt
+      // already resolved everything; apply finds only freshly-written
+      // canonical files, so its own edited-file prompt should never fire, but
+      // a non-interactive stub keeps it from blocking on a surprise.
+      apply: () =>
+        apply({
+          parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd) }),
+          adapters,
+          reader,
+          writer,
+          contextFor,
+          isDirty: () => isWorkingTreeDirty(cwd),
+          confirm: () => Promise.resolve(false),
+          readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
+          writeState: (state: ApplyState): void =>
+            writer.write(APPLY_STATE_PATH, serializeState(state)),
+          flags: { allowDirty: true, dryRun, nonInteractive: true },
+        }),
+      flags: { dryRun, nonInteractive },
+    });
+  } catch (err) {
+    if (err instanceof DomainError) {
+      io.stderr.write(`harness-haircut: ${err.message}\n`);
+      return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
+    }
+    throw err;
+  }
+
+  if (json) {
+    io.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    io.stdout.write(renderInitReport(report));
+  }
+  return report.exitCode;
+}
+
+function renderInitReport(report: InitReport): string {
+  const lines: string[] = [];
+
+  if (report.refused === 'already-canonical') {
+    lines.push('refused — this repo is already canonical (run `harness-haircut apply` instead).');
+    for (const note of report.notes) {
+      lines.push(`  ${note}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  if (report.detected.length > 0) {
+    lines.push(`detected ${report.detected.length} existing provider config(s):`);
+    for (const config of report.detected) {
+      lines.push(`  ${config.providerId}\t${config.paths.join(', ')}`);
+    }
+  } else {
+    lines.push('no existing provider config detected.');
+  }
+
+  if (report.contradictions.length > 0) {
+    lines.push('');
+    if (report.refused === 'unresolved-contradictions') {
+      lines.push(`refused — ${report.contradictions.length} unresolved contradiction(s):`);
+    } else {
+      lines.push(`resolved ${report.contradictions.length} contradiction(s):`);
+    }
+    for (const contradiction of report.contradictions) {
+      const sources = contradiction.candidates
+        .map((candidate) => `${candidate.providerId} (${candidate.path})`)
+        .join(' vs ');
+      lines.push(`  ${contradiction.slot}: ${sources}`);
+    }
+  }
+
+  if (report.planned.length > 0) {
+    lines.push('');
+    const verb = report.dryRun ? 'would write' : 'wrote';
+    lines.push(`${verb} ${report.planned.length} canonical file(s):`);
+    for (const file of report.planned) {
+      lines.push(`  ${file.path}\t[${file.origin}]`);
+    }
+  }
+
+  if (report.backups.length > 0) {
+    const backupSet = new Set(report.backups);
+    lines.push('');
+    lines.push('preserved non-chosen candidates (originals backed up):');
+    for (const contradiction of report.contradictions) {
+      for (const candidate of contradiction.candidates) {
+        const backupPath = `.harness-haircut-init-backup/${candidate.path.replace(/[/\\]/g, '__')}`;
+        if (backupSet.has(backupPath)) {
+          lines.push(`  ${contradiction.slot}: ${candidate.path} -> ${backupPath}`);
+        }
+      }
+    }
+  }
+
+  if (report.apply !== undefined) {
+    lines.push('');
+    lines.push(
+      `projected ${report.apply.written.length} provider file(s) via apply ` +
+        `(exit ${report.apply.exitCode}).`,
+    );
+  }
+
+  if (report.notes.length > 0) {
+    lines.push('');
+    lines.push('notes:');
+    for (const note of report.notes) {
+      lines.push(`  ${note}`);
+    }
+  }
+
+  if (report.dryRun) {
+    lines.push('');
+    lines.push('(dry run — no files written)');
   }
 
   lines.push('');

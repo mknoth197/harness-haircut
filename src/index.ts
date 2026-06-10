@@ -28,7 +28,7 @@ export { createAllAdapters } from './adapters/index.js';
 export { SHIM_BODY, SHIM_IMPORT_LINE } from './adapters/shim.js';
 export { instructionSourceEntry, skillSourceEntry } from './adapters/source-manifest.js';
 
-export { readRepoSnapshot } from './gateways/filesystem.js';
+export { readRepoSnapshot, readInitSnapshot } from './gateways/filesystem.js';
 export { createProviderFileReader } from './gateways/provider-files.js';
 
 export { parseRepo } from './use-cases/parse-repo.js';
@@ -50,6 +50,9 @@ export type {
   FileApply,
   ApplyAction,
 } from './use-cases/apply.js';
+
+export { init } from './use-cases/init.js';
+export type { InitDeps, InitFlags, InitReport, PlannedFile } from './use-cases/init.js';
 
 export { isWorkingTreeDirty } from './gateways/git.js';
 export { createFileWriter } from './gateways/fs-writer.js';
