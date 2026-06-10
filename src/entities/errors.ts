@@ -50,6 +50,20 @@ export class DuplicateAdapterError extends DomainError {
   }
 }
 
+/**
+ * An existing co-owned provider config could not be parsed (A2 UN1, A3 UN1;
+ * exit code 3). Adapters refuse to emit into a file they cannot merge with
+ * rather than risking a silent overwrite of user content.
+ */
+export class MalformedProviderConfigError extends DomainError {
+  readonly path: string;
+
+  constructor(path: string, reason: string) {
+    super(`${path}: ${reason}`, 3);
+    this.path = path;
+  }
+}
+
 /** An OS-level filesystem failure, converted at the gateway boundary. */
 export class FileSystemError extends DomainError {
   readonly path: string;
