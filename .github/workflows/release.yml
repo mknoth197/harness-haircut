@@ -2,7 +2,10 @@ name: Release
 
 # I2 (#15), PRD §6/§16: publish to npm on a version tag. A stable tag
 # (v1.2.3) publishes to the default `latest` dist-tag; a pre-release tag
-# (v1.2.3-rc.1) publishes to `next` (OPT1). The test -> build -> publish step
+# (v1.2.3-<suffix>, e.g. v1.2.3-rc.1, v1.2.3-beta.1) publishes to `next` (OPT1).
+# The trigger glob below cannot anchor digits, so any malformed tag it lets
+# through (v1.2.3.4, v1.2.3-rc1, …) is rejected fail-closed by the regex in the
+# publish step — see "Publish to npm". The test -> build -> publish step
 # ordering gates the publish: a failing test or build aborts the job before
 # `npm publish` ever runs (UN1), because each step only runs if the prior
 # steps succeeded.
@@ -41,20 +44,26 @@ jobs:
       - name: Build
         run: npm run build
 
-      # OPT1: route a pre-release tag (v1.2.3-rc.1) to the `next` dist-tag, and
-      # a stable tag to the default `latest`. EV1: --provenance attaches a
-      # signed build-provenance attestation; --access public publishes the
-      # scoped/unscoped package publicly.
+      # OPT1: fail-closed tag routing. The trigger glob (`v*.*.*`) cannot anchor
+      # digits, so this regex is the authority on what publishes where:
+      #   - exact vX.Y.Z              -> `latest`
+      #   - vX.Y.Z-<pre-release>      -> `next` (any suffix: -rc.1, -beta.1, …)
+      #   - anything else (vX.Y.Z.W, vX.Y.Z-rc1, …) -> refuse, do NOT publish.
+      # EV1: --provenance attaches a signed build-provenance attestation;
+      # --access public publishes the scoped/unscoped package publicly.
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          if printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$'; then
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "stable $TAG -> dist-tag latest"
+            npm publish --provenance --access public
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+$ ]]; then
             echo "pre-release $TAG -> dist-tag next"
             npm publish --provenance --access public --tag next
           else
-            echo "stable $TAG -> dist-tag latest"
-            npm publish --provenance --access public
+            echo "unrecognized tag shape: $GITHUB_REF_NAME" >&2
+            exit 1
           fi

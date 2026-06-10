@@ -10,12 +10,46 @@
  * `os.tmpdir()` fixture — the integration tests drive the real gateway.
  */
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, chmodSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { dirname, isAbsolute, join } from 'node:path';
 import type { PrecommitGateway } from '../use-cases/install-precommit.js';
 import { FileSystemError } from '../entities/errors.js';
 
-function toAbsolute(root: string, relPath: string): string {
-  return join(root, ...relPath.split('/'));
+/**
+ * Resolves a path the gateway round-trips through read/write/chmod against the
+ * repo `root`. A POSIX-relative path (the husky target, or a `git rev-parse`
+ * result relative to cwd) is split and re-joined under `root`; an absolute path
+ * (some worktrees report one) is used verbatim.
+ */
+function toAbsolute(root: string, p: string): string {
+  if (isAbsolute(p)) {
+    return p;
+  }
+  return join(root, ...p.split('/'));
+}
+
+/**
+ * The repo's real git hooks directory, resolved via `git rev-parse --git-path
+ * hooks` (run with cwd at `root`). This returns the correct directory for a
+ * normal repo (`.git/hooks`), a worktree, and a submodule — including the case
+ * where `.git` is a FILE (a gitlink) rather than a directory, which a literal
+ * `<root>/.git/hooks` join would turn into an ENOTDIR crash. Returns `null`
+ * when `git` is unavailable or this is not a git repo, so the use case can
+ * surface a clear domain error instead of failing later on a bad path.
+ */
+function resolveHooksDir(root: string): string | null {
+  try {
+    const out = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    const trimmed = out.trim();
+    return trimmed === '' ? null : trimmed;
+  } catch {
+    // `git` missing (spawn failure) or not a repo (non-zero exit): cannot
+    // resolve, so report null. The use case maps this to its exit-3 path.
+    return null;
+  }
 }
 
 function dirExists(absPath: string): boolean {
@@ -32,15 +66,10 @@ export function createPrecommitGateway(root: string): PrecommitGateway {
     huskyPresent(): boolean {
       return dirExists(join(root, '.husky'));
     },
-    gitPresent(): boolean {
-      // A `.git` directory is the common case; a `.git` *file* is a worktree
-      // or submodule gitlink, which is still a git repo with hooks.
-      const abs = join(root, '.git');
-      try {
-        return existsSync(abs);
-      } catch (err) {
-        throw new FileSystemError(abs, err);
-      }
+    resolveGitHooksDir(): string | null {
+      // Ask git for the real hooks dir so worktrees/submodules (where `.git` is
+      // a file) resolve correctly instead of crashing on a non-dir `.git/hooks`.
+      return resolveHooksDir(root);
     },
     read(relPath: string): string | null {
       const abs = toAbsolute(root, relPath);
@@ -79,9 +108,9 @@ export function createPrecommitGateway(root: string): PrecommitGateway {
 
 /**
  * Pure in-memory `PrecommitGateway` for unit tests. Backed by a path → content
- * map plus boolean flags for husky/`.git` presence and a set recording which
- * paths were chmod-ed executable (so tests can assert the chmod call without a
- * real filesystem). Paths are repo-relative POSIX.
+ * map plus flags for husky presence and the resolved hooks dir, and a set
+ * recording which paths were chmod-ed executable (so tests can assert the chmod
+ * call without a real filesystem). Paths are repo-relative POSIX.
  */
 export interface InMemoryPrecommitGateway extends PrecommitGateway {
   /** Current in-memory file contents, keyed by repo-relative POSIX path. */
@@ -92,18 +121,28 @@ export interface InMemoryPrecommitGateway extends PrecommitGateway {
 
 export function createInMemoryPrecommitGateway(init?: {
   husky?: boolean;
+  /**
+   * Whether this is a (resolvable) git repo. `true` (default) resolves to
+   * `.git/hooks`; `false` resolves to `null` (the not-a-repo / no-git case).
+   */
   git?: boolean;
+  /**
+   * Overrides the resolved hooks dir — e.g. a worktree's
+   * `.git/worktrees/foo/hooks`. Takes precedence over `git` when set.
+   */
+  hooksDir?: string;
   files?: Record<string, string>;
 }): InMemoryPrecommitGateway {
   const files = new Map<string, string>(Object.entries(init?.files ?? {}));
   const chmodded = new Set<string>();
   const husky = init?.husky ?? false;
   const git = init?.git ?? true;
+  const hooksDir = init?.hooksDir ?? (git ? '.git/hooks' : null);
   return {
     files,
     chmodded,
     huskyPresent: () => husky,
-    gitPresent: () => git,
+    resolveGitHooksDir: () => hooksDir,
     read: (path) => files.get(path) ?? null,
     write: (path, content) => {
       files.set(path, content);

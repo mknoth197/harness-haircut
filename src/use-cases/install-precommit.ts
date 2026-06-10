@@ -9,20 +9,53 @@
  *
  * Behavior (EARS, story 11 / PRD §13):
  *   - U1  the command installs a hook that runs `npx harness-haircut audit
- *         --json`; a non-zero exit blocks the commit.
+ *         --json`; a DRIFT (exit 1) or config error (exit 3) blocks the commit,
+ *         a clean tree (exit 0) lets it through, and an informational lossy
+ *         warning (exit 2) does NOT block — a standing `HH-Wxxx` is a persistent
+ *         property of a canonical config, so blocking on it would wedge every
+ *         commit forever on a repo with no drift.
  *   - EV1 a repo using husky (a `.husky/` directory exists) → target
- *         `.husky/pre-commit` (husky already wires `.git/hooks` to run it).
- *   - EV2 otherwise → `.git/hooks/pre-commit`, made executable (chmod +x).
+ *         `.husky/pre-commit` (husky already wires the hooks dir to run it).
+ *   - EV2 otherwise → the repo's real hooks directory (resolved by the gateway
+ *         via `git rev-parse --git-path hooks`, so a worktree or submodule
+ *         gitlink — where `.git` is a FILE, not a directory — resolves to the
+ *         correct hooks dir rather than crashing on a non-directory
+ *         `.git/hooks`). The hook is made executable (chmod +x).
  *   - OPT1 `--force` overwrites an existing hook wholesale; without it, the
  *         tool APPENDS a fenced, marked block so re-runs are idempotent (the
  *         block is detected and not duplicated) and the block is removable by
  *         hand. An existing hook with no harness block is appended to; an
  *         existing hook that already carries the block is left untouched.
- *   - UN1 no `.git` directory → exit 3 (this is not a git repo).
+ *   - UN1 not a git repo (or `git` unavailable, so the hooks dir cannot be
+ *         resolved) → exit 3.
  */
 
-/** The hook line every installed pre-commit runs (U1). */
+/** The audit command every installed pre-commit runs (U1). */
 export const PRECOMMIT_COMMAND = 'npx harness-haircut audit --json';
+
+/**
+ * The exit code `audit` returns for an informational lossy-translation warning
+ * (PRD §7: 0 clean · 1 drift · 2 lossy-warning · 3 invalid config). The hook
+ * treats it as non-blocking — see `precommitHookCommand`.
+ */
+export const AUDIT_WARNING_EXIT = 2;
+
+/**
+ * The POSIX-sh snippet the hook runs (U1). It runs `audit --json`, then maps
+ * the audit exit code to a commit-block decision: a lossy-only warning
+ * (exit 2) is informational and MUST NOT block — a standing `HH-Wxxx` is a
+ * persistent property of canonical config, so blocking on it would wedge every
+ * commit on a drift-free repo. Drift (exit 1) and config errors (exit 3) still
+ * block; a clean tree (exit 0) passes.
+ */
+export function precommitHookCommand(): string {
+  return [
+    PRECOMMIT_COMMAND,
+    'rc=$?',
+    `if [ "$rc" = ${AUDIT_WARNING_EXIT} ]; then exit 0; fi`,
+    'exit $rc',
+  ].join('\n');
+}
 
 /** Opening fence of the harness-managed block (OPT1 idempotency marker). */
 export const PRECOMMIT_MARKER_START = '# >>> harness-haircut >>>';
@@ -31,7 +64,13 @@ export const PRECOMMIT_MARKER_END = '# <<< harness-haircut <<<';
 
 /** Where the hook landed and what the install did to get it there. */
 export interface InstallReport {
-  /** Repo-relative POSIX path of the installed hook. */
+  /**
+   * POSIX path of the installed hook, as understood by the gateway. For a
+   * husky hook this is the repo-relative `.husky/pre-commit`; for a plain hook
+   * it is `<resolved-hooks-dir>/pre-commit`, where the directory is whatever
+   * the gateway resolved (normally `.git/hooks`, but a worktree/submodule
+   * gitlink resolves elsewhere).
+   */
   target: string;
   /**
    * 'created'     — no hook existed; a fresh hook file was written.
@@ -47,13 +86,19 @@ export interface InstallReport {
 /**
  * The disk seam for `install-precommit`. The real implementation lives in
  * `src/gateways/precommit.ts`; tests use a pure in-memory implementation.
- * All paths are repo-relative POSIX.
+ * The husky target is repo-relative POSIX; the resolved hooks dir may be any
+ * POSIX path the gateway hands back (it round-trips it through read/write/chmod).
  */
 export interface PrecommitGateway {
   /** EV1: true when a `.husky/` directory exists at the repo root. */
   huskyPresent(): boolean;
-  /** UN1: true when a `.git` directory exists at the repo root. */
-  gitPresent(): boolean;
+  /**
+   * EV2/UN1: the repo's real git hooks directory (POSIX path), or `null` when
+   * this is not a git repo or `git` is unavailable so the directory cannot be
+   * resolved. Resolves correctly for worktrees and submodules, where `.git` is
+   * a file rather than a directory.
+   */
+  resolveGitHooksDir(): string | null;
   /** Reads a hook file's content, or `null` when it does not exist. */
   read(path: string): string | null;
   /** Writes the hook file wholesale, creating parent directories as needed. */
@@ -72,14 +117,16 @@ export interface InstallPrecommitDeps {
   flags: InstallPrecommitFlags;
 }
 
-/** Repo-relative POSIX paths of the two possible targets. */
+/** Repo-relative POSIX path of the husky target (the git target is resolved). */
 const HUSKY_TARGET = '.husky/pre-commit';
-const GIT_HOOKS_TARGET = '.git/hooks/pre-commit';
+/** Hook filename appended to the resolved hooks directory for a plain hook. */
+const HOOK_FILENAME = 'pre-commit';
 
 /**
  * The full content of a freshly-created hook: a shebang, a brief comment, and
- * the fenced harness block. `npx … audit --json` exits non-zero on drift or a
- * lossy warning, and a non-zero pre-commit hook aborts the commit (U1).
+ * the fenced harness block. The block runs `audit --json` and blocks the commit
+ * on drift (exit 1) or a config error (exit 3); a lossy-only warning (exit 2)
+ * does not block (U1, `precommitHookCommand`).
  */
 function freshHook(): string {
   return [
@@ -95,7 +142,9 @@ function block(): string {
     PRECOMMIT_MARKER_START,
     '# Managed by harness-haircut. Re-run `harness-haircut install-precommit`',
     '# to refresh, or delete the lines between the markers to remove.',
-    PRECOMMIT_COMMAND,
+    '# Blocks on drift (exit 1) or config error (exit 3); a lossy-translation',
+    '# warning (exit 2) is informational and does not block the commit.',
+    precommitHookCommand(),
     PRECOMMIT_MARKER_END,
   ].join('\n');
 }
@@ -119,16 +168,24 @@ function appendBlock(existing: string): string {
 export function installPrecommit(deps: InstallPrecommitDeps): InstallReport {
   const { gateway, flags } = deps;
 
-  // UN1: refuse when this is not a git repo — there is no hooks directory to
-  // install into, and a husky hook would never be invoked.
-  if (!gateway.gitPresent()) {
-    return { target: GIT_HOOKS_TARGET, action: 'unchanged', exitCode: 3 };
-  }
-
-  // EV1 / EV2: husky owns `.git/hooks` when present, so write the source hook
+  // EV1 / EV2: husky owns the hooks dir when present, so write the source hook
   // husky actually runs; otherwise write the git hook directly and chmod it.
   const husky = gateway.huskyPresent();
-  const target = husky ? HUSKY_TARGET : GIT_HOOKS_TARGET;
+
+  let target: string;
+  if (husky) {
+    target = HUSKY_TARGET;
+  } else {
+    // EV2 / UN1: resolve the repo's real hooks dir (correct for worktrees and
+    // submodules, where `.git` is a file). A null result means this is not a
+    // git repo or `git` is unavailable — refuse with exit 3 rather than writing
+    // into a path that does not exist.
+    const hooksDir = gateway.resolveGitHooksDir();
+    if (hooksDir === null) {
+      return { target: `.git/hooks/${HOOK_FILENAME}`, action: 'unchanged', exitCode: 3 };
+    }
+    target = `${hooksDir.replace(/\/+$/, '')}/${HOOK_FILENAME}`;
+  }
 
   const existing = gateway.read(target);
 

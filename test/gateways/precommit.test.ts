@@ -1,8 +1,9 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile, stat, rm, mkdtemp } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { createPrecommitGateway } from '../../dist/gateways/precommit.js';
 import { installPrecommit, PRECOMMIT_COMMAND } from '../../dist/use-cases/install-precommit.js';
 
@@ -11,12 +12,16 @@ after(async () => {
   await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-/** A throwaway repo with a real `.git` directory (and optionally `.husky`). */
+/**
+ * A throwaway repo. By default it is a REAL git repo (`git init`) so the
+ * gateway's `git rev-parse --git-path hooks` resolves; `git: false` leaves a
+ * bare tmpdir with no repo (the not-a-git-repo case).
+ */
 async function mkRepo(opts?: { husky?: boolean; git?: boolean }): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'harness-precommit-'));
   tempDirs.push(root);
   if (opts?.git ?? true) {
-    await mkdir(join(root, '.git', 'hooks'), { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: root });
   }
   if (opts?.husky) {
     await mkdir(join(root, '.husky'), { recursive: true });
@@ -98,12 +103,41 @@ describe('createPrecommitGateway() + installPrecommit() over a real repo', () =>
     assert.doesNotMatch(content, /npm run lint/);
   });
 
-  it('exits 3 when there is no .git directory (UN1)', async () => {
+  it('exits 3 when there is no git repo to resolve (UN1)', async () => {
     const root = await mkRepo({ git: false });
     const report = installPrecommit({
       gateway: createPrecommitGateway(root),
       flags: { force: false },
     });
     assert.equal(report.exitCode, 3);
+  });
+
+  it('installs in a worktree where .git is a FILE — no ENOTDIR/exit 70 (EV2)', async () => {
+    const main = await mkRepo();
+    // A commit is required before `git worktree add`.
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty'], {
+      cwd: main,
+    });
+    const wt = await mkdtemp(join(tmpdir(), 'harness-precommit-wt-'));
+    tempDirs.push(wt);
+    // `git worktree add` wants a non-existent path; remove the empty mkdtemp dir.
+    await rm(wt, { recursive: true, force: true });
+    execFileSync('git', ['worktree', 'add', '-q', wt], { cwd: main });
+
+    // `.git` in the worktree is a gitlink FILE, not a directory.
+    const dotGit = await readFile(join(wt, '.git'), 'utf8');
+    assert.equal(dotGit.startsWith('gitdir:'), true);
+
+    const report = installPrecommit({
+      gateway: createPrecommitGateway(wt),
+      flags: { force: false },
+    });
+    assert.equal(report.exitCode, 0);
+    assert.match(report.target, /pre-commit$/);
+    // `git rev-parse --git-path hooks` reports an absolute path in a worktree;
+    // the gateway honors it verbatim, so read it directly.
+    const hookPath = isAbsolute(report.target) ? report.target : join(wt, report.target);
+    const content = await readFile(hookPath, 'utf8');
+    assert.match(content, new RegExp(PRECOMMIT_COMMAND.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   });
 });

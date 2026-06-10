@@ -53,6 +53,13 @@ export interface DoctorDeps {
   configRaw: string | null;
   /** The config path, used only for error messages. */
   configPath: string;
+  /**
+   * Set when an EXPLICIT `--config <path>` was passed but the file does not
+   * exist. The default-location absence stays silent (it falls back to
+   * defaults), but a health check should not quietly ignore a user pointing at
+   * a config that is not there — doctor surfaces it as a warning.
+   */
+  explicitConfigMissing?: boolean;
 }
 
 export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
@@ -67,6 +74,15 @@ export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
   }
 
   const warnings: string[] = [];
+
+  // A user-specified config that is not on disk is worth surfacing — the run
+  // silently fell back to defaults, which is rarely what `--config <path>` was
+  // meant to do. The default-location absence stays silent (handled by the
+  // caller passing `explicitConfigMissing` only for an explicit path).
+  if (deps.explicitConfigMissing === true) {
+    warnings.push(`specified config not found: ${deps.configPath} (using defaults)`);
+  }
+
   let config: HarnessConfig | null;
   let exitCode: 0 | 3 = 0;
   try {

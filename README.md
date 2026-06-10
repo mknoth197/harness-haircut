@@ -32,7 +32,10 @@ npx harness-haircut install-precommit   # install a pre-commit hook that runs `a
 ### Pre-commit hook
 
 `install-precommit` writes a hook that runs `harness-haircut audit --json` and
-blocks the commit on any drift:
+blocks the commit on **drift** (exit 1) or a **config error** (exit 3). An
+informational lossy-translation warning (exit 2) does **not** block — a standing
+`HH-Wxxx` is a persistent property of a canonical config, so blocking on it
+would wedge every commit on a drift-free repo.
 
 ```sh
 npx harness-haircut install-precommit          # append a fenced harness block
@@ -40,9 +43,11 @@ npx harness-haircut install-precommit --force  # overwrite an existing hook whol
 ```
 
 It targets `.husky/pre-commit` when [husky](https://typicode.github.io/husky/)
-is present, otherwise `.git/hooks/pre-commit` (made executable). Re-running is
-idempotent — the harness block is fenced with markers and never duplicated.
-Run it from inside a git repository (it exits 3 otherwise).
+is present, otherwise the repo's real git hooks directory (resolved via
+`git rev-parse --git-path hooks`, so worktrees and submodules work too), and
+makes the hook executable. Re-running is idempotent — the harness block is
+fenced with markers and never duplicated. Run it from inside a git repository
+(it exits 3 otherwise).
 
 ### Continuous integration
 

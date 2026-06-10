@@ -202,8 +202,10 @@ async function runInstallPrecommit(parsed: ParsedArgs, io: RunIO): Promise<ExitC
     io.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else if (report.exitCode === 3) {
     io.stderr.write(
-      'harness-haircut: not a git repository (no .git directory). ' +
-        'Run `git init` first, or run from the repo root.\n',
+      'harness-haircut: not a git repository, or `git` is not installed, so the ' +
+        'hooks directory could not be resolved. Run `git init` first, run from ' +
+        'the repo root (including a worktree or submodule), and ensure `git` is ' +
+        'on PATH.\n',
     );
   } else {
     const verb: Record<InstallReport['action'], string> = {
@@ -228,7 +230,7 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   try {
     // Read the raw config text (or null when absent) here in layer 4; the use
     // case parses it so an invalid config surfaces as the doctor's exit 3.
-    const { raw, configPath } = await readConfigText(cwd, configFlag);
+    const { raw, configPath, explicitConfigMissing } = await readConfigText(cwd, configFlag);
     report = await doctor({
       version: await readPackageVersion(),
       nodeVersion: process.version,
@@ -237,6 +239,7 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       snapshot: () => readInitSnapshot(cwd),
       configRaw: raw,
       configPath,
+      explicitConfigMissing,
     });
   } catch (err) {
     if (err instanceof DomainError) {
@@ -331,24 +334,25 @@ async function readConfig(cwd: string, configFlag: string | undefined): Promise<
 /**
  * Reads the raw config text without parsing it, for `doctor` (which diagnoses
  * an invalid config rather than throwing on it). Returns `null` raw when the
- * default-location file is absent; an explicit `--config` that does not exist
- * yields a `null` raw too — the use case then reports the absence via
- * `loadConfig`'s defaults, which is the friendly behavior for a health check.
+ * file is absent. The default-location absence is silent (doctor falls back to
+ * defaults); an explicit `--config <path>` that does not exist sets
+ * `explicitConfigMissing` so doctor can surface it as a warning rather than
+ * silently defaulting.
  */
 async function readConfigText(
   cwd: string,
   configFlag: string | undefined,
-): Promise<{ raw: string | null; configPath: string }> {
+): Promise<{ raw: string | null; configPath: string; explicitConfigMissing: boolean }> {
   const explicit = configFlag !== undefined;
   const configPath = explicit
     ? resolve(cwd, configFlag)
     : resolve(cwd, 'harness-haircut.config.json');
   try {
     const raw = await readFile(configPath, 'utf8');
-    return { raw, configPath };
+    return { raw, configPath, explicitConfigMissing: false };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { raw: null, configPath };
+      return { raw: null, configPath, explicitConfigMissing: explicit };
     }
     throw err;
   }

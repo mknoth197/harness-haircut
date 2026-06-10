@@ -58,6 +58,32 @@ describe('doctor()', () => {
     assert.equal(report.exitCode, 0);
   });
 
+  it('warns when an explicit --config path does not exist', async () => {
+    const report = await doctor({
+      ...baseDeps,
+      configPath: '/tmp/repo/does-not-exist.json',
+      snapshot: () => Promise.resolve(snapshotOf({})),
+      configRaw: null,
+      explicitConfigMissing: true,
+    });
+    // It still falls back to defaults (exit 0, valid config)...
+    assert.equal(report.exitCode, 0);
+    assert.notEqual(report.config, null);
+    // ...but the missing explicit config is surfaced, not silently ignored.
+    assert.ok(report.warnings.some((w) => /specified config not found/.test(w)));
+  });
+
+  it('stays silent about an absent config at the DEFAULT location', async () => {
+    const report = await doctor({
+      ...baseDeps,
+      snapshot: () => Promise.resolve(snapshotOf({})),
+      configRaw: null,
+      // explicitConfigMissing omitted/false -> default-location absence is fine.
+    });
+    assert.equal(report.exitCode, 0);
+    assert.deepEqual(report.warnings, []);
+  });
+
   it('exits 3 and warns when the config is invalid (does not throw)', async () => {
     const report = await doctor({
       ...baseDeps,

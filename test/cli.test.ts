@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync, existsSync } from 'node:fs';
-import { rm, writeFile, mkdir } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 import { parseArgs, run } from '../dist/index.js';
 import { mkTempRepo } from './_helpers/tmp-repo.ts';
 import type { TempRepo } from './_helpers/tmp-repo.ts';
@@ -179,8 +179,9 @@ describe('install-precommit E2E (spawn dist/bin.js)', () => {
   it('installs into .git/hooks/pre-commit and exits 0 (U1, EV2)', async () => {
     const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
     repos.push(repo);
-    // mkTempRepo has no .git; create one so the hook has a home.
-    await mkdir(join(repo.root, '.git', 'hooks'), { recursive: true });
+    // mkTempRepo has no .git; init a real repo so `git rev-parse --git-path
+    // hooks` resolves the hooks dir.
+    spawnSync('git', ['init', '-q'], { cwd: repo.root, encoding: 'utf8' });
     const r = spawnSync(
       process.execPath,
       [binPath, 'install-precommit', '--cwd', repo.root],
@@ -190,6 +191,8 @@ describe('install-precommit E2E (spawn dist/bin.js)', () => {
     assert.equal(existsSync(join(repo.root, '.git', 'hooks', 'pre-commit')), true);
     const hook = readFileSync(join(repo.root, '.git', 'hooks', 'pre-commit'), 'utf8');
     assert.match(hook, /npx harness-haircut audit --json/);
+    // The hook must not block on an informational lossy warning (audit exit 2).
+    assert.match(hook, /if \[ "\$rc" = 2 \]; then exit 0; fi/);
   });
 
   it('exits 3 when run outside a git repo (UN1)', async () => {
@@ -202,6 +205,39 @@ describe('install-precommit E2E (spawn dist/bin.js)', () => {
     );
     assert.equal(r.status, 3);
     assert.match(r.stderr, /not a git repository/);
+  });
+
+  it('installs in a worktree where .git is a FILE, not exit 70 (EV2)', async () => {
+    // A linked worktree has a `.git` *file* (a gitlink) — the old code did
+    // mkdir over <root>/.git/hooks and crashed with ENOTDIR -> exit 70.
+    const main = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(main);
+    spawnSync('git', ['init', '-q'], { cwd: main.root, encoding: 'utf8' });
+    // A commit is required before `git worktree add`.
+    spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty'], {
+      cwd: main.root,
+      encoding: 'utf8',
+    });
+    const wtPath = join(main.root, '..', `${main.root.split('/').pop()}-wt`);
+    const add = spawnSync('git', ['worktree', 'add', '-q', wtPath], {
+      cwd: main.root,
+      encoding: 'utf8',
+    });
+    assert.equal(add.status, 0, add.stderr);
+    repos.push({ root: wtPath, cleanup: () => rm(wtPath, { recursive: true, force: true }) });
+
+    // Sanity: `.git` in the worktree is a file (gitlink), not a directory.
+    assert.equal(readFileSync(join(wtPath, '.git'), 'utf8').startsWith('gitdir:'), true);
+
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'install-precommit', '--cwd', wtPath],
+      { encoding: 'utf8' },
+    );
+    assert.notEqual(r.status, 70);
+    assert.equal(r.status, 0, r.stderr);
+    // The hook was written into the worktree's resolved hooks dir.
+    assert.match(r.stdout, /pre-commit/);
   });
 });
 

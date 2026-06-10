@@ -9,6 +9,23 @@ minor versions (see [`AGENTS.md`](AGENTS.md) "Definition of Done").
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release workflow** now routes tags fail-closed: an exact `vX.Y.Z` publishes
+  to `latest`, a `vX.Y.Z-<suffix>` pre-release publishes to `next`, and any
+  malformed tag (`vX.Y.Z.W`, `vX.Y.Z-rc1`, …) refuses to publish. Previously a
+  non-`rc.N` pre-release tag could reach the `latest` dist-tag.
+- **Pre-commit hook** no longer blocks a commit on an informational
+  lossy-translation warning (audit exit 2); it blocks only on drift (exit 1) or
+  a config error (exit 3). A standing `HH-Wxxx` on a drift-free repo no longer
+  wedges every commit.
+- **`install-precommit`** resolves the real git hooks directory via
+  `git rev-parse --git-path hooks`, so a worktree or submodule (where `.git` is
+  a file) installs correctly instead of crashing with exit 70. When `git` is
+  unavailable, it now fails with a clear exit-3 domain error.
+- **`doctor --config <path>`** now warns when the explicitly specified config
+  file does not exist, instead of silently falling back to defaults.
+
 ## [0.1.0] - 2026-06-10
 
 First public release. `harness-haircut` audits a single repository and
@@ -32,10 +49,13 @@ each provider's native format.
   - `doctor` — print version, Node version, cwd, detected providers, the
     parsed config, and any environment warnings. Exit `3` on an invalid config.
   - `install-precommit` — install a git pre-commit hook that runs
-    `npx harness-haircut audit --json` to block commits on drift. Detects
-    husky (`.husky/pre-commit`) or falls back to `.git/hooks/pre-commit`
-    (chmod +x). `--force` overwrites; otherwise appends an idempotent,
-    fenced harness block.
+    `npx harness-haircut audit --json`. The hook blocks the commit on drift
+    (exit 1) or a config error (exit 3); an informational lossy-translation
+    warning (exit 2) does not block. Detects husky (`.husky/pre-commit`) or
+    falls back to the repo's real git hooks directory resolved via
+    `git rev-parse --git-path hooks` (so worktrees and submodules work),
+    chmod +x. `--force` overwrites; otherwise appends an idempotent, fenced
+    harness block.
 - **Provider adapters** (four, in A-story order): Codex, Claude, Gemini, and
   Copilot — each projecting the instructions, skills, and hooks surfaces into
   the provider's native files and merge-key settings.
