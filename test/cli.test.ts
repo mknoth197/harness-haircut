@@ -1,10 +1,14 @@
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
+import { rm, writeFile } from 'node:fs/promises';
 import { parseArgs, run } from '../dist/index.js';
+import { mkTempRepo } from './_helpers/tmp-repo.ts';
+import type { TempRepo } from './_helpers/tmp-repo.ts';
+import { emitProjection } from './_helpers/emit.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
@@ -98,10 +102,12 @@ describe('run() in-process', () => {
     assert.match(stderr, /unknown command/);
   });
 
-  it('known but unimplemented command exits 70', async () => {
-    const { code, stderr } = await runCli(['audit']);
-    assert.equal(code, 70);
-    assert.match(stderr, /not yet implemented/);
+  it('unimplemented commands (init/apply/doctor) exit 70', async () => {
+    for (const command of ['init', 'apply', 'doctor']) {
+      const { code, stderr } = await runCli([command]);
+      assert.equal(code, 70);
+      assert.match(stderr, /not yet implemented/);
+    }
   });
 
   it('parser error (--cwd with no value) exits 64', async () => {
@@ -118,9 +124,129 @@ describe('built CLI binary', () => {
     assert.equal(r.stdout.trim(), pkgVersion);
   });
 
-  it('audit via spawn exits 70', () => {
-    const r = spawnSync(process.execPath, [binPath, 'audit'], { encoding: 'utf8' });
+  it('init via spawn exits 70 (still a stub)', () => {
+    const r = spawnSync(process.execPath, [binPath, 'init'], { encoding: 'utf8' });
     assert.equal(r.status, 70);
     assert.match(r.stderr, /not yet implemented/);
+  });
+});
+
+describe('audit E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  async function cleanRepo(): Promise<TempRepo> {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+    });
+    repos.push(repo);
+    await emitProjection(repo.root);
+    return repo;
+  }
+
+  it('exits 0 on a clean canonical repo', async () => {
+    const repo = await cleanRepo();
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /clean/);
+  });
+
+  it('exits 1 on a drifted repo', async () => {
+    const repo = await cleanRepo();
+    await rm(join(repo.root, '.github', 'copilot-instructions.md'));
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /drift/);
+  });
+
+  it('--json emits a structured report', async () => {
+    const repo = await cleanRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'audit', '--cwd', repo.root, '--json'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    const report = JSON.parse(r.stdout) as { exitCode: number; files: unknown[] };
+    assert.equal(report.exitCode, 0);
+    assert.ok(Array.isArray(report.files));
+  });
+
+  it('exits 3 on a malformed harness-haircut.config.json', async () => {
+    const repo = await cleanRepo();
+    await writeFile(join(repo.root, 'harness-haircut.config.json'), '{ not json', 'utf8');
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /harness-haircut/);
+  });
+
+  it('exits 3 on a malformed canonical source, naming the file (UN1)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n',
+      '.agents/instructions/broken.md': '# missing scope frontmatter\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /broken\.md/);
+  });
+
+  /**
+   * A repo whose projection fires a lossy warning (HH-W007: scoped fragment
+   * unrepresentable for Gemini) while disk matches every emitted file.
+   */
+  async function lossyRepo(): Promise<TempRepo> {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n\nUse npm test.\n',
+      '.agents/instructions/testing.md':
+        '---\nscope: "test/**/*.ts"\n---\n# Testing\n\nUse node:test.\n',
+    });
+    repos.push(repo);
+    await emitProjection(repo.root);
+    return repo;
+  }
+
+  it('exits 2 when only lossy warnings fire (EV4)', async () => {
+    const repo = await lossyRepo();
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 2);
+    assert.match(r.stdout, /HH-W007/);
+  });
+
+  it('--strict escalates lossy warnings to exit 1 (OPT1)', async () => {
+    const repo = await lossyRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'audit', '--cwd', repo.root, '--strict'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+  });
+
+  it('config warningsAsErrors escalates lossy warnings to exit 1', async () => {
+    const repo = await lossyRepo();
+    await writeFile(
+      join(repo.root, 'harness-haircut.config.json'),
+      '{ "warningsAsErrors": true }\n',
+      'utf8',
+    );
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1);
   });
 });

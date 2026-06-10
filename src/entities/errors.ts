@@ -83,6 +83,20 @@ export class EmitPathCollisionError extends DomainError {
   }
 }
 
+/**
+ * `harness-haircut.config.json` is malformed or carries an invalid value
+ * (C1 UN — invalid config; exit code 3). Distinct from
+ * `MalformedProviderConfigError`, which covers a *provider's* co-owned file.
+ */
+export class InvalidConfigError extends DomainError {
+  readonly path: string;
+
+  constructor(path: string, reason: string) {
+    super(`${path}: ${reason}`, 3);
+    this.path = path;
+  }
+}
+
 /** An OS-level filesystem failure, converted at the gateway boundary. */
 export class FileSystemError extends DomainError {
   readonly path: string;

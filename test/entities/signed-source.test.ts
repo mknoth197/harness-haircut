@@ -6,8 +6,10 @@ import {
   HEADER_TAG,
   InvalidSourcePathError,
   canonicalManifest,
+  detectHeaderPlacement,
   embedHeader,
   embedHeaderAfterFrontmatter,
+  verifyAgainstExpected,
   verifyHeader,
   verifyHeaderAfterFrontmatter,
 } from '../../dist/index.js';
@@ -240,6 +242,94 @@ describe('canonicalManifest', () => {
   it('makes verification independent of manifest entry order', () => {
     const file = embedHeader(body, sources, 'html');
     assert.deepEqual(verifyHeader(file, [...sources].reverse()), { status: 'clean' });
+  });
+});
+
+describe('detectHeaderPlacement', () => {
+  const frontmattered = '---\npaths: ["src/**"]\n---\n# Rules\n';
+
+  it('detects a first-line header for every comment syntax', () => {
+    for (const syntax of ['html', 'hash', 'slash'] as const) {
+      assert.equal(detectHeaderPlacement(embedHeader(body, sources, syntax)), 'first-line');
+    }
+  });
+
+  it('detects an after-frontmatter header', () => {
+    assert.equal(
+      detectHeaderPlacement(embedHeaderAfterFrontmatter(frontmattered, sources)),
+      'after-frontmatter',
+    );
+  });
+
+  it('reports none for plain markdown', () => {
+    assert.equal(detectHeaderPlacement('# Just a readme\n'), 'none');
+  });
+
+  it('reports none for frontmatter without a header after it', () => {
+    assert.equal(detectHeaderPlacement(frontmattered), 'none');
+  });
+
+  it('reports none for the empty string', () => {
+    assert.equal(detectHeaderPlacement(''), 'none');
+  });
+});
+
+describe('verifyAgainstExpected', () => {
+  const frontmattered = '---\npaths: ["src/**"]\n---\n# Rules\n\nUse the layer rules.\n';
+
+  it('reports clean when disk equals the expected emission (first-line placement)', () => {
+    const expected = embedHeader(body, sources, 'html');
+    assert.deepEqual(verifyAgainstExpected(expected, expected), { status: 'clean' });
+  });
+
+  it('reports clean when disk equals the expected emission (after-frontmatter placement)', () => {
+    const expected = embedHeaderAfterFrontmatter(frontmattered, sources);
+    assert.deepEqual(verifyAgainstExpected(expected, expected), { status: 'clean' });
+  });
+
+  it('reports clean across CRLF differences (Windows autocrlf checkout)', () => {
+    const expected = embedHeader(body, sources, 'html');
+    const crlfDisk = expected.replace(/\n/g, '\r\n');
+    assert.deepEqual(verifyAgainstExpected(crlfDisk, expected), { status: 'clean' });
+  });
+
+  it('reports edited when the disk body was modified under an intact header', () => {
+    const expected = embedHeader(body, sources, 'html');
+    assert.deepEqual(verifyAgainstExpected(`${expected}\nuser-added line\n`, expected), {
+      status: 'edited',
+    });
+  });
+
+  it('reports edited when a frontmatter line was modified (BODY_HASH binds frontmatter)', () => {
+    const expected = embedHeaderAfterFrontmatter(frontmattered, sources);
+    const tampered = expected.replace('paths: ["src/**"]', 'paths: ["**"]');
+    assert.notEqual(tampered, expected);
+    assert.deepEqual(verifyAgainstExpected(tampered, expected), { status: 'edited' });
+  });
+
+  it('reports stale when disk is an intact emission of older canonical content', () => {
+    const oldEmission = embedHeader('# old projected content\n', otherSources, 'html');
+    const expected = embedHeader(body, sources, 'html');
+    assert.deepEqual(verifyAgainstExpected(oldEmission, expected), { status: 'stale' });
+  });
+
+  it('reports stale when only the sources manifest changed (same body)', () => {
+    const oldEmission = embedHeader(body, otherSources, 'html');
+    const expected = embedHeader(body, sources, 'html');
+    assert.deepEqual(verifyAgainstExpected(oldEmission, expected), { status: 'stale' });
+  });
+
+  it('reports unmanaged when disk has no header at the expected placement', () => {
+    const expected = embedHeader(body, sources, 'html');
+    assert.deepEqual(verifyAgainstExpected('# hand-written file\n', expected), {
+      status: 'unmanaged',
+    });
+    const fmExpected = embedHeaderAfterFrontmatter(frontmattered, sources);
+    assert.deepEqual(verifyAgainstExpected(frontmattered, fmExpected), { status: 'unmanaged' });
+  });
+
+  it('throws when the expected emission carries no header (internal misuse)', () => {
+    assert.throws(() => verifyAgainstExpected('anything', '# headerless expected\n'), /header/);
   });
 });
 

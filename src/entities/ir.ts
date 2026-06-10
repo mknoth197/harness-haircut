@@ -36,6 +36,15 @@ export function isHookEvent(value: string): value is HookEvent {
   return (HOOK_EVENTS as readonly string[]).includes(value);
 }
 
+/**
+ * The canonical one-line import that provider import-shim files (`CLAUDE.md`,
+ * and `GEMINI.md` in shim mode) must carry as their first line (PRD §9
+ * carve-out 1). It lives in the entities layer so the audit use case can run
+ * the first-line drift check without importing adapter code; the shim
+ * projection in `src/adapters/shim.ts` re-exports it.
+ */
+export const AGENTS_IMPORT_LINE = '@AGENTS.md';
+
 /** An opaque file carried through the IR verbatim (skill sibling files, unknown `.agents/` files). */
 export interface Attachment {
   /** Repo-relative POSIX path. */
