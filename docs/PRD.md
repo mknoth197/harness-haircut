@@ -176,18 +176,31 @@ Global options:
 
 **[draft default — open to revision]**
 
+> **Revision note (v0.3):** the v0.2 draft used a single combined hash of body + sources. That design cannot distinguish "user edited the emitted file" from "canonical sources changed since emit" — any mismatch is ambiguous — yet the `apply` overwrite policy and story F2 (#5) depend on exactly that distinction. The header therefore carries **two** hashes.
+
 Every file `harness-haircut` emits begins with one of:
 
 ```
-<!-- @generated SignedSource<<<HASH>>> harness-haircut DO NOT EDIT -->
+<!-- @generated SignedSource<<<BODY_HASH.SOURCES_HASH>>> harness-haircut DO NOT EDIT -->
 ```
 
 (or the language-appropriate comment syntax for non-markdown emitted files).
 
-- **`HASH`** = lowercase hex of `SHA-256(content_after_header_line + "\n" + sources_manifest)`, truncated to 16 chars.
-- **`sources_manifest`** = newline-separated list of `<canonical_path>:<sha256_of_content>` for every canonical file that contributed to this projection. Lets `audit` detect both downstream edits *and* upstream changes.
-- On `apply`: recompute hash from canonical sources; if disk file hash mismatch but file content unchanged from last emit, overwrite freely. If content was edited (signature line invalid), prompt before overwriting.
-- On `audit`: read disk file, recompute expected projection, compare. Mismatch = drift.
+- **`BODY_HASH`** = lowercase hex of `SHA-256(content_after_header_line)`, truncated to 16 chars. Binds the emitted body.
+- **`SOURCES_HASH`** = lowercase hex of `SHA-256(sources_manifest)`, truncated to 16 chars. Binds the canonical inputs.
+- **`sources_manifest`** = `<canonical_path>:<sha256_of_content>` lines for every canonical file that contributed to this projection, sorted by path, joined with `\n`.
+
+Verification takes the disk file **and** the current canonical sources, and returns one of four states:
+
+| State | Condition | Meaning |
+|---|---|---|
+| `unmanaged` | no header present | file is not ours; never overwrite silently |
+| `edited` | `BODY_HASH` ≠ hash(disk body) | user modified the generated file — prompt before overwrite (fail under `--non-interactive`) |
+| `stale` | body intact, `SOURCES_HASH` ≠ hash(current manifest) | canonical sources changed since emit — safe to overwrite freely |
+| `clean` | both hashes match | up to date |
+
+- On `apply`: `clean` → skip; `stale` → overwrite; `edited` → prompt; `unmanaged` at a target path → refuse with error.
+- On `audit`: any state other than `clean` for an expected emitted file is reported (`stale`/`edited` → drift, exit 1; `unmanaged` → drift with a distinct message).
 
 ## 10. Provider mapping & merge policy *(new)*
 
