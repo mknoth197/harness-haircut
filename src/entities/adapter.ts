@@ -102,6 +102,15 @@ export interface RepoSnapshot {
   /** Absolute path of the repo root the snapshot was taken from. */
   root: string;
   files: FileSnapshot[];
+  /**
+   * Repo-relative POSIX paths of canonical-shaped sources excluded by a
+   * `.gitignore` rule (an `AGENTS.md`, or a pruned directory on the
+   * `.agents/` path reported with a trailing `/`). The `parseRepo` use case
+   * maps these into `HH-W012` warnings so over-ignored canonical content
+   * surfaces instead of vanishing silently (F1 follow-up #21, PRD §16).
+   * Sorted; absent or empty when nothing canonical was excluded.
+   */
+  excludedCanonicalPaths?: string[];
 }
 
 export interface ExistingProviderConfig {

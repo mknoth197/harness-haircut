@@ -12,12 +12,14 @@ import { FileSystemError } from '../entities/errors.js';
 /** Skipped unconditionally, at any depth, regardless of .gitignore. */
 const ALWAYS_SKIPPED_DIRS: ReadonlySet<string> = new Set(['.git', 'node_modules', 'dist']);
 
-interface IgnorePattern {
+export interface IgnorePattern {
   regex: RegExp;
   /** Pattern ended with '/': matches directories only. */
   dirOnly: boolean;
   /** Pattern contains '/' (or led with one): matched against the full repo-relative path. */
   anchored: boolean;
+  /** Started with '!': re-includes a path an earlier pattern excluded. */
+  negated: boolean;
 }
 
 /*
@@ -29,34 +31,137 @@ interface IgnorePattern {
  *   - root-anchored patterns ('/foo', 'a/b') — any non-trailing '/' anchors
  *     the pattern to the repo root
  *   - '*' wildcards within a single path segment ([^/]*)
+ *   - '!' negation lines — a later pattern re-includes a path excluded by an
+ *     earlier one. Last matching pattern wins (git semantics). Honored with
+ *     git's caveat: a negation cannot re-include a file beneath a directory
+ *     that is itself excluded, because the walk prunes excluded directories
+ *     and never descends into them (see `walk`).
+ *   - multi-segment double-star globs. A trailing double-star (foo then
+ *     slash then star-star) matches everything below foo; a leading
+ *     star-star-slash (star-star then slash then bar) matches bar at any
+ *     depth; an interior double-star (a then slash-star-star-slash then b)
+ *     matches both a/b and a/x/y/b. A bare double-star segment matches zero
+ *     or more path segments.
  * NOT supported (documented limitations):
- *   - '!' negation lines are skipped entirely, so re-included files stay
- *     ignored (conservative over-skip)
- *   - '**' collapses to a single-segment '*'; '?', character classes, and
- *     backslash escapes are treated as literal characters
+ *   - '?', character classes ('[a-z]'), and backslash escapes are treated as
+ *     literal characters
  *   - nested .gitignore files and $GIT_DIR/info/exclude are not consulted
+ *     (root .gitignore only)
  */
 function compilePattern(line: string): IgnorePattern | null {
   const trimmed = line.trim();
-  if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('!')) {
+  if (trimmed === '' || trimmed.startsWith('#')) {
     return null;
   }
   let pattern = trimmed;
+  let negated = false;
+  if (pattern.startsWith('!')) {
+    negated = true;
+    pattern = pattern.slice(1);
+  }
   let dirOnly = false;
   if (pattern.endsWith('/')) {
     dirOnly = true;
     pattern = pattern.slice(0, -1);
+  }
+  if (pattern === '') {
+    return null;
   }
   let anchored = false;
   if (pattern.startsWith('/')) {
     anchored = true;
     pattern = pattern.slice(1);
   }
-  if (pattern.includes('/')) {
+  // A '/' anywhere other than a trailing slash anchors the pattern to the
+  // repo root (git rule). Leading '**/' does not anchor — it stays a
+  // match-at-any-depth pattern — so detect a "real" interior slash first.
+  if (hasAnchoringSlash(pattern)) {
     anchored = true;
   }
-  const regexBody = pattern.split('/').map(segmentToRegexSource).join('/');
-  return { regex: new RegExp(`^${regexBody}$`), dirOnly, anchored };
+  return { regex: new RegExp(`^${globToRegexSource(pattern)}$`), dirOnly, anchored, negated };
+}
+
+/**
+ * True when the pattern contains a slash that anchors it to the repo root.
+ * A leading double-star-slash is the one slash that does NOT anchor (git: it
+ * means "in this dir or any subdir"), so strip one leading globstar prefix
+ * before looking for an anchoring slash.
+ */
+function hasAnchoringSlash(pattern: string): boolean {
+  const withoutLeadingGlobstar = pattern.startsWith('**/') ? pattern.slice(3) : pattern;
+  return withoutLeadingGlobstar.includes('/');
+}
+
+/**
+ * Compiles a gitignore glob (already stripped of leading '!', leading '/',
+ * and trailing '/') into a regex source. Splits on '/' so that a whole '**'
+ * segment becomes a multi-segment matcher and '*' stays single-segment
+ * ([^/]*). Git's three globstar shapes are honored:
+ *   - leading globstar ('foo' at any depth): a zero-or-more-segment prefix
+ *     group precedes the rest of the pattern.
+ *   - trailing globstar ('everything inside foo'): the head is followed by a
+ *     mandatory separator and one-or-more remaining path chars.
+ *   - interior globstar ('a' … 'b' with anything between): a mandatory
+ *     separator after the head, then a zero-or-more-segment group, then the
+ *     tail — matching 'a/b' (zero between) and 'a/x/y/b' but not 'ab'.
+ * A literal '**' that is not a standalone segment (e.g. 'a**b') degrades to
+ * the single-segment '*' behavior for each star, which is acceptable for the
+ * canonical-source patterns we care about.
+ */
+function globToRegexSource(pattern: string): string {
+  // Collapse runs of consecutive '**' segments into a single '**' first:
+  // 'a/**/**/b' is semantically identical to 'a/**/b', and the per-segment
+  // emitter below would otherwise stitch two globstar groups together into a
+  // dead regex containing a literal '//' that no normalized path can match.
+  const segments = collapseGlobstars(pattern.split('/'));
+  let out = '';
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i] ?? '';
+    const isFirst = i === 0;
+    const isLast = i === segments.length - 1;
+    if (segment === '**') {
+      if (isLast) {
+        // Trailing globstar ('foo' then slash-star-star): everything strictly
+        // inside foo, ≥1 segment. The previous segment skipped its join slash
+        // (its successor is this globstar), so supply the separator here.
+        out += isFirst ? '.+' : '/.+';
+      } else if (isFirst) {
+        // Leading globstar ('star-star/<rest>'): zero-or-more leading whole
+        // segments. The group ends in '/', so it also supplies the separator
+        // before the next segment — no join slash after it.
+        out += '(?:.*/)?';
+        continue;
+      } else {
+        // Interior globstar ('a' … star-star … 'b'): the preceding segment
+        // skipped its join slash, so require that separator here, then a
+        // zero-or-more-whole-segments group. The result matches 'a/b' and
+        // 'a/x/y/b' but not the single fused component 'ab'.
+        out += '/(?:.*/)?';
+        continue;
+      }
+    } else {
+      out += segmentToRegexSource(segment);
+    }
+    // Emit a path separator before the next segment, unless that next
+    // segment is a globstar whose own prefix group already supplies it.
+    if (!isLast && segments[i + 1] !== '**') {
+      out += '/';
+    }
+  }
+  return out;
+}
+
+/**
+ * Drops each '**' segment that immediately follows another '**', leaving one
+ * globstar per run. Git treats a run of adjacent globstars (a, then two
+ * globstar segments, then b) as identical to a single one (a, one globstar,
+ * b); a run left intact would compile to a regex with a literal '//' that no
+ * normalized path can match (a dead pattern).
+ */
+function collapseGlobstars(segments: string[]): string[] {
+  return segments.filter(
+    (segment, i) => !(segment === '**' && segments[i - 1] === '**'),
+  );
 }
 
 function segmentToRegexSource(segment: string): string {
@@ -66,26 +171,66 @@ function segmentToRegexSource(segment: string): string {
     .join('[^/]*');
 }
 
-function parseGitignore(content: string): IgnorePattern[] {
+export function parseGitignore(content: string): IgnorePattern[] {
   return content
     .split('\n')
     .map(compilePattern)
     .filter((pattern): pattern is IgnorePattern => pattern !== null);
 }
 
-function isIgnored(relPath: string, isDir: boolean, patterns: readonly IgnorePattern[]): boolean {
+/**
+ * Last-matching-pattern-wins verdict for `relPath`. A negated pattern that
+ * matches flips the verdict back to "not ignored"; a later non-negated match
+ * flips it back. Returns the final boolean after walking every pattern.
+ *
+ * The directory-exclusion caveat (a negation cannot resurrect a file under an
+ * excluded directory) is enforced by the walk, not here: `walk` prunes a
+ * directory whose verdict is "ignored", so files beneath it are never tested.
+ *
+ * Contract: this assumes the walk's incremental, segment-by-segment descent.
+ * An unanchored parent-directory pattern (e.g. `build`) takes effect because
+ * the walk tests — and prunes — that directory as it descends, NOT because a
+ * deep path is tested standalone (`build/x/y.md` is never asked about once
+ * `build/` is pruned). Callers must therefore drive `isIgnored` via the walk
+ * (testing each path component as it is reached), not on arbitrary deep paths.
+ */
+export function isIgnored(
+  relPath: string,
+  isDir: boolean,
+  patterns: readonly IgnorePattern[],
+): boolean {
   const basename = relPath.slice(relPath.lastIndexOf('/') + 1);
-  return patterns.some((pattern) => {
+  let ignored = false;
+  for (const pattern of patterns) {
+    // A dir-only pattern can still re-include via negation? No: dir-only
+    // patterns only apply to directories. Skip non-matching file/dir kinds.
     if (pattern.dirOnly && !isDir) {
-      return false;
+      continue;
     }
-    return pattern.regex.test(pattern.anchored ? relPath : basename);
-  });
+    const target = pattern.anchored ? relPath : basename;
+    if (pattern.regex.test(target)) {
+      ignored = !pattern.negated;
+    }
+  }
+  return ignored;
 }
 
-function isCanonicalPath(relPath: string): boolean {
+export function isCanonicalPath(relPath: string): boolean {
   const basename = relPath.slice(relPath.lastIndexOf('/') + 1);
   return relPath.startsWith('.agents/') || basename === 'AGENTS.md';
+}
+
+/**
+ * True when a pruned directory sits on the canonical `.agents/` path — the
+ * root `.agents/` tree itself or any directory beneath it. Excluding such a
+ * directory loses canonical content we can attribute precisely, so it earns
+ * an HH-W012 (EV1). A pruned non-`.agents` directory *might* hold a nested
+ * `AGENTS.md`, but git's rule is that an excluded directory's contents are
+ * excluded, and scanning a user-ignored tree to find out would defeat the
+ * ignore rule — so those are left unreported by design (documented limit).
+ */
+function dirIsCanonicalAnchor(relPath: string): boolean {
+  return relPath === '.agents' || relPath.startsWith('.agents/');
 }
 
 async function loadRootGitignore(root: string): Promise<IgnorePattern[]> {
@@ -101,11 +246,17 @@ async function loadRootGitignore(root: string): Promise<IgnorePattern[]> {
   return parseGitignore(content);
 }
 
+interface WalkState {
+  out: FileSnapshot[];
+  /** Canonical-shaped paths excluded by an ignore rule (drives HH-W012). */
+  excludedCanonical: string[];
+}
+
 async function walk(
   absDir: string,
   relDir: string,
   patterns: readonly IgnorePattern[],
-  out: FileSnapshot[],
+  state: WalkState,
 ): Promise<void> {
   let entries;
   try {
@@ -120,13 +271,30 @@ async function walk(
         continue;
       }
       if (isIgnored(rel, true, patterns)) {
+        // Git never descends into an excluded directory, so canonical
+        // sources beneath it are lost. Surface the exclusion instead of
+        // silently skipping (EV1). We report the directory path; the
+        // root `.agents/` exclusion is the headline case.
+        // Known limit: a canonical file inside a fully-ignored *non-`.agents`*
+        // directory (e.g. `vendor/AGENTS.md`) is intentionally out of scope —
+        // we honor the directory ignore rather than enumerating ignored trees,
+        // so no HH-W012 fires for it (see docs/warnings/HH-W012.md).
+        if (dirIsCanonicalAnchor(rel)) {
+          recordExcludedCanonicalDir(rel, state);
+        }
         continue;
       }
-      await walk(join(absDir, entry.name), rel, patterns, out);
+      await walk(join(absDir, entry.name), rel, patterns, state);
     } else if (entry.isFile()) {
       // Symlinks and special files are skipped: following links could
       // escape the repo or cycle, and canonical sources are plain files.
-      if (isIgnored(rel, false, patterns) || !isCanonicalPath(rel)) {
+      if (!isCanonicalPath(rel)) {
+        continue;
+      }
+      if (isIgnored(rel, false, patterns)) {
+        // A canonical source the user asked git to ignore: surface it (EV1)
+        // rather than silently dropping it from the IR.
+        state.excludedCanonical.push(rel);
         continue;
       }
       let content: string;
@@ -141,9 +309,21 @@ async function walk(
       if (content.charCodeAt(0) === 0xfeff) {
         content = content.slice(1);
       }
-      out.push({ path: rel, content });
+      state.out.push({ path: rel, content });
     }
   }
+}
+
+/**
+ * Records a pruned canonical directory as a trailing-slash path so the
+ * warning points at the lost subtree. Excluding the root `.agents/` empties
+ * the IR (the headline EV1 case); excluding a subdirectory under it loses
+ * just that subtree. We report the directory anchor rather than enumerating
+ * its files, because descending into a user-ignored tree to list them would
+ * defeat the very ignore rule that pruned it.
+ */
+function recordExcludedCanonicalDir(rel: string, state: WalkState): void {
+  state.excludedCanonical.push(`${rel}/`);
 }
 
 /**
@@ -153,11 +333,18 @@ async function walk(
  * `node_modules/`, and `dist/`; honors the root `.gitignore` subset
  * documented above. Paths are repo-relative POSIX, sorted; a leading UTF-8
  * BOM is stripped from file contents.
+ *
+ * When a canonical-shaped path is excluded by an ignore rule it is reported
+ * in `excludedCanonicalPaths` (sorted) rather than silently dropped; the
+ * `parseRepo` use case maps those into `HH-W012` warnings (EV1).
  */
 export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
-  const files: FileSnapshot[] = [];
-  await walk(root, '', patterns, files);
-  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { root, files };
+  const state: WalkState = { out: [], excludedCanonical: [] };
+  await walk(root, '', patterns, state);
+  state.out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const excludedCanonicalPaths = [...new Set(state.excludedCanonical)].sort((a, b) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return { root, files: state.out, excludedCanonicalPaths };
 }
