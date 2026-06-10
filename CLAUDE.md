@@ -1,30 +1,17 @@
+@AGENTS.md
+
 <!-- @hand-emitted-projection
-This file is a hand-emitted projection of AGENTS.md + .agents/instructions/*.
-When `harness-haircut apply` ships (tracked at
-https://github.com/mknoth197/harness-haircut/issues/12), this file will
-be regenerated automatically and the hand-emit step goes away. Until
-then, edits should land in AGENTS.md or the relevant
-.agents/instructions/<topic>.md file first, then be re-projected here
-by hand.
+One-line import shim — the officially blessed bridge while Claude Code
+lacks native AGENTS.md support (anthropics/claude-code#6235; docs:
+"Claude Code reads CLAUDE.md, not AGENTS.md"). The @AGENTS.md import
+above loads the canonical standards in full at launch, so this file can
+never drift from them. Verified in docs/research/provider-matrix.md.
+When `harness-haircut apply` ships (#12) it will own this file; until
+then, edits land in AGENTS.md or .agents/instructions/<topic>.md —
+never here.
 -->
 
-# Project standards (Claude Code projection)
+Claude-specific notes (content below the import line is preserved by the future `apply`):
 
-The canonical project standards live in [`AGENTS.md`](AGENTS.md). This file is a projection for Claude Code, which does not yet natively read `AGENTS.md` (tracked upstream as `anthropics/claude-code#6235`). Until that lands, treat this file as a pointer:
-
-**Read first:**
-- [`AGENTS.md`](AGENTS.md) — project overview, tech stack, architecture, definition of done.
-
-**Per-topic standards** (apply when working in the listed scope):
-
-| Topic | Scope | File |
-|---|---|---|
-| Software architecture (CLEAN layers) | `src/**/*.ts` | [`.agents/instructions/software-architecture.md`](.agents/instructions/software-architecture.md) |
-| Testing | `test/**/*.ts` | [`.agents/instructions/testing.md`](.agents/instructions/testing.md) |
-| Commit style | repo-wide | [`.agents/instructions/commit-style.md`](.agents/instructions/commit-style.md) |
-
-**Product context:**
-- [`docs/PRD.md`](docs/PRD.md) — what we're building and why.
-- [`docs/stories/`](docs/stories/) — EARS user stories, one per planned GitHub issue.
-
-**When in doubt:** check `AGENTS.md` first, then the relevant `.agents/instructions/<topic>.md`. If both are silent, prefer the simpler option and open an issue.
+- Per-topic standards live in `.agents/instructions/` — architecture (`src/**/*.ts`), testing (`test/**/*.ts`), commit style (repo-wide). AGENTS.md links them all.
+- Product context: `docs/PRD.md` and `docs/stories/` (one EARS story per GitHub issue).

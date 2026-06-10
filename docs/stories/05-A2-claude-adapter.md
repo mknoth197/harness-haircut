@@ -6,23 +6,26 @@
 **Labels:** `enhancement`, `adapter`
 
 ## Context
-Claude Code does not yet read `AGENTS.md` natively (tracked upstream as `anthropics/claude-code#6235`). Until that lands, the adapter projects instructions to `CLAUDE.md`. Skills go to `.claude/skills/`, hooks go inside `.claude/settings.json` under the `hooks` key, with all other keys preserved.
+Claude Code does not read `AGENTS.md` ([anthropics/claude-code#6235](https://github.com/anthropics/claude-code/issues/6235) still open; docs verbatim: "Claude Code reads CLAUDE.md, not AGENTS.md"). The officially blessed bridge — per the verified [provider matrix](../research/provider-matrix.md) — is a `CLAUDE.md` whose first line is the import `@AGENTS.md`. Scoped instructions project to `.claude/rules/*.md` with `paths:` glob frontmatter (lazily loaded; brace expansion supported). Claude is the **only** provider that does not read `.agents/skills/`, so skills project to `.claude/skills/`. Hooks go inside `.claude/settings.json` under the `hooks` key (~30-event taxonomy), with all other keys preserved.
 
 ## Requirements (EARS)
 
 - **U1.** The adapter shall register with `id: 'claude'`.
-- **EV1.** When the IR contains a root `Instruction`, the adapter shall emit it as `CLAUDE.md` with a SignedSource header.
-- **EV2.** When the IR contains nested `Instruction` entries, the adapter shall concatenate them under scoped headings inside the root `CLAUDE.md` (Claude does not support nested files in v1).
-- **EV3.** When the IR contains `Skill` entries, the adapter shall emit them as `.claude/skills/<name>/SKILL.md`.
-- **EV4.** When the IR contains `Hook` entries, the adapter shall write the `hooks` key inside `.claude/settings.json`, leaving all other top-level keys untouched (mode `merge-key`).
-- **OPT1.** Where the canonical instruction has a `scope` glob that cannot be expressed in a Claude heading (e.g., regex), the adapter shall emit warning `HH-W001`.
+- **EV1.** When the IR contains a root `Instruction`, the adapter shall emit a `CLAUDE.md` whose first line is `@AGENTS.md` — a one-line import shim, not a content copy. Existing user content below the import line shall be preserved on re-emit (the shim line is the only owned region).
+- **EV2.** When the IR contains scoped `Instruction` fragments (`.agents/instructions/*.md` with `scope:`), the adapter shall emit `.claude/rules/hh.<name>.md` files with `paths: [<glob>]` frontmatter.
+- **EV3.** When the IR contains nested `Instruction` entries (nested `AGENTS.md`), the adapter shall emit no extra projection — Claude loads ancestor CLAUDE.md at launch and the `@AGENTS.md` import covers root; nested AGENTS.md content is reachable when Claude reads those subdirectories only if a nested shim exists, so the adapter shall emit a nested one-line `CLAUDE.md` shim per nested `AGENTS.md`.
+- **EV4.** When the IR contains `Skill` entries, the adapter shall emit them as `.claude/skills/<name>/SKILL.md` (copying sibling files), restricted to the Agent Skills common-core frontmatter (`name`, `description`).
+- **EV5.** When the IR contains `Hook` entries, the adapter shall write the `hooks` key inside `.claude/settings.json` (mode `merge-key`), mapping canonical events to Claude's PascalCase taxonomy and leaving all other top-level keys untouched.
+- **OPT1.** Where a canonical `scope` glob cannot be expressed in Claude's `paths:` glob dialect, the adapter shall emit warning `HH-W001` with the downgraded glob.
 - **UN1.** If the existing `.claude/settings.json` is malformed JSON, then the adapter shall fail and report the error (do not silently overwrite).
+- **UN2.** If an existing `CLAUDE.md` does not begin with the `@AGENTS.md` import and contains substantive content, then the adapter shall treat it as a contradiction source for `init` (C3) rather than overwriting.
 
 ## Acceptance criteria
 
 - [ ] Adapter at `src/adapters/claude.ts`.
-- [ ] Tests cover: root + nested instruction concatenation; skill emit; settings.json merge preserves user theme/keybindings; lossy glob warning; malformed settings.json refuses overwrite.
-- [ ] Fixture-based round-trip test where reasonable (note: nested → flattened is intentionally lossy and tracked via warning).
+- [ ] Tests cover: one-line shim emit + user-content preservation below the import; nested shim per nested AGENTS.md; `.claude/rules/` emission with `paths:` frontmatter; skills emit (common core only); settings.json merge preserves user keys; event-name mapping; malformed settings.json refusal; non-shim CLAUDE.md detection.
+- [ ] Fixture-based round-trip test for skills and rules.
 
 ## Out of scope
-- Switching to native `AGENTS.md` once `claude-code#6235` ships — that's a future story.
+- Switching to native `AGENTS.md` if #6235 ships — future story (adapter's instruction surface becomes a no-op).
+- Claude-specific skill frontmatter extras (`context: fork`, skill-scoped `hooks`, …) — pass-through + lossy warning handled by F3's common policy.

@@ -1,10 +1,12 @@
 # harness-haircut — Product Requirements Document
 
-**Status:** Draft v0.2
+**Status:** Draft v0.3
 **Owner:** TBD
-**Last updated:** 2026-05-08
+**Last updated:** 2026-06-10
 
 > **Audit log (2026-05-08):** v0.1 was missing §6–14. This revision fills those sections with reasonable defaults derived from the existing goals and §5 scope table. Defaults are marked **[draft default — open to revision]** so they're easy to spot. No goal in §3 was changed; §15–16 are unchanged.
+>
+> **Audit log (2026-06-10, v0.3):** provider facts verified against current official documentation via a 10-agent research workflow — see [`docs/research/provider-matrix.md`](research/provider-matrix.md) for the full matrix with citations. Major corrections: `.agents/skills/` is read natively by Codex, Gemini CLI, and Copilot (skills projection becomes a no-op for 3 of 4 providers); Copilot reads AGENTS.md (root+nested) for the coding agent/CLI/VS Code but NOT for code review; all four providers now ship hooks, with divergent event taxonomies; canonical AGENTS.md must be pure markdown (the spec defines no frontmatter and consumers inject the file verbatim); `pre-commit` removed from the canonical hook enum (no provider has it). §9 also revised (two-hash SignedSource header). Affected sections: §2, §5, §8, §9, §10, §14.
 
 ---
 
@@ -22,7 +24,7 @@ Every AI coding provider ships its own configuration file format. A team using m
 - **Toil.** Every change to project conventions requires updating 4+ files manually. Teams either skip providers (creating coverage gaps) or copy-paste sloppily (creating drift).
 - **Cognitive overhead.** New contributors face a wall of near-duplicate config files and no clear answer to "which one is authoritative."
 
-Existing tools in the space (`rulesync`, `ruler`, `crag`, `c2c`) either target too many providers shallowly, focus on rule distribution rather than audit-and-transform, or impose their own intermediate-representation file the user has to learn. None solve nested-and-path-scoped configurations well, and none address all three layers (instructions, skills, hooks) coherently.
+Existing tools in the space (`rulesync`, `ruler`, `crag`, `agentsync`, `agent_sync`) each cover parts of the problem: `crag` audits, `rulesync` distributes rules/skills/hooks per-tool, `agent_sync` has sync manifests. What none of them have — the defensible gap, verified against the June-2026 landscape in [`docs/research/provider-matrix.md`](research/provider-matrix.md) — is (1) **expected-projection diffing** (recompute what *should* be on disk from canonical sources and content-diff it, SignedSource-style, rather than mtime/manifest checks), (2) **cataloged, suppressible lossy-translation warnings**, and (3) a **unified canonical hook event taxonomy** mapped per provider rather than passthrough per-tool hook configs.
 
 ## 3. Goals & non-goals
 
@@ -59,14 +61,18 @@ Existing tools in the space (`rulesync`, `ruler`, `crag`, `c2c`) either target t
 
 ### In scope (v1)
 
+*(Table verified 2026-06-10 against official docs — full matrix with citations in [`docs/research/provider-matrix.md`](research/provider-matrix.md).)*
+
 | Provider | Instructions | Skills | Hooks |
 |---|---|---|---|
-| GitHub Copilot | ✅ root + path-scoped via `.github/instructions/` | ❌ no native equivalent — surfaced as warning | ✅ via `.github/hooks/*.json` (coding agent only) |
-| Claude Code | ✅ via `CLAUDE.md` shim until anthropics/claude-code#6235 lands | ✅ via `.claude/skills/` | ✅ via `.claude/settings.json` |
-| OpenAI Codex | ✅ native `AGENTS.md` (root + nested) | ✅ via `.codex/skills/` | ✅ via `.codex/config.toml` |
-| Gemini CLI | ✅ via `GEMINI.md` shim or `context.fileName` setting | ✅ via `.gemini/skills/` | ✅ via `.gemini/settings.json` |
+| GitHub Copilot | ✅ native `AGENTS.md` root+nested for coding agent/CLI/VS Code (since 2025-08-28); `.github/copilot-instructions.md` + `.github/instructions/*.instructions.md` (`applyTo` globs) still emitted to cover **code review**, which does not read AGENTS.md | ✅ **no-op** — reads canonical `.agents/skills/` natively (Agent Skills standard, since 2025-12-18) | ✅ via `.github/hooks/*.json` (`version: 1` schema; cloud agent — default branch only — plus CLI and VS Code preview) |
+| Claude Code | ✅ via one-line `CLAUDE.md` shim (`@AGENTS.md` import — the officially blessed bridge while anthropics/claude-code#6235 stays open); scoped instructions via `.claude/rules/*.md` with `paths:` globs | ✅ projected to `.claude/skills/` (only provider not reading `.agents/skills/`) | ✅ via `hooks` key in `.claude/settings.json` (~30-event taxonomy) |
+| OpenAI Codex | ✅ native `AGENTS.md` (root→cwd concatenation, 32 KiB combined cap) | ✅ **no-op** — current docs discover `.agents/skills` natively (`.codex/skills` is legacy) | ✅ via `.codex/hooks.json` (idiomatic) or `[hooks]` in `.codex/config.toml`; GA 2026-05-14; per-user hash-pinned trust review applies |
+| Gemini CLI | ✅ via `context.fileName: ["AGENTS.md", "GEMINI.md"]` in `.gemini/settings.json` (or a `GEMINI.md` `@AGENTS.md` import shim) | ✅ **no-op** — `.agents/skills/` alias takes precedence over `.gemini/skills/` | ✅ via `hooks` key in `.gemini/settings.json` (Before/After event naming; needs event-name mapping) |
 
-> **Note on `claude-code#6235`:** that issue tracks first-class `AGENTS.md` support in Claude Code. Until it ships, the Claude adapter emits a `CLAUDE.md` projection. When it lands, the adapter switches to a no-op for instructions (Claude reads `AGENTS.md` directly).
+> **Note on `claude-code#6235`:** still open as of 2026-06-10 with no maintainer commitment ("Claude Code reads CLAUDE.md, not AGENTS.md" — current docs). The blessed bridge is a `CLAUDE.md` whose first line is the import `@AGENTS.md` — a one-line projection that cannot drift. When/if #6235 lands, the Claude instructions projection becomes a full no-op.
+>
+> **Skills convergence:** because Codex, Gemini CLI, and Copilot all read `.agents/skills/<name>/SKILL.md` natively, the canonical skills location IS the native location for 3 of 4 providers. All four use the same Agent Skills SKILL.md format (required frontmatter: `name`, `description`); canonical skills must stick to that common core, with provider-specific frontmatter extras treated as lossy.
 
 ### Out of scope (v1)
 
@@ -135,31 +141,33 @@ Global options:
 
 ### Instructions: `AGENTS.md`
 
-- Plain markdown. Optional YAML frontmatter:
-  ```yaml
-  ---
-  scope: "src/api/**"   # optional path glob; absent = applies to this dir + descendants
-  ---
-  ```
-- Root `AGENTS.md` and nested `<dir>/AGENTS.md` are both valid. Nested files apply to that subtree.
-- Path-scoped variants (Copilot's `.github/instructions/*.instructions.md` model) are expressed as nested `AGENTS.md` or as additional files under `.agents/instructions/<name>.md` with a `scope` glob in frontmatter.
+- **Pure markdown — no frontmatter.** The agents.md spec defines none, and every native consumer (Codex, Copilot coding agent, configured Gemini CLI, …) injects the file **verbatim**: YAML frontmatter would leak as raw text into providers' prompts. *(v0.3 correction — v0.2 allowed an optional `scope:` frontmatter block here.)*
+- Root `AGENTS.md` and nested `<dir>/AGENTS.md` are both valid. Nested files apply to that subtree. Note the spec/implementation divergence: the spec says nearest-wins, but Codex *concatenates* root→cwd and Copilot *combines* root+nested — emitted content must read correctly under both semantics.
+- Keep root `AGENTS.md` lean: Codex caps the combined nested chain at **32 KiB** (`project_doc_max_bytes` default).
+- Path-scoped instruction *fragments* live under `.agents/instructions/<name>.md` with a `scope:` glob in frontmatter — that directory is read by no provider natively, so frontmatter is safe there. They project to Copilot `.instructions.md` `applyTo` files and Claude `.claude/rules/*.md` `paths:` files.
 
 ### Skills: `.agents/skills/<name>/SKILL.md`
 
-- One folder per skill. `SKILL.md` is the entrypoint, with frontmatter:
+- One folder per skill. `SKILL.md` is the entrypoint, with frontmatter following the Agent Skills open standard **common core**:
   ```yaml
   ---
-  name: <name>
+  name: <lowercase-hyphenated, should match folder name>
   description: <one-line trigger description>
   ---
   ```
-- Supporting files (e.g., scripts, templates) live alongside `SKILL.md` in the same folder.
+- Supporting files (`scripts/`, `references/`, `assets/`) live alongside `SKILL.md` in the same folder.
+- **This location is native** for Codex, Gemini CLI, and Copilot (verified 2026-06-10) — no projection emitted for them. Claude Code is the only provider needing a `.claude/skills/` projection.
+- Provider-specific frontmatter extras (Claude's `allowed-tools`/`context`/`hooks`, Codex's `agents/openai.yaml`, …) are out of the canonical core; if present they are passed through to providers that understand them and trigger a lossy warning for the rest.
 
 ### Hooks: `.agents/hooks/<event>.<name>.{sh,js,toml,json}`
 
-- Filename convention: `<event>.<name>.<ext>`, where `<event>` is one of a fixed enum (`pre-tool-use`, `post-tool-use`, `pre-commit`, `session-start`, …; full list in the adapter spec).
+- Filename convention: `<event>.<name>.<ext>`, where `<event>` is one of the **canonical event enum** — the cross-provider common denominator (verified against all four providers' current taxonomies):
+  `session-start`, `session-end`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`, `stop`, `subagent-start`, `subagent-stop`, `pre-compact`.
+  *(v0.3 correction: `pre-commit` removed — no provider has an agent-hook event for it; git-level pre-commit enforcement is I1's job.)*
+- Canonical events map to provider-native names via per-adapter translation tables (e.g., `pre-tool-use` → Claude `PreToolUse` / Codex `PreToolUse` / Gemini `BeforeTool` / Copilot `preToolUse`). Events a provider lacks trigger `HH-W003` for that provider only.
 - The file body is the executable hook content. `harness-haircut` does not run hooks; it only projects them into provider-specific configs.
 - A sibling `.agents/hooks/<event>.<name>.toml` may declare matchers / metadata.
+- Projection stability matters: Codex requires per-user hash-pinned trust of each hook definition, re-prompted whenever the definition changes — so adapters should emit thin, stable commands (e.g., invoke a repo script) rather than inlining hook bodies that churn.
 
 ### Config: `harness-haircut.config.json` (optional)
 
@@ -212,14 +220,14 @@ For files that `harness-haircut` co-owns with non-hook configuration (e.g., `.cl
 - A `# managed by harness-haircut: hooks` comment (where the format permits) marks owned regions.
 - For files the tool fully owns (e.g., `.github/copilot-instructions.md`), the SignedSource header is the whole file's first line and the tool refuses to merge — it overwrites.
 
-Per-provider details:
+Per-provider details *(v0.3 — verified against current docs; see [`docs/research/provider-matrix.md`](research/provider-matrix.md))*:
 
 | Provider | Owned files | Co-owned files | Merge strategy |
 |---|---|---|---|
-| Copilot | `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `.github/hooks/*.json` | none | overwrite owned; never touch others |
-| Claude | `CLAUDE.md`, `.claude/skills/*` | `.claude/settings.json` | rewrite `hooks` key only |
-| Codex | none (writes native `AGENTS.md` already canonical) + `.codex/skills/*` | `.codex/config.toml` | rewrite `[hooks]` table only |
-| Gemini | `GEMINI.md`, `.gemini/skills/*` | `.gemini/settings.json` | rewrite `hooks` key only |
+| Copilot | `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `.github/hooks/harness-haircut.json` | none | overwrite owned; never touch other `.github/hooks/*.json` files. Skills: no emission (`.agents/skills/` read natively). Hook entries pinned to the conservative cross-surface schema (`{type:"command", bash, powershell}`) |
+| Claude | `CLAUDE.md` (one-line `@AGENTS.md` import shim — content below the import line is user-owned and preserved), `.claude/skills/*` (projection of `.agents/skills/`), `.claude/rules/hh.*.md` (projections of scoped `.agents/instructions/`) | `.claude/settings.json` | rewrite `hooks` key only; preserve all other keys |
+| Codex | `.codex/hooks.json` | `.codex/config.toml` (only if user opts into `[hooks]`-in-config style) | prefer owning `.codex/hooks.json` outright; never touch `config.toml` otherwise. Instructions and skills: no emission (native). Emit stable hook bodies (trust-hash churn, see §8) |
+| Gemini | `GEMINI.md` (only in shim mode) | `.gemini/settings.json` | rewrite `hooks` key and `context.fileName` key only; preserve all other keys (incl. user `mcpServers`, `tools.*`). Skills: no emission (`.agents/skills/` alias is native and higher-precedence) |
 
 ## 11. Lossy translation policy *(new)*
 
@@ -280,9 +288,12 @@ Both artifacts are documentation + simple scripts in v1; no GitHub App, no marke
 ## 14. Risks & open questions *(new)*
 
 **Risks:**
-- **Provider format churn.** Providers ship breaking changes (Claude's `AGENTS.md` support, settings.json schema). Mitigation: adapters are versioned; CI runs daily fixture tests against pinned provider docs.
+- **Provider format churn.** Providers ship breaking changes (Claude's `AGENTS.md` support, settings.json schema). Mitigation: adapters are versioned; CI runs daily fixture tests against pinned provider docs. *Observed in practice during the v0.3 research pass: Copilot's hook schema gained a cross-platform `command` key and `http`/`prompt` types; Codex moved skills discovery from `.codex/skills` to `.agents/skills` within ~6 months.*
+- **Gemini CLI consumer sunset (v0.3).** Gemini Code Assist free/Pro/Ultra auth stops serving on **2026-06-18**; enterprise + API-key/Vertex auth continue, and the OSS CLI keeps releasing. Google's successor is **Antigravity CLI** (keeps skills/hooks/subagents, different config paths). Mitigation: A3 ships as specced (targets remain technically valid), but re-validate against Antigravity before v1.0 and treat an Antigravity adapter as the leading v2 candidate.
+- **Codex hook trust churn (v0.3).** Codex requires per-user, hash-pinned trust of each hook definition; any re-projection that changes a hook re-prompts every teammate. Mitigation: adapter emits thin stable commands pointing at repo scripts (§8, §10).
 - **Lossy translation backlash.** Users may be unhappy with WARN noise. Mitigation: per-warning suppression; `--strict` opt-in.
 - **SignedSource hash collisions.** 16-char truncation gives 64 bits of collision space — fine for inadvertent edits, weak against adversaries. Acceptable for v1 (no security claim is being made).
+- **Spec-vs-implementation divergence on nested AGENTS.md (v0.3).** The agents.md spec says nearest-wins; Codex concatenates and Copilot combines. Mitigation: emitted nested content must be self-contained enough to read correctly under both semantics; documented in §8.
 
 **Open questions (deferred to product owner):**
 - Should `init` support a `--from <provider>` mode that treats one drifted file as authoritative, instead of interactive merge?

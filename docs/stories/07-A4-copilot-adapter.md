@@ -6,23 +6,27 @@
 **Labels:** `enhancement`, `adapter`
 
 ## Context
-Copilot is the most divergent of the four targets: no nested instruction files (it has a flat `.github/instructions/<name>.instructions.md` model with `applyTo` frontmatter globs), no skills concept, and a coding-agent-only hook surface at `.github/hooks/*.json`. Lossy translation is unavoidable here — the adapter must surface the losses cleanly.
+Per the verified [provider matrix](../research/provider-matrix.md), Copilot's instruction surface is split by product surface: the coding/cloud agent, CLI, and VS Code read **`AGENTS.md` natively (root + nested, since 2025-08-28)** — but **Copilot code review does not**, so `.github/copilot-instructions.md` and path-scoped `.github/instructions/*.instructions.md` (`applyTo` globs; no negation/braces) must still be emitted to cover review. Skills are a **no-op** (Copilot reads `.agents/skills/` natively since 2025-12-18). Hooks go to `.github/hooks/*.json` (`version: 1` schema; cloud agent reads them from the default branch only; also CLI + VS Code preview).
 
 ## Requirements (EARS)
 
 - **U1.** The adapter shall register with `id: 'copilot'`.
-- **EV1.** When the IR contains a root `Instruction`, the adapter shall emit it as `.github/copilot-instructions.md`.
-- **EV2.** When the IR contains a nested or scoped `Instruction`, the adapter shall emit it as `.github/instructions/<flatname>.instructions.md` with `applyTo` frontmatter set to the scope glob.
-- **EV3.** When the IR contains `Hook` entries that target events Copilot's coding-agent supports, the adapter shall emit `.github/hooks/<event>.<name>.json`.
-- **OPT1.** Where the IR contains `Skill` entries, the adapter shall emit warning `HH-W002` for each, and emit nothing.
-- **OPT2.** Where a `scope` glob uses syntax outside Copilot's `applyTo` capabilities (e.g., regex, brace expansion), the adapter shall emit warning `HH-W001` and downgrade to the closest expressible glob.
-- **UN1.** If two nested `AGENTS.md` files would flatten to the same `<flatname>.instructions.md`, then the adapter shall fail before emit, naming both source paths.
+- **EV1.** When the IR contains a root `Instruction`, the adapter shall emit `.github/copilot-instructions.md` — needed for the code-review surface even though other surfaces read AGENTS.md natively. The file shall note (in an HTML comment) that it exists for code review and that AGENTS.md is authoritative.
+- **EV2.** When the IR contains a scoped `Instruction` fragment, the adapter shall emit `.github/instructions/hh.<name>.instructions.md` with `applyTo:` frontmatter set to the scope glob (comma-separated for multiple globs).
+- **EV3.** When the IR contains `Skill` entries, the adapter shall emit nothing and report the surface as `native` (Agent Skills standard; `.agents/skills/` is searched).
+- **EV4.** When the IR contains `Hook` entries with mappable events, the adapter shall emit `.github/hooks/harness-haircut.json` with `{"version": 1, "hooks": {...}}` using camelCase event names and the conservative cross-surface entry schema `{type: "command", bash: ..., powershell: ...}` (the newer bare-`command`/`http`/`prompt` forms are not emitted in v1).
+- **OPT1.** Where a `scope` glob uses syntax outside Copilot's documented `applyTo` capabilities (negation, brace expansion), the adapter shall emit warning `HH-W001` and downgrade to the closest expressible glob.
+- **OPT2.** Where a canonical hook event has no Copilot equivalent, the adapter shall emit warning `HH-W003` and skip it. The mapping table includes `pre-tool-use` → `preToolUse` (note: **fail-closed** on the cloud agent — document this in the emitted file comment), `user-prompt-submit` → `userPromptSubmitted`, `stop` → `agentStop`, `session-start`/`session-end` → `sessionStart`/`sessionEnd`.
+- **UN1.** If two scoped fragments would flatten to the same `.instructions.md` filename, then the adapter shall fail before emit, naming both source paths.
+- **UN2.** If hooks are emitted on a non-default branch context, the adapter shall include an informational note that the cloud agent only honors hooks from the default branch (no warning code — informational).
 
 ## Acceptance criteria
 
 - [ ] Adapter at `src/adapters/copilot.ts`.
-- [ ] Tests cover: root emit; nested → flat with `applyTo`; skill → warning + no emit; lossy glob warning; collision detection.
+- [ ] Tests cover: root emit with code-review rationale comment; scoped → `applyTo` flat files; collision detection; skills native no-op; hooks JSON with `version: 1` + camelCase events + bash/powershell pairs; lossy glob warning; unmappable event warning.
 - [ ] Lossy-translation test asserts both the warning code *and* the downgraded glob shape.
 
 ## Out of scope
-- Detecting which hook events Copilot's coding-agent currently supports — bake the list as a constant; revisit when Copilot adds events.
+- `excludeAgent` frontmatter emission (v1 emits files for all surfaces; per-surface exclusion is a v2 refinement).
+- Custom agents (`.github/agents/*.agent.md`), prompt files (`.github/prompts/`), `copilot-setup-steps.yml` — not part of the three v1 layers.
+- Org/enterprise-level instruction layers (single-repo scope).
