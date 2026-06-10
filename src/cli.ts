@@ -20,6 +20,11 @@ import { apply } from './use-cases/apply.js';
 import type { ApplyReport } from './use-cases/apply.js';
 import { init } from './use-cases/init.js';
 import type { InitReport } from './use-cases/init.js';
+import { installPrecommit } from './use-cases/install-precommit.js';
+import type { InstallReport } from './use-cases/install-precommit.js';
+import { createPrecommitGateway } from './gateways/precommit.js';
+import { doctor } from './use-cases/doctor.js';
+import type { DoctorReport } from './use-cases/doctor.js';
 import type { Contradiction, Resolution } from './entities/contradiction.js';
 
 export type ExitCode = 0 | 1 | 2 | 3 | 64 | 70;
@@ -32,7 +37,7 @@ export interface ParsedArgs {
   error?: string;
 }
 
-const KNOWN_COMMANDS = new Set(['init', 'audit', 'apply', 'doctor']);
+const KNOWN_COMMANDS = new Set(['init', 'audit', 'apply', 'doctor', 'install-precommit']);
 
 const VALUE_FLAGS = new Set(['--cwd', '--config']);
 
@@ -89,6 +94,7 @@ function helpText(): string {
     '  audit      Read-only drift check; exits non-zero on any divergence or warning',
     '  apply      Project canonical sources into provider-specific files',
     '  doctor     Print configuration, detected providers, and version info',
+    '  install-precommit  Install a git pre-commit hook that runs `audit`',
     '',
     'Global options:',
     '  --cwd <path>        Run as if invoked in <path> (default: process.cwd())',
@@ -108,6 +114,9 @@ function helpText(): string {
     '  --dry-run           Print the would-emit plan and exit without writing',
     '  --allow-dirty       Run even when the git working tree is dirty',
     '  --non-interactive   Never prompt; fail (exit 1) on a user-edited file',
+    '',
+    'install-precommit options:',
+    '  --force             Overwrite an existing pre-commit hook (else append)',
     '',
     'See https://github.com/mknoth197/harness-haircut for documentation.',
   ].join('\n');
@@ -155,9 +164,134 @@ export async function run(argv: readonly string[], io: RunIO): Promise<ExitCode>
     return runInit(parsed, io);
   }
 
-  // doctor is a stub until its story lands.
+  if (parsed.command === 'install-precommit') {
+    return runInstallPrecommit(parsed, io);
+  }
+
+  if (parsed.command === 'doctor') {
+    return runDoctor(parsed, io);
+  }
+
+  // Every known command is dispatched above; this is unreachable but keeps the
+  // function total for the type checker.
   io.stderr.write(`harness-haircut: '${parsed.command}' not yet implemented\n`);
   return 70;
+}
+
+async function runInstallPrecommit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
+  const cwdFlag = parsed.flags['--cwd'];
+  const cwd = typeof cwdFlag === 'string' ? resolve(cwdFlag) : process.cwd();
+  const json = parsed.flags['--json'] === true;
+  const force = parsed.flags['--force'] === true;
+
+  let report: InstallReport;
+  try {
+    report = installPrecommit({
+      gateway: createPrecommitGateway(cwd),
+      flags: { force },
+    });
+  } catch (err) {
+    if (err instanceof DomainError) {
+      io.stderr.write(`harness-haircut: ${err.message}\n`);
+      return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
+    }
+    throw err;
+  }
+
+  if (json) {
+    io.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else if (report.exitCode === 3) {
+    io.stderr.write(
+      'harness-haircut: not a git repository, or `git` is not installed, so the ' +
+        'hooks directory could not be resolved. Run `git init` first, run from ' +
+        'the repo root (including a worktree or submodule), and ensure `git` is ' +
+        'on PATH.\n',
+    );
+  } else {
+    const verb: Record<InstallReport['action'], string> = {
+      created: 'installed pre-commit hook',
+      overwritten: 'overwrote pre-commit hook',
+      appended: 'appended harness block to existing pre-commit hook',
+      unchanged: 'pre-commit hook already up to date',
+    };
+    io.stdout.write(`${verb[report.action]}: ${report.target}\n`);
+  }
+  return report.exitCode;
+}
+
+async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
+  const cwdFlag = parsed.flags['--cwd'];
+  const cwd = typeof cwdFlag === 'string' ? resolve(cwdFlag) : process.cwd();
+  const configFlag =
+    typeof parsed.flags['--config'] === 'string' ? (parsed.flags['--config'] as string) : undefined;
+  const json = parsed.flags['--json'] === true;
+
+  let report: DoctorReport;
+  try {
+    // Read the raw config text (or null when absent) here in layer 4; the use
+    // case parses it so an invalid config surfaces as the doctor's exit 3.
+    const { raw, configPath, explicitConfigMissing } = await readConfigText(cwd, configFlag);
+    report = await doctor({
+      version: await readPackageVersion(),
+      nodeVersion: process.version,
+      cwd,
+      adapters: createAllAdapters(),
+      snapshot: () => readInitSnapshot(cwd),
+      configRaw: raw,
+      configPath,
+      explicitConfigMissing,
+    });
+  } catch (err) {
+    if (err instanceof DomainError) {
+      io.stderr.write(`harness-haircut: ${err.message}\n`);
+      return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
+    }
+    throw err;
+  }
+
+  if (json) {
+    io.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    io.stdout.write(renderDoctorReport(report));
+  }
+  return report.exitCode;
+}
+
+function renderDoctorReport(report: DoctorReport): string {
+  const lines: string[] = [];
+  lines.push('harness-haircut doctor');
+  lines.push(`  version       ${report.version}`);
+  lines.push(`  node          ${report.nodeVersion}`);
+  lines.push(`  cwd           ${report.cwd}`);
+  lines.push('');
+  if (report.detectedProviders.length > 0) {
+    lines.push(`detected ${report.detectedProviders.length} provider config(s):`);
+    for (const provider of report.detectedProviders) {
+      lines.push(`  ${provider.providerId}\t${provider.paths.join(', ')}`);
+    }
+  } else {
+    lines.push('no existing provider config detected.');
+  }
+  lines.push('');
+  if (report.config === null) {
+    lines.push('config: invalid (see warnings)');
+  } else {
+    const enabled = report.config.providers ?? 'all';
+    lines.push('config:');
+    lines.push(`  providers     ${Array.isArray(enabled) ? enabled.join(', ') : enabled}`);
+    lines.push(`  disabled      ${report.config.providersDisabled.join(', ') || '(none)'}`);
+    lines.push(`  gemini.mode   ${report.config.gemini.mode}`);
+    lines.push(`  warningsAsErrors ${report.config.warningsAsErrors}`);
+  }
+  if (report.warnings.length > 0) {
+    lines.push('');
+    lines.push(`${report.warnings.length} warning(s):`);
+    for (const warning of report.warnings) {
+      lines.push(`  ${warning}`);
+    }
+  }
+  lines.push('');
+  return lines.join('\n');
 }
 
 const DRIFT_LABELS: Readonly<Record<FileAudit['status'], string>> = {
@@ -195,6 +329,33 @@ async function readConfig(cwd: string, configFlag: string | undefined): Promise<
     }
   }
   return loadConfig(raw, explicit ? configPath : 'harness-haircut.config.json');
+}
+
+/**
+ * Reads the raw config text without parsing it, for `doctor` (which diagnoses
+ * an invalid config rather than throwing on it). Returns `null` raw when the
+ * file is absent. The default-location absence is silent (doctor falls back to
+ * defaults); an explicit `--config <path>` that does not exist sets
+ * `explicitConfigMissing` so doctor can surface it as a warning rather than
+ * silently defaulting.
+ */
+async function readConfigText(
+  cwd: string,
+  configFlag: string | undefined,
+): Promise<{ raw: string | null; configPath: string; explicitConfigMissing: boolean }> {
+  const explicit = configFlag !== undefined;
+  const configPath = explicit
+    ? resolve(cwd, configFlag)
+    : resolve(cwd, 'harness-haircut.config.json');
+  try {
+    const raw = await readFile(configPath, 'utf8');
+    return { raw, configPath, explicitConfigMissing: false };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { raw: null, configPath, explicitConfigMissing: explicit };
+    }
+    throw err;
+  }
 }
 
 async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {

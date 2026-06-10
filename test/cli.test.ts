@@ -102,12 +102,6 @@ describe('run() in-process', () => {
     assert.match(stderr, /unknown command/);
   });
 
-  it('unimplemented command (doctor) exits 70', async () => {
-    const { code, stderr } = await runCli(['doctor']);
-    assert.equal(code, 70);
-    assert.match(stderr, /not yet implemented/);
-  });
-
   it('parser error (--cwd with no value) exits 64', async () => {
     const { code, stderr } = await runCli(['--cwd']);
     assert.equal(code, 64);
@@ -122,10 +116,128 @@ describe('built CLI binary', () => {
     assert.equal(r.stdout.trim(), pkgVersion);
   });
 
-  it('doctor via spawn exits 70 (still a stub)', () => {
-    const r = spawnSync(process.execPath, [binPath, 'doctor'], { encoding: 'utf8' });
-    assert.equal(r.status, 70);
-    assert.match(r.stderr, /not yet implemented/);
+  it('doctor via spawn exits 0 and prints version + node info', () => {
+    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repoRoot], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /harness-haircut doctor/);
+    assert.match(r.stdout, new RegExp(pkgVersion.replace(/\./g, '\\.')));
+  });
+});
+
+describe('doctor E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('lists detected provider configs and exits 0', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n',
+      'CLAUDE.md': '@AGENTS.md\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /claude/);
+  });
+
+  it('--json emits a structured report', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'doctor', '--cwd', repo.root, '--json'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    const report = JSON.parse(r.stdout) as { exitCode: number; version: string };
+    assert.equal(report.exitCode, 0);
+    assert.equal(typeof report.version, 'string');
+  });
+
+  it('exits 3 on an invalid harness-haircut.config.json', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    await writeFile(join(repo.root, 'harness-haircut.config.json'), '{ not json', 'utf8');
+    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 3);
+  });
+});
+
+describe('install-precommit E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('installs into .git/hooks/pre-commit and exits 0 (U1, EV2)', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    // mkTempRepo has no .git; init a real repo so `git rev-parse --git-path
+    // hooks` resolves the hooks dir.
+    spawnSync('git', ['init', '-q'], { cwd: repo.root, encoding: 'utf8' });
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'install-precommit', '--cwd', repo.root],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.equal(existsSync(join(repo.root, '.git', 'hooks', 'pre-commit')), true);
+    const hook = readFileSync(join(repo.root, '.git', 'hooks', 'pre-commit'), 'utf8');
+    assert.match(hook, /npx harness-haircut audit --json/);
+    // The hook must not block on an informational lossy warning (audit exit 2).
+    assert.match(hook, /if \[ "\$rc" = 2 \]; then exit 0; fi/);
+  });
+
+  it('exits 3 when run outside a git repo (UN1)', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'install-precommit', '--cwd', repo.root],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /not a git repository/);
+  });
+
+  it('installs in a worktree where .git is a FILE, not exit 70 (EV2)', async () => {
+    // A linked worktree has a `.git` *file* (a gitlink) — the old code did
+    // mkdir over <root>/.git/hooks and crashed with ENOTDIR -> exit 70.
+    const main = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(main);
+    spawnSync('git', ['init', '-q'], { cwd: main.root, encoding: 'utf8' });
+    // A commit is required before `git worktree add`.
+    spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty'], {
+      cwd: main.root,
+      encoding: 'utf8',
+    });
+    const wtPath = join(main.root, '..', `${main.root.split('/').pop()}-wt`);
+    const add = spawnSync('git', ['worktree', 'add', '-q', wtPath], {
+      cwd: main.root,
+      encoding: 'utf8',
+    });
+    assert.equal(add.status, 0, add.stderr);
+    repos.push({ root: wtPath, cleanup: () => rm(wtPath, { recursive: true, force: true }) });
+
+    // Sanity: `.git` in the worktree is a file (gitlink), not a directory.
+    assert.equal(readFileSync(join(wtPath, '.git'), 'utf8').startsWith('gitdir:'), true);
+
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'install-precommit', '--cwd', wtPath],
+      { encoding: 'utf8' },
+    );
+    assert.notEqual(r.status, 70);
+    assert.equal(r.status, 0, r.stderr);
+    // The hook was written into the worktree's resolved hooks dir.
+    assert.match(r.stdout, /pre-commit/);
   });
 });
 

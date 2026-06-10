@@ -54,6 +54,27 @@ export type {
 export { init } from './use-cases/init.js';
 export type { InitDeps, InitFlags, InitReport, PlannedFile } from './use-cases/init.js';
 
+export {
+  installPrecommit,
+  PRECOMMIT_COMMAND,
+  PRECOMMIT_MARKER_START,
+  PRECOMMIT_MARKER_END,
+} from './use-cases/install-precommit.js';
+export type {
+  InstallReport,
+  InstallPrecommitDeps,
+  InstallPrecommitFlags,
+  PrecommitGateway,
+} from './use-cases/install-precommit.js';
+export {
+  createPrecommitGateway,
+  createInMemoryPrecommitGateway,
+} from './gateways/precommit.js';
+export type { InMemoryPrecommitGateway } from './gateways/precommit.js';
+
+export { doctor } from './use-cases/doctor.js';
+export type { DoctorReport, DoctorDeps } from './use-cases/doctor.js';
+
 export { isWorkingTreeDirty } from './gateways/git.js';
 export { createFileWriter } from './gateways/fs-writer.js';
 
