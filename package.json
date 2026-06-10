@@ -1,6 +1,6 @@
 {
   "name": "harness-haircut",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Audit and consolidate redundant AI-provider configuration files into a single canonical source of truth.",
   "type": "module",
   "bin": {
@@ -17,6 +17,7 @@
   },
   "files": [
     "dist",
+    "templates",
     "README.md",
     "LICENSE"
   ],

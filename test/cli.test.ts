@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync, existsSync } from 'node:fs';
-import { rm, writeFile } from 'node:fs/promises';
+import { rm, writeFile, mkdir } from 'node:fs/promises';
 import { parseArgs, run } from '../dist/index.js';
 import { mkTempRepo } from './_helpers/tmp-repo.ts';
 import type { TempRepo } from './_helpers/tmp-repo.ts';
@@ -102,12 +102,6 @@ describe('run() in-process', () => {
     assert.match(stderr, /unknown command/);
   });
 
-  it('unimplemented command (doctor) exits 70', async () => {
-    const { code, stderr } = await runCli(['doctor']);
-    assert.equal(code, 70);
-    assert.match(stderr, /not yet implemented/);
-  });
-
   it('parser error (--cwd with no value) exits 64', async () => {
     const { code, stderr } = await runCli(['--cwd']);
     assert.equal(code, 64);
@@ -122,10 +116,92 @@ describe('built CLI binary', () => {
     assert.equal(r.stdout.trim(), pkgVersion);
   });
 
-  it('doctor via spawn exits 70 (still a stub)', () => {
-    const r = spawnSync(process.execPath, [binPath, 'doctor'], { encoding: 'utf8' });
-    assert.equal(r.status, 70);
-    assert.match(r.stderr, /not yet implemented/);
+  it('doctor via spawn exits 0 and prints version + node info', () => {
+    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repoRoot], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /harness-haircut doctor/);
+    assert.match(r.stdout, new RegExp(pkgVersion.replace(/\./g, '\\.')));
+  });
+});
+
+describe('doctor E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('lists detected provider configs and exits 0', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n',
+      'CLAUDE.md': '@AGENTS.md\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /claude/);
+  });
+
+  it('--json emits a structured report', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'doctor', '--cwd', repo.root, '--json'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    const report = JSON.parse(r.stdout) as { exitCode: number; version: string };
+    assert.equal(report.exitCode, 0);
+    assert.equal(typeof report.version, 'string');
+  });
+
+  it('exits 3 on an invalid harness-haircut.config.json', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    await writeFile(join(repo.root, 'harness-haircut.config.json'), '{ not json', 'utf8');
+    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 3);
+  });
+});
+
+describe('install-precommit E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('installs into .git/hooks/pre-commit and exits 0 (U1, EV2)', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    // mkTempRepo has no .git; create one so the hook has a home.
+    await mkdir(join(repo.root, '.git', 'hooks'), { recursive: true });
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'install-precommit', '--cwd', repo.root],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.equal(existsSync(join(repo.root, '.git', 'hooks', 'pre-commit')), true);
+    const hook = readFileSync(join(repo.root, '.git', 'hooks', 'pre-commit'), 'utf8');
+    assert.match(hook, /npx harness-haircut audit --json/);
+  });
+
+  it('exits 3 when run outside a git repo (UN1)', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n' });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'install-precommit', '--cwd', repo.root],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /not a git repository/);
   });
 });
 

@@ -1,0 +1,60 @@
+name: Release
+
+# I2 (#15), PRD §6/§16: publish to npm on a version tag. A stable tag
+# (v1.2.3) publishes to the default `latest` dist-tag; a pre-release tag
+# (v1.2.3-rc.1) publishes to `next` (OPT1). The test -> build -> publish step
+# ordering gates the publish: a failing test or build aborts the job before
+# `npm publish` ever runs (UN1), because each step only runs if the prior
+# steps succeeded.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Provenance (--provenance) requires an OIDC token; least-privilege otherwise.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          # registry-url makes setup-node write an .npmrc that reads
+          # NODE_AUTH_TOKEN, so `npm publish` authenticates below.
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        run: npm ci
+
+      # UN1: a failing test aborts the job — `npm publish` never runs.
+      - name: Test
+        run: npm test
+
+      # UN1: a failing build aborts the job too.
+      - name: Build
+        run: npm run build
+
+      # OPT1: route a pre-release tag (v1.2.3-rc.1) to the `next` dist-tag, and
+      # a stable tag to the default `latest`. EV1: --provenance attaches a
+      # signed build-provenance attestation; --access public publishes the
+      # scoped/unscoped package publicly.
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$'; then
+            echo "pre-release $TAG -> dist-tag next"
+            npm publish --provenance --access public --tag next
+          else
+            echo "stable $TAG -> dist-tag latest"
+            npm publish --provenance --access public
+          fi

@@ -2,17 +2,54 @@
 
 Audit and consolidate redundant AI-provider configuration files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md`, …) into a single canonical source of truth, then project that source into each provider's native format.
 
-> **Status:** pre-alpha. The CLI scaffold is in place; commands are stubs. See [`docs/PRD.md`](docs/PRD.md) for the v1 product requirements and [`docs/stories/`](docs/stories/) for the EARS user stories that will fill it in.
+> **Status:** v0.1.0. The four core commands (`init`, `apply`, `audit`, `doctor`) and the `install-precommit` helper are implemented across four provider adapters (Codex, Claude, Gemini, Copilot). See [`CHANGELOG.md`](CHANGELOG.md) for the release notes, [`docs/PRD.md`](docs/PRD.md) for the product requirements, and [`docs/stories/`](docs/stories/) for the EARS user stories.
 >
 > **Contributing?** Read [`AGENTS.md`](AGENTS.md) first — it's the canonical entry-point for project standards (tech stack, CLEAN architecture, testing, commit style).
 
-## Quick start (once published)
+## Quick start
+
+Requires Node.js 24 or later. No install step — run it through `npx`:
 
 ```sh
-npx harness-haircut init      # bootstrap canonical layout
-npx harness-haircut apply     # project canonical sources to each provider
-npx harness-haircut audit     # CI-friendly drift check
+npx harness-haircut init      # bootstrap the canonical AGENTS.md + .agents/ layout
+npx harness-haircut apply     # project canonical sources into each provider's files
+npx harness-haircut audit     # read-only drift check (CI-friendly; exits non-zero on drift)
 ```
+
+`init` scans the repo, resolves any contradictions between existing provider
+configs interactively, writes the canonical layout, and runs `apply`. From
+then on, edit `AGENTS.md` / `.agents/` and re-run `apply`; `audit` is the
+read-only check you wire into CI and pre-commit. `apply && audit` is
+idempotent — it exits 0 on a clean tree.
+
+Other commands:
+
+```sh
+npx harness-haircut doctor              # print version, Node, detected providers, config
+npx harness-haircut install-precommit   # install a pre-commit hook that runs `audit`
+```
+
+### Pre-commit hook
+
+`install-precommit` writes a hook that runs `harness-haircut audit --json` and
+blocks the commit on any drift:
+
+```sh
+npx harness-haircut install-precommit          # append a fenced harness block
+npx harness-haircut install-precommit --force  # overwrite an existing hook wholesale
+```
+
+It targets `.husky/pre-commit` when [husky](https://typicode.github.io/husky/)
+is present, otherwise `.git/hooks/pre-commit` (made executable). Re-running is
+idempotent — the harness block is fenced with markers and never duplicated.
+Run it from inside a git repository (it exits 3 otherwise).
+
+### Continuous integration
+
+To fail a PR check on drift, copy [`templates/github-action.yml`](templates/github-action.yml)
+into your repo's `.github/workflows/`. It checks out the repo, sets up Node 24,
+runs `npm ci`, then `npx harness-haircut audit` — a non-zero exit (drift, a
+lossy-translation warning, or invalid config) fails the check.
 
 ## Local development
 
@@ -31,7 +68,7 @@ The compiled binary lives at `dist/bin.js`. You can run it directly during devel
 ```sh
 node dist/bin.js --version
 node dist/bin.js --help
-node dist/bin.js audit       # exits 70 (not yet implemented)
+node dist/bin.js audit --cwd /path/to/repo
 ```
 
 ## Project layout
@@ -60,7 +97,7 @@ docs/
 
 ## Contributing
 
-Start with [`AGENTS.md`](AGENTS.md) for the standards, then pick a story from [`docs/stories/`](docs/stories/) — they're ordered and the dependency chain is documented in [`docs/stories/README.md`](docs/stories/README.md). The first foundational story (F0) is implemented; F0.5 (project standards / this dogfood pass), F1, F2, and F3 are the next work items.
+Start with [`AGENTS.md`](AGENTS.md) for the standards, then pick a story from [`docs/stories/`](docs/stories/) — they're ordered and the dependency chain is documented in [`docs/stories/README.md`](docs/stories/README.md). The foundational (F-series), adapter (A-series), command (C-series), and integration (I-series) stories that make up v0.1.0 are implemented; remaining work is tracked as GitHub issues.
 
 ## License
 

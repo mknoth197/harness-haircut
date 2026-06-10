@@ -1,0 +1,36 @@
+# harness-haircut drift check — paste into .github/workflows/ (I1, PRD §13).
+#
+# Runs `harness-haircut audit` on every push and pull request. The audit is
+# read-only and exits non-zero on any drift (1), lossy-translation warning (2),
+# or invalid config (3) — so a divergence between your canonical sources and
+# the committed provider files fails the check. Action SHAs are pinned to match
+# this repo's own .github/workflows/ci.yml.
+name: harness-haircut
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege token: the audit only reads the checked-out source.
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      # Install your project's deps so the repo is in its committed state.
+      - name: Install
+        run: npm ci
+
+      # Fails the check on non-zero exit (drift, lossy warning, or bad config).
+      - name: Audit AI-provider configuration drift
+        run: npx harness-haircut audit
