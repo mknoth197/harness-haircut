@@ -6,7 +6,7 @@
 **Labels:** `enhancement`, `command`
 
 ## Context
-[PRD §7](../PRD.md) describes `audit` as a read-only drift detector. It parses canonical sources, runs every enabled adapter to produce expected `EmittedFile[]`, then compares against disk. Exit codes are precisely defined (0 clean, 1 drift, 2 lossy-translation warning, 3 invalid config).
+[PRD §7](../PRD.md) describes `audit` as a read-only drift detector. It parses canonical sources, runs every enabled adapter to produce an expected `Projection` (files + warnings + per-surface summary, per F3), then compares the projected files against disk — honoring the §9 carve-outs (import shims verify by first-line check; merge-key targets verify by owned-key comparison). Exit codes are precisely defined (0 clean, 1 drift, 2 lossy-translation warning, 3 invalid config).
 
 ## Requirements (EARS)
 

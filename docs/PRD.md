@@ -14,7 +14,7 @@
 
 `harness-haircut` is a CLI tool that audits a single repository and consolidates redundant AI-provider configuration files into a single canonical source of truth, then projects that source into each provider's native format. It is distributed via `npx` initially, with `uvx` planned. The MVP targets four providers — GitHub Copilot, Claude Code, OpenAI Codex, and Google Gemini CLI — and three configuration layers: instructions, skills, and hooks.
 
-The tool is opinionated about what canonical looks like (`AGENTS.md` at the root and any nested directory; `.agents/` for skills and hooks), pragmatic about where providers diverge (Copilot's flat `.github/instructions/` model, Claude's missing AGENTS.md support), and explicit about lossy translations (it warns rather than silently degrades).
+The tool is opinionated about what canonical looks like (`AGENTS.md` at the root and any nested directory; `.agents/instructions/` for scoped instruction fragments; `.agents/skills/` and `.agents/hooks/` for the other two layers), pragmatic about where providers diverge (Copilot's code-review surface, Claude's missing AGENTS.md support), and explicit about lossy translations (it warns rather than silently degrades).
 
 ## 2. Problem
 
@@ -38,7 +38,7 @@ Existing tools in the space (`rulesync`, `ruler`, `crag`, `agentsync`, `agent_sy
 
 ### Non-goals (v1)
 
-- **Not** a rule-distribution platform (`instruct-sync`'s territory).
+- **Not** a rule-distribution platform (`rulesync`'s territory).
 - **Not** a multi-repo / org-wide governance system. Scope is one repo at a time.
 - **Not** an authoring UI. Users edit markdown directly.
 - **Not** trying to support every provider. v1 is Copilot, Claude, Codex, Gemini. Cursor, Windsurf, Aider, Cline, Continue, etc. are explicit non-goals for v1 and may be added later as community-contributed adapters.
@@ -161,7 +161,7 @@ Global options:
 
 ### Hooks: `.agents/hooks/<event>.<name>.{sh,js,toml,json}`
 
-- Filename convention: `<event>.<name>.<ext>`, where `<event>` is one of the **canonical event enum** — the cross-provider common denominator (verified against all four providers' current taxonomies):
+- Filename convention: `<event>.<name>.<ext>`, where `<event>` is one of the **canonical event enum** — a canonical superset chosen for cross-provider mappability (verified against all four providers' current taxonomies; not every provider has every event — gaps trigger `HH-W003` per provider):
   `session-start`, `session-end`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`, `stop`, `subagent-start`, `subagent-stop`, `pre-compact`.
   *(v0.3 correction: `pre-commit` removed — no provider has an agent-hook event for it; git-level pre-commit enforcement is I1's job.)*
 - Canonical events map to provider-native names via per-adapter translation tables (e.g., `pre-tool-use` → Claude `PreToolUse` / Codex `PreToolUse` / Gemini `BeforeTool` / Copilot `preToolUse`). Events a provider lacks trigger `HH-W003` for that provider only.
@@ -176,9 +176,12 @@ Global options:
   "providers": ["copilot", "claude", "codex", "gemini"],
   "providers_disabled": [],
   "warningsAsErrors": false,
-  "writeGitignore": true
+  "writeGitignore": true,
+  "gemini": { "mode": "settings" }
 }
 ```
+
+- `gemini.mode`: `"settings"` (default — write `context.fileName` into `.gemini/settings.json`) or `"shim"` (emit a `GEMINI.md` `@AGENTS.md` import instead). See A3 (#9).
 
 ## 9. SignedSource header *(new)*
 
@@ -193,6 +196,11 @@ Every file `harness-haircut` emits begins with one of:
 ```
 
 (or the language-appropriate comment syntax for non-markdown emitted files).
+
+**Carve-outs — two emitted-file classes carry no SignedSource header:**
+
+1. **One-line import shims** (`CLAUDE.md`, and `GEMINI.md` in shim mode): their first line MUST be `@AGENTS.md` for the provider to resolve the import, and their content never derives from canonical sources (it *references* them), so drift is structurally impossible. Ownership rule instead: the tool owns only the first line; `verify` for shims = "first line is exactly `@AGENTS.md`"; everything below it is user content and is always preserved.
+2. **Merge-key targets** (`.claude/settings.json`, `.gemini/settings.json`, `.codex/config.toml`): JSON has no comments and the file is co-owned. Drift detection for these compares the owned key's value against the expected projection (F3 merge policy), not a header.
 
 - **`BODY_HASH`** = lowercase hex of `SHA-256(content_after_header_line)`, truncated to 16 chars. Binds the emitted body.
 - **`SOURCES_HASH`** = lowercase hex of `SHA-256(sources_manifest)`, truncated to 16 chars. Binds the canonical inputs.
@@ -224,8 +232,8 @@ Per-provider details *(v0.3 — verified against current docs; see [`docs/resear
 
 | Provider | Owned files | Co-owned files | Merge strategy |
 |---|---|---|---|
-| Copilot | `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `.github/hooks/harness-haircut.json` | none | overwrite owned; never touch other `.github/hooks/*.json` files. Skills: no emission (`.agents/skills/` read natively). Hook entries pinned to the conservative cross-surface schema (`{type:"command", bash, powershell}`) |
-| Claude | `CLAUDE.md` (one-line `@AGENTS.md` import shim — content below the import line is user-owned and preserved), `.claude/skills/*` (projection of `.agents/skills/`), `.claude/rules/hh.*.md` (projections of scoped `.agents/instructions/`) | `.claude/settings.json` | rewrite `hooks` key only; preserve all other keys |
+| Copilot | `.github/copilot-instructions.md`, `.github/instructions/hh.*.instructions.md` (namespaced — user-authored `.instructions.md` files are never touched), `.github/hooks/harness-haircut.json` | none | overwrite owned; never touch other `.github/hooks/*.json` or un-namespaced `.instructions.md` files. Skills: no emission (`.agents/skills/` read natively). Hook entries pinned to the conservative cross-surface schema (`{type:"command", bash, powershell}`) |
+| Claude | `CLAUDE.md` at root and one per nested `AGENTS.md` directory (one-line `@AGENTS.md` import shims — content below the import line is user-owned and preserved), `.claude/skills/*` (projection of `.agents/skills/`), `.claude/rules/hh.*.md` (projections of scoped `.agents/instructions/`) | `.claude/settings.json` | rewrite `hooks` key only; preserve all other keys |
 | Codex | `.codex/hooks.json` | `.codex/config.toml` (only if user opts into `[hooks]`-in-config style) | prefer owning `.codex/hooks.json` outright; never touch `config.toml` otherwise. Instructions and skills: no emission (native). Emit stable hook bodies (trust-hash churn, see §8) |
 | Gemini | `GEMINI.md` (only in shim mode) | `.gemini/settings.json` | rewrite `hooks` key and `context.fileName` key only; preserve all other keys (incl. user `mcpServers`, `tools.*`). Skills: no emission (`.agents/skills/` alias is native and higher-precedence) |
 
@@ -236,7 +244,7 @@ Per-provider details *(v0.3 — verified against current docs; see [`docs/resear
 A translation is **lossy** if any of:
 
 - A path glob in canonical can't be expressed in the target provider's matcher language (e.g., regex → glob, brace expansion → no brace expansion).
-- A skill exists for a provider that has no skills concept (Copilot).
+- A skill exists for a provider that has no skills concept (none of the v1 four — all consume Agent Skills as of 2026; the rule remains for future adapters) or uses provider-specific frontmatter extras the target cannot represent.
 - A hook event in canonical maps to multiple events in the target (or none).
 - Frontmatter metadata (description, activation mode) has no target slot.
 
@@ -246,7 +254,7 @@ On lossy translation:
 3. **`audit` exit code 2** if any warnings fired (between drift's `1` and config-error's `3`).
 4. **`--strict`** flag (on any command) escalates warnings to errors.
 
-Warnings are catalogued in `src/warnings/<code>.md` with a stable code (e.g., `HH-W001`) so users can suppress specific warnings via `harness-haircut.config.json`.
+Warning codes are defined in `src/entities/warnings.ts` (the registry F3 specifies), with one explanation page per code under `docs/warnings/HH-Wxxx.md`; users suppress specific codes via `harness-haircut.config.json`.
 
 ## 12. Architecture *(new)*
 
@@ -264,15 +272,20 @@ discover → parse → IR → adapters → emit
 - **Discovery** walks the repo from `--cwd`, enumerating `AGENTS.md`, `.agents/`, and known provider files.
 - **Parser** reads canonical sources into an in-memory IR: `Instruction[]`, `Skill[]`, `Hook[]`.
 - **IR** is the single boundary between canonical-format concerns and provider-format concerns. New providers are pure adapters over IR.
-- **Adapter interface**:
+- **Adapter interface** (aligned with F3 — `project` returns a `Projection`, not a bare file list, so native no-op surfaces are reportable):
   ```ts
   interface ProviderAdapter {
     id: 'copilot' | 'claude' | 'codex' | 'gemini';
-    project(ir: IR, ctx: ProjectionContext): EmittedFile[];
+    project(ir: IR, ctx: ProjectionContext): Projection;
     detectExisting(repo: RepoSnapshot): ExistingProviderConfig | null;
   }
+  interface Projection {
+    files: EmittedFile[];
+    warnings: Warning[];
+    surfaces: Record<'instructions' | 'skills' | 'hooks', 'emitted' | 'merged' | 'native' | 'skipped'>;
+  }
   ```
-- **Emitter** writes `EmittedFile[]` with SignedSource headers, respecting merge policy and the dirty-tree guard.
+- **Emitter** writes `Projection.files` with SignedSource headers where applicable (§9 carve-outs), respecting merge policy and the dirty-tree guard.
 
 ## 13. CI integration *(new)*
 

@@ -6,7 +6,7 @@
 **Labels:** `enhancement`, `adapter`
 
 ## Context
-Codex consumes `AGENTS.md` natively (root→cwd concatenation, 32 KiB combined cap) and — per the verified [provider matrix](../research/provider-matrix.md) — **also discovers canonical `.agents/skills/` natively** (`.codex/skills/` is legacy). That leaves hooks as the only real projection surface: `.codex/hooks.json` (GA 2026-05-14), with per-user hash-pinned trust review. This is the simplest adapter and the right place to validate the adapter interface end-to-end before A2/A4.
+Codex consumes `AGENTS.md` natively (root→cwd concatenation, 32 KiB combined cap) and — per the verified [provider matrix](../research/provider-matrix.md) — **also discovers canonical `.agents/skills/` natively** (`.codex/skills/` is legacy). That leaves hooks as the only real projection surface: `.codex/hooks.json` (GA 2026-05-14), with per-user hash-pinned trust review. This is the simplest adapter and the right place to validate the adapter interface end-to-end before A2/A3/A4.
 
 ## Requirements (EARS)
 

@@ -21,8 +21,8 @@
 
 ## Acceptance criteria
 
-- [ ] Module at `src/sign.ts`.
-- [ ] Comment syntaxes supported: HTML, `#` (TOML/YAML), `//` (JSON-with-comments via tolerant parse — note: JSON proper has no comments; for `.claude/settings.json` etc. use the merge-policy approach from F3 instead of headers).
+- [ ] Module at `src/entities/signed-source.ts` (pure logic — `node:crypto` `createHash` is deterministic and I/O-free, so it belongs in the entities layer per `.agents/instructions/software-architecture.md`).
+- [ ] Comment syntaxes supported: HTML, `#` (TOML/YAML), `//` (JS/TS). Files that take no header — one-line import shims and merge-key JSON targets — are governed by the PRD §9 carve-outs, not by this module.
 - [ ] Round-trip tests: `embedHeader → verifyHeader → 'clean'`.
 - [ ] Mutation tests: edit body after embed → `'edited'`; change a source manifest entry → `'stale'`; edit body AND change sources → `'edited'` (edited wins).
 - [ ] Constants exported: `HEADER_TAG = '@generated SignedSource'`, `HASH_LEN = 16`.
