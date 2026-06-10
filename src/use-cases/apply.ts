@@ -426,8 +426,10 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
     }
     if (decision.needsPrompt) {
       // `edited`: prompt unless --non-interactive (UN1). The prompt is awaited
-      // only while planning; no write has happened yet.
-      const confirmed = flags.nonInteractive ? false : await deps.confirm(file.path);
+      // only while planning; no write has happened yet. A dry run never
+      // prompts — a preview reports edited files as blocked without asking.
+      const confirmed =
+        flags.dryRun || flags.nonInteractive ? false : await deps.confirm(file.path);
       if (!confirmed) {
         plan.push({ kind: 'block', file: fileApply(file, providerId, 'blocked', 'edited') });
         continue;
@@ -474,8 +476,8 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   const nothingToDo = written.length === 0;
 
   // OPT1: dry run computes the full plan + report and returns without writing
-  // anything (and without touching the state file). Exit 0 — a plan is not a
-  // failure even when it includes blocked edits in the report.
+  // anything (and without touching the state file). A preview always exits 0 —
+  // it is a plan, not an action; edited files surface as blocked-in-preview.
   if (flags.dryRun) {
     return {
       files,
@@ -485,7 +487,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
       blocked,
       nothingToDo,
       dryRun: true,
-      exitCode: blocked.length > 0 && flags.nonInteractive ? 1 : 0,
+      exitCode: 0,
     };
   }
 

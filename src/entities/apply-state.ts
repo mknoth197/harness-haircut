@@ -25,6 +25,15 @@
  * `createHash` is deterministic and I/O-free, so it is allowed in entities
  * (matching `signed-source.ts`). The file LOCATION and the read/write I/O
  * live in the gateway / use case; this module is the pure format + decision.
+ *
+ * This file is meant to be COMMITTED, not gitignored: it is the team's shared
+ * baseline of "what harness-haircut last emitted", so every clone agrees on
+ * which on-disk changes are stale (safe to overwrite) versus hand-edited
+ * (prompt). A consequence is that a successful `apply` leaves the tree dirty
+ * (this file + the rewritten provider files) — that is the dirty-tree guard
+ * (STATE1) working as intended; commit the apply output, then the tree is
+ * clean again. `--allow-dirty` is the escape hatch for re-running before a
+ * commit.
  */
 import { createHash } from 'node:crypto';
 

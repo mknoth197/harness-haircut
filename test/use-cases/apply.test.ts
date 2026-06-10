@@ -199,6 +199,35 @@ describe('apply() — merge-key (EV3, §10 preserve foreign keys)', () => {
     );
     assert.equal(entry?.action, 'skipped');
   });
+
+  // The highest-risk merge: a dot-path owned key (Gemini `context.fileName`)
+  // must replace only its leaf and preserve a foreign SIBLING under the same
+  // parent object (`context.otherKey`) as well as foreign top-level keys.
+  it('preserves a foreign sibling under a dot-path owned key (context.otherKey)', async () => {
+    const repo = await setup(CANONICAL);
+    await runApply(repo.root);
+    const path = join(repo.root, '.gemini', 'settings.json');
+    await writeFile(
+      path,
+      `${JSON.stringify({ context: { fileName: 'STALE', otherKey: 'keep-me' }, theme: 'x' }, null, 2)}\n`,
+      'utf8',
+    );
+    const report = await runApply(repo.root);
+    assert.equal(report.exitCode, 0);
+    const after = JSON.parse(await readFile(path, 'utf8')) as {
+      context: { fileName: string[]; otherKey: unknown };
+      theme: unknown;
+    };
+    // The adapter merges AGENTS.md into the existing value (A3 EV5 string→array
+    // promotion, preserving the user's prior entry) — the owned leaf was rewritten.
+    assert.ok(
+      Array.isArray(after.context.fileName) && after.context.fileName.includes('AGENTS.md'),
+      'owned leaf rewritten to include AGENTS.md',
+    );
+    // The point of this test: a foreign SIBLING under the dot-path parent survives.
+    assert.equal(after.context.otherKey, 'keep-me', 'foreign sibling under context preserved');
+    assert.equal(after.theme, 'x', 'foreign top-level key preserved');
+  });
 });
 
 describe('apply() — UN2 malformed merge-key target', () => {

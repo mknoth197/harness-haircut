@@ -372,6 +372,12 @@ function renderApplyReport(report: ApplyReport): string {
   if (report.skipped.length > 0) {
     lines.push(`skipped ${report.skipped.length} unchanged file(s)`);
   }
+  // U1 transparency: a real apply that wrote anything also updates the
+  // committed state baseline. Name it so the only non-adapter path apply
+  // touches is never a surprise.
+  if (!report.dryRun && report.written.length > 0) {
+    lines.push(`updated state baseline ${APPLY_STATE_PATH} (commit alongside the changes above)`);
+  }
   if (report.dryRun) {
     lines.push('(dry run — no files written)');
   }
