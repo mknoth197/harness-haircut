@@ -64,6 +64,25 @@ export class MalformedProviderConfigError extends DomainError {
   }
 }
 
+/**
+ * Two canonical sources flatten to the same emitted file path (A4 UN1;
+ * exit code 3). Thrown before any emit so neither projection can silently
+ * clobber the other; the fix is renaming one canonical source.
+ */
+export class EmitPathCollisionError extends DomainError {
+  readonly targetPath: string;
+  readonly sourcePaths: readonly [string, string];
+
+  constructor(targetPath: string, sourceA: string, sourceB: string) {
+    super(
+      `two canonical sources project to the same file ${targetPath}: ${sourceA} and ${sourceB}`,
+      3,
+    );
+    this.targetPath = targetPath;
+    this.sourcePaths = [sourceA, sourceB];
+  }
+}
+
 /** An OS-level filesystem failure, converted at the gateway boundary. */
 export class FileSystemError extends DomainError {
   readonly path: string;
