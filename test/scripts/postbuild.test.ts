@@ -16,8 +16,10 @@ describe('postbuild output', () => {
     assert.equal(firstLine, '#!/usr/bin/env node');
   });
 
-  it('dist/bin.js is executable', () => {
+  // Windows synthesizes mode bits from file extensions and chmod is a no-op
+  // there, so the exec-bit assertion only holds on POSIX.
+  it('dist/bin.js is executable', { skip: process.platform === 'win32' }, () => {
     const mode = statSync(binPath).mode;
-    assert.ok(mode & 0o111, `expected an executable bit, got mode ${mode.toString(8)}`);
+    assert.notEqual(mode & 0o111, 0);
   });
 });

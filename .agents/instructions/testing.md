@@ -12,10 +12,12 @@ scope: "test/**/*.ts"
 2. **Integration tests** — exercise a use case end-to-end against a real filesystem in `os.tmpdir()`. Set up + tear down per-test. No AI-provider runtimes (the PRD non-goal: zero AI-provider deps).
 3. **End-to-end (E2E)** — `spawnSync(process.execPath, [binPath, ...])` against the built `dist/bin.js`; assert on exit code, stdout, stderr. These exist to validate the **whole** pipeline (parser → run → bin shim → exit code).
 
+In addition, **build-artifact tests** are allowed: small assertions on the built output itself (e.g., `dist/bin.js` carries a shebang and exec bit). They guard the build/postbuild scripts rather than runtime behavior. Gate platform-specific assertions with `{ skip: process.platform === '...' }` rather than letting them fail on contributor machines.
+
 ## File layout
 
 - All test files: `test/**/*.test.ts`.
-- Mirror source layout: `src/use-cases/audit.ts` → `test/use-cases/audit.test.ts`.
+- Mirror source layout: `src/use-cases/audit.ts` → `test/use-cases/audit.test.ts`; tests for build/repo scripts mirror `scripts/` under `test/scripts/`.
 - Top-level `test/cli.test.ts` is allowed for cross-cutting concerns (the F0 CLI smoke tests live here).
 - Shared helpers (e.g., a `mkTempRepo()` utility) go in `test/_helpers/*.ts`.
 
