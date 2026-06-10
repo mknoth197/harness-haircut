@@ -5,3 +5,5 @@ export * from './signed-source.js';
 export * from './adapter.js';
 export * from './file-writer.js';
 export * from './apply-state.js';
+export * from './contradiction.js';
+export * from './instruction-source.js';
