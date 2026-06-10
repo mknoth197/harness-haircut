@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { rm, writeFile } from 'node:fs/promises';
 import { parseArgs, run } from '../dist/index.js';
 import { mkTempRepo } from './_helpers/tmp-repo.ts';
@@ -102,8 +102,8 @@ describe('run() in-process', () => {
     assert.match(stderr, /unknown command/);
   });
 
-  it('unimplemented commands (init/apply/doctor) exit 70', async () => {
-    for (const command of ['init', 'apply', 'doctor']) {
+  it('unimplemented commands (init/doctor) exit 70', async () => {
+    for (const command of ['init', 'doctor']) {
       const { code, stderr } = await runCli([command]);
       assert.equal(code, 70);
       assert.match(stderr, /not yet implemented/);
@@ -248,5 +248,86 @@ describe('audit E2E (spawn dist/bin.js)', () => {
       encoding: 'utf8',
     });
     assert.equal(r.status, 1);
+  });
+});
+
+describe('apply E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  async function canonicalRepo(): Promise<TempRepo> {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+      '.agents/hooks/pre-tool-use.lint.sh': '#!/usr/bin/env bash\necho lint\n',
+    });
+    repos.push(repo);
+    return repo;
+  }
+
+  it('apply --allow-dirty writes provider files to disk and exits 0', async () => {
+    const repo = await canonicalRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /wrote/);
+    // The projected files appear on disk.
+    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), true);
+    assert.equal(existsSync(join(repo.root, '.claude', 'settings.json')), true);
+    assert.equal(existsSync(join(repo.root, '.codex', 'hooks.json')), true);
+    assert.equal(existsSync(join(repo.root, '.agents', '.harness-state.json')), true);
+  });
+
+  it('a second apply prints "nothing to do" and exits 0 (idempotent)', async () => {
+    const repo = await canonicalRepo();
+    spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
+      encoding: 'utf8',
+    });
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /nothing to do/);
+  });
+
+  it('audit after apply exits 0 (idempotency end-to-end)', async () => {
+    const repo = await canonicalRepo();
+    spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
+      encoding: 'utf8',
+    });
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /clean/);
+  });
+
+  it('refuses on a dirty (non-git) tree without --allow-dirty, exit 1', async () => {
+    const repo = await canonicalRepo();
+    const r = spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /refused/);
+  });
+
+  it('--dry-run writes nothing and exits 0', async () => {
+    const repo = await canonicalRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty', '--dry-run'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /dry run/);
+    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
   });
 });

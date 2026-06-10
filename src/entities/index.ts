@@ -3,3 +3,5 @@ export * from './warnings.js';
 export * from './errors.js';
 export * from './signed-source.js';
 export * from './adapter.js';
+export * from './file-writer.js';
+export * from './apply-state.js';

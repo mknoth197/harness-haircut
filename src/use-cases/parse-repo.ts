@@ -4,6 +4,7 @@
  * composition root); assembly logic is pure and throws only domain errors.
  */
 import type { FileSnapshot, RepoSnapshot } from '../entities/adapter.js';
+import { APPLY_STATE_PATH } from '../entities/apply-state.js';
 import { ParseError } from '../entities/errors.js';
 import type { Attachment, Hook, IR, Instruction, Skill } from '../entities/ir.js';
 import { HOOK_EVENTS, isHookEvent } from '../entities/ir.js';
@@ -353,6 +354,13 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
       continue;
     }
     if (!file.path.startsWith('.agents/')) {
+      continue;
+    }
+    // The apply state file (`.agents/.harness-state.json`) is tool bookkeeping,
+    // not canonical content — skip it by name so it never becomes an IR
+    // attachment (which would otherwise fire HH-W010 and feed itself into
+    // projections). `audit` stays independent of it (C2 design note).
+    if (file.path === APPLY_STATE_PATH) {
       continue;
     }
     const segments = file.path.split('/');
