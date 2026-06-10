@@ -209,6 +209,71 @@ describe('audit() — merge-key drift (§9 carve-out 2, §10)', () => {
   });
 });
 
+describe('audit() — import shims (§9 carve-out 1, first-line ownership)', () => {
+  it('stays clean when user content sits below the CLAUDE.md import line', async () => {
+    const repo = await setup(CANONICAL);
+    await writeRel(repo.root, 'CLAUDE.md', '@AGENTS.md\n\n# my private notes\n');
+    const report = await runAudit(repo.root);
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.drift, false);
+  });
+
+  it('audits clean in gemini shim mode when GEMINI.md carries the import', async () => {
+    const repo = await setup(CANONICAL, { geminiMode: 'shim' });
+    const report = await runAudit(repo.root, { geminiMode: 'shim' });
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.drift, false);
+  });
+
+  it('reports drift:missing when GEMINI.md is deleted in shim mode', async () => {
+    const repo = await setup(CANONICAL, { geminiMode: 'shim' });
+    await rm(join(repo.root, 'GEMINI.md'));
+    const report = await runAudit(repo.root, { geminiMode: 'shim' });
+    assert.equal(report.exitCode, 1);
+    const entry = report.files.find((f) => f.path === 'GEMINI.md');
+    assert.equal(entry?.status, 'drift:missing');
+  });
+
+  it('warns HH-W005 (exit 2, no drift) when a shim target lacks the import line', async () => {
+    const repo = await setup(CANONICAL, { geminiMode: 'shim' });
+    await writeRel(repo.root, 'GEMINI.md', '# hand-written Gemini instructions\n');
+    const report = await runAudit(repo.root, { geminiMode: 'shim' });
+    assert.equal(report.drift, false);
+    assert.equal(report.exitCode, 2);
+    assert.ok(report.warnings.some((w) => w.code === 'HH-W005' && w.providerId === 'gemini'));
+  });
+});
+
+describe('audit() — merge-key dot-path (context.fileName, §9 carve-out 2)', () => {
+  it('reports drift:differs when AGENTS.md is missing from context.fileName', async () => {
+    const repo = await setup(CANONICAL);
+    const path = join(repo.root, '.gemini', 'settings.json');
+    const settings = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    settings['context'] = { fileName: ['GEMINI.md'] };
+    await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+    const report = await runAudit(repo.root);
+    assert.equal(report.exitCode, 1);
+    const entry = report.files.find(
+      (f) => f.path === '.gemini/settings.json' && f.mergeKey === 'context.fileName',
+    );
+    assert.equal(entry?.status, 'drift:differs');
+  });
+
+  it('reports drift:missing when the nested context key is absent', async () => {
+    const repo = await setup(CANONICAL);
+    const path = join(repo.root, '.gemini', 'settings.json');
+    const settings = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    delete settings['context'];
+    await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+    const report = await runAudit(repo.root);
+    assert.equal(report.exitCode, 1);
+    const entry = report.files.find(
+      (f) => f.path === '.gemini/settings.json' && f.mergeKey === 'context.fileName',
+    );
+    assert.equal(entry?.status, 'drift:missing');
+  });
+});
+
 describe('audit() — lossy warnings (EV4, OPT1)', () => {
   // A scoped fragment is unrepresentable for Gemini → HH-W007 (lossy), while
   // the rest of the repo emits clean.

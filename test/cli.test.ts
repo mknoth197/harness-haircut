@@ -189,4 +189,64 @@ describe('audit E2E (spawn dist/bin.js)', () => {
     assert.equal(r.status, 3);
     assert.match(r.stderr, /harness-haircut/);
   });
+
+  it('exits 3 on a malformed canonical source, naming the file (UN1)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n',
+      '.agents/instructions/broken.md': '# missing scope frontmatter\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /broken\.md/);
+  });
+
+  /**
+   * A repo whose projection fires a lossy warning (HH-W007: scoped fragment
+   * unrepresentable for Gemini) while disk matches every emitted file.
+   */
+  async function lossyRepo(): Promise<TempRepo> {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n\nUse npm test.\n',
+      '.agents/instructions/testing.md':
+        '---\nscope: "test/**/*.ts"\n---\n# Testing\n\nUse node:test.\n',
+    });
+    repos.push(repo);
+    await emitProjection(repo.root);
+    return repo;
+  }
+
+  it('exits 2 when only lossy warnings fire (EV4)', async () => {
+    const repo = await lossyRepo();
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 2);
+    assert.match(r.stdout, /HH-W007/);
+  });
+
+  it('--strict escalates lossy warnings to exit 1 (OPT1)', async () => {
+    const repo = await lossyRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'audit', '--cwd', repo.root, '--strict'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+  });
+
+  it('config warningsAsErrors escalates lossy warnings to exit 1', async () => {
+    const repo = await lossyRepo();
+    await writeFile(
+      join(repo.root, 'harness-haircut.config.json'),
+      '{ "warningsAsErrors": true }\n',
+      'utf8',
+    );
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1);
+  });
 });
