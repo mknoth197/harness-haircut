@@ -70,6 +70,7 @@ Each file in this directory is one user story written in EARS syntax (Easy Appro
 | 11 | C3 | [`init` command](10-C3-init-command.md) | F1, F3, all adapters, C2 |
 | 12 | I1 | [CI integration](11-I1-ci-integration.md) | C1, C2 |
 | 13 | I2 | [npm distribution](12-I2-npm-distribution.md) | everything |
+| 14 | C4 | [AI-assisted init merge (optional, post-v1)](13-C4-ai-assisted-init.md) | C3 |
 
 ## Parallelization notes
 
