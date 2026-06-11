@@ -377,11 +377,20 @@ The deterministic engine cannot make a *semantic* judgment — it compares norma
 - Provider SDKs are **optional/peer dependencies**, `import()`-ed lazily only when `--assist` is active. A default `npm i` / `npx harness-haircut`, and the entire `audit`/`apply` path, never load an SDK. [PRD Goal 5](#3-goals--non-goals) (zero AI-provider runtime deps) holds unchanged for the default install.
 - The assist resolver is a layer-3 gateway implementing the existing `ContradictionResolver` interface that C3 already injects; the entities and use-case layers stay SDK-free.
 
-### Auth
+### Auth — discovery & propose, never an assumed default
 
-- **Opt-in API key via env var** (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`) or a BYO endpoint for self-hosted/enterprise gateways. Never required.
-- Optionally, reuse an already-installed-and-authed provider CLI's session (uses the user's subscription, no separate key) — but this reintroduces a provider-tool dependency, so it is opt-in only and never the default.
-- No key / no network / consent declined → graceful fallback to the deterministic resolver. The feature is always safe to not have.
+`init --assist` runs a **paid-call-free discovery** and **proposes** the credential sources it finds; it never assumes a provider. Two source kinds, both opt-in (verified per provider in [`docs/research/provider-matrix.md`](research/provider-matrix.md#ai-assist-credential-sources--cli-headless-modes--subscription-sessions)):
+
+1. **Env API key** — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`|`GOOGLE_API_KEY` (or a BYO endpoint for self-hosted/enterprise gateways). Deterministic and CI-safe; uses the optional, lazily-loaded provider SDK.
+2. **Subscription session** — reuse an already-logged-in provider CLI's headless mode (`claude -p` / `codex exec` / `gemini -p` / `copilot -p`) so the developer's existing Pro/Max/Plus/Copilot subscription is the credential, **no API key required**. This reintroduces only an *optional* provider-CLI dependency, invoked solely on the assist path via `execFile`.
+
+Discovery probes the binary on PATH, then an env key, then an authed-session marker (file/keychain, or a status subcommand — only `codex login status` offers a clean exit code). Every available source is shown **with its ToS/feasibility caveat** and the user chooses:
+
+- **Claude `claude -p` — sanctioned.** Anthropic provisions a separate monthly Agent SDK credit for scripted subscription use (effective 2026-06-15).
+- **Codex / Gemini — work, with caveats.** Vendors steer automation toward API keys/service accounts; subscription calls meter against plan limits.
+- **Copilot — subscription-only**, text-output (no JSON), consumes premium requests.
+
+No source found / consent declined / call fails → graceful fallback to the deterministic resolver (or a clear `fail` per config). The feature is always safe to not have. harness-haircut never performs the provider login itself — it detects and reuses an existing session, or points the user at the other discovered sources.
 
 ### Privacy posture
 
