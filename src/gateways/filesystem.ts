@@ -48,9 +48,66 @@ export interface IgnorePattern {
  *   - nested .gitignore files and $GIT_DIR/info/exclude are not consulted
  *     (root .gitignore only)
  */
+/**
+ * SECURITY (ReDoS): a root `.gitignore` is attacker-controlled when onboarding
+ * an untrusted repo. The hand-rolled glob-to-regex compiler used to emit one
+ * `[^/]*` group per `*`; a single segment with N stars compiled to N adjacent
+ * `[^/]*` groups — the classic catastrophic-backtracking shape (18 stars vs a
+ * 29-char path took ~44s). The real fix is to COLLAPSE runs of consecutive `*`
+ * within a segment to a single `[^/]*` at compile time (see
+ * `segmentToRegexSource`): `***` is semantically identical to `*` (match any
+ * run of non-`/`), so collapsing is correct AND removes the adjacent-unbounded-
+ * quantifier shape entirely. The only line-level cap we still enforce is a
+ * length cap (a pathological multi-kilobyte line cannot be a real ignore rule);
+ * we keep a generous per-line wildcard sanity cap as defense-in-depth, but with
+ * the collapse it is no longer load-bearing. A dropped line is surfaced (see
+ * `noteDroppedLine`) so the user knows an ignore rule was skipped.
+ */
+const MAX_GITIGNORE_LINE_LENGTH = 1000;
+const MAX_GITIGNORE_WILDCARDS = 50;
+
+/**
+ * NIT: dropping an over-complex `.gitignore` line silently can change ignore
+ * verdicts (a path the user expected to be ignored is now walked). The matcher
+ * lives in a gateway with no warning channel threaded through it, so we surface
+ * the drop on stderr — minimal and side-channel-only, no signature change. A
+ * one-time note per process keeps it from spamming a giant generated file.
+ */
+let droppedLineNoticeEmitted = false;
+function noteDroppedLine(line: string): void {
+  if (droppedLineNoticeEmitted) {
+    return;
+  }
+  droppedLineNoticeEmitted = true;
+  const preview = line.length > 60 ? `${line.slice(0, 60)}…` : line;
+  process.stderr.write(
+    `harness-haircut: skipped an over-complex .gitignore line (>${MAX_GITIGNORE_LINE_LENGTH} chars); ` +
+      `ignore verdicts may differ from git. First skipped line: ${JSON.stringify(preview)}\n`,
+  );
+}
+
+function tooComplexToCompile(line: string): boolean {
+  if (line.length > MAX_GITIGNORE_LINE_LENGTH) {
+    return true;
+  }
+  let wildcards = 0;
+  for (const ch of line) {
+    if (ch === '*') {
+      wildcards++;
+    }
+  }
+  return wildcards > MAX_GITIGNORE_WILDCARDS;
+}
+
 function compilePattern(line: string): IgnorePattern | null {
   const trimmed = line.trim();
   if (trimmed === '' || trimmed.startsWith('#')) {
+    return null;
+  }
+  // SECURITY: skip a pathological line before it reaches the regex compiler,
+  // and surface the drop so a silently-changed ignore verdict is visible (NIT).
+  if (tooComplexToCompile(trimmed)) {
+    noteDroppedLine(trimmed);
     return null;
   }
   let pattern = trimmed;
@@ -104,9 +161,11 @@ function hasAnchoringSlash(pattern: string): boolean {
  *   - interior globstar ('a' … 'b' with anything between): a mandatory
  *     separator after the head, then a zero-or-more-segment group, then the
  *     tail — matching 'a/b' (zero between) and 'a/x/y/b' but not 'ab'.
- * A literal '**' that is not a standalone segment (e.g. 'a**b') degrades to
- * the single-segment '*' behavior for each star, which is acceptable for the
- * canonical-source patterns we care about.
+ * A literal '**' that is not a standalone segment (e.g. 'a**b') is an
+ * intra-segment '*' run: `segmentToRegexSource` collapses the run to a single
+ * '[^/]*' (semantically identical to one '*'), which also removes the
+ * catastrophic-backtracking shape. Only the '**' SEGMENT token (a whole path
+ * segment, handled above) spans path separators; intra-segment runs never do.
  */
 function globToRegexSource(pattern: string): string {
   // Collapse runs of consecutive '**' segments into a single '**' first:
@@ -165,7 +224,15 @@ function collapseGlobstars(segments: string[]): string[] {
 }
 
 function segmentToRegexSource(segment: string): string {
+  // SECURITY (ReDoS): collapse a run of consecutive intra-segment '*' into a
+  // single '*' BEFORE splitting. Inside one path segment, '***' matches the
+  // same set as '*' (any run of non-'/' chars), so this is semantically exact —
+  // and it removes the adjacent-'[^/]*'-group shape that caused catastrophic
+  // backtracking (N stars → N concatenated unbounded quantifiers). This only
+  // touches '*' characters *within* a segment; the '**' globstar SEGMENT token
+  // is handled separately in globToRegexSource and never reaches here.
   return segment
+    .replace(/\*+/g, '*')
     .split('*')
     .map((literal) => literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
     .join('[^/]*');

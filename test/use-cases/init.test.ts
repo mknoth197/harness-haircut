@@ -19,7 +19,8 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   init,
@@ -468,5 +469,117 @@ describe('init() — hooks not reverse-engineered (scoped deviation)', () => {
     const report = await runInit(repo.root);
     assert.equal(report.exitCode, 0);
     assert.ok(report.notes.some((note) => /reverse-engineer|hook/i.test(note)));
+  });
+});
+
+describe('init() — FIX 1 symlinked root-instruction candidate (security)', () => {
+  it('does NOT recover an external secret when CLAUDE.md is a symlink to it', async () => {
+    // The secret lives OUTSIDE the repo; a malicious CLAUDE.md symlinks to it.
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-secret-'));
+    const secretPath = join(outside, 'credentials');
+    await writeFile(secretPath, 'AWS_SECRET_ACCESS_KEY=topsecret\n', 'utf8');
+
+    const repo = await setup({
+      // A legitimate hand-written AGENTS.md so init still has a real candidate.
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+    });
+    await symlink(secretPath, join(repo.root, 'CLAUDE.md'));
+
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    // The symlinked candidate was skipped — the secret never reached canonical.
+    const canonical = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(canonical, /topsecret/);
+    assert.doesNotMatch(canonical, /AWS_SECRET_ACCESS_KEY/);
+    // And no projected provider file leaked it either.
+    if (existsSync(join(repo.root, '.github', 'copilot-instructions.md'))) {
+      const ci = await readFile(join(repo.root, '.github', 'copilot-instructions.md'), 'utf8');
+      assert.doesNotMatch(ci, /topsecret/);
+    }
+    // The external secret file itself is untouched (apply replaced the symlink
+    // with a real in-repo shim rather than following the link to corrupt it).
+    assert.equal(await readFile(secretPath, 'utf8'), 'AWS_SECRET_ACCESS_KEY=topsecret\n');
+
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  // BLOCKER 1 (live bypass, end-to-end): a symlinked PARENT dir — .github →
+  // /tmp/external — with an ORDINARY real leaf (copilot-instructions.md holding
+  // a secret) defeated the old leaf-only lstat. init read the secret THROUGH
+  // the symlinked parent into canonical AGENTS.md and projected it everywhere.
+  // Realpath-containment now treats the whole escaping chain as absent, and the
+  // writer refuses to project back through the symlinked parent.
+  it('does NOT recover a secret behind a symlinked PARENT directory (.github → external)', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-external-'));
+    await writeFile(
+      join(outside, 'copilot-instructions.md'),
+      'EXFIL_SECRET=topsecret-parent-dir\n',
+      'utf8',
+    );
+
+    const repo = await setup({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+    });
+    // .github is a symlink to the external dir; the leaf behind it is a real file.
+    await symlink(outside, join(repo.root, '.github'));
+
+    // READ side: the secret behind the symlinked parent is never recovered. The
+    // WRITE side then refuses to project back through the symlinked `.github`
+    // parent (it would land outside the repo) — surfacing as a thrown
+    // FileSystemError rather than a silent clobber. Either way the secret is
+    // contained, so we accept the throw and assert the security invariants hold.
+    await assert.rejects(
+      runInit(repo.root),
+      (err: unknown) =>
+        err instanceof Error && /escapes repo root|outside repo root/.test(err.message),
+    );
+
+    // The secret never reached canonical AGENTS.md (read guard held).
+    const canonical = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(canonical, /topsecret-parent-dir/);
+    assert.doesNotMatch(canonical, /EXFIL_SECRET/);
+    // And the external file was never clobbered by a projection write-through.
+    assert.equal(
+      await readFile(join(outside, 'copilot-instructions.md'), 'utf8'),
+      'EXFIL_SECRET=topsecret-parent-dir\n',
+    );
+
+    await rm(outside, { recursive: true, force: true });
+  });
+});
+
+describe('init() — FIX 2(a) unsafe discovered names skipped + noted', () => {
+  it('skips a skill whose folder name is unsafe and notes it, writing no partial files', async () => {
+    const skill = '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n';
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      // An unsafe skill folder name (uppercase + dot are outside the safe-name
+      // rule). skillNameFromPath rejects '/', so we exercise the char rule.
+      '.claude/skills/Bad.Name/SKILL.md': skill,
+      // A legitimate sibling skill still carries over.
+      '.claude/skills/good/SKILL.md': skill,
+    });
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    // The unsafe skill is skipped — no canonical folder for it.
+    assert.equal(existsSync(join(repo.root, '.agents', 'skills', 'Bad.Name', 'SKILL.md')), false);
+    assert.ok(report.notes.some((n) => /unsafe name/i.test(n) && /Bad\.Name/.test(n)));
+    // The valid one still landed (no partial write / no abort).
+    assert.equal(existsSync(join(repo.root, '.agents', 'skills', 'good', 'SKILL.md')), true);
+  });
+
+  it('skips a scoped fragment whose derived name is unsafe and notes it', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      // The derived fragment name is the basename sans suffix; uppercase/dot
+      // segments are unsafe path-segment names.
+      '.claude/rules/Bad.Name.md': '---\npaths: ["src/**"]\n---\n# x\n\nbody.\n',
+      '.claude/rules/good.md': '---\npaths: ["src/**"]\n---\n# y\n\nbody.\n',
+    });
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'Bad.Name.md')), false);
+    assert.ok(report.notes.some((n) => /unsafe/i.test(n) && /Bad\.Name\.md/.test(n)));
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'good.md')), true);
   });
 });

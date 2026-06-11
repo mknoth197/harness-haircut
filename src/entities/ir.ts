@@ -45,6 +45,22 @@ export function isHookEvent(value: string): value is HookEvent {
  */
 export const AGENTS_IMPORT_LINE = '@AGENTS.md';
 
+/**
+ * Agent Skills standard name shape, and a security boundary: skill and scoped
+ * instruction-fragment names become emit *path segments*
+ * (`.claude/skills/<name>/…`, `.agents/instructions/<name>.md`). Restricting
+ * them to lowercase alphanumeric segments separated by single hyphens makes
+ * path traversal (`..`, `/`) and YAML/frontmatter-breaking characters (`:`,
+ * quotes) impossible. Both `parseRepo` (canonical sources) and `init`
+ * (recovered provider sources) gate names through this single rule.
+ */
+export const SAFE_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/** True when `name` is a safe path-segment name (see {@link SAFE_NAME_RE}). */
+export function isSafeName(name: string): boolean {
+  return SAFE_NAME_RE.test(name);
+}
+
 /** An opaque file carried through the IR verbatim (skill sibling files, unknown `.agents/` files). */
 export interface Attachment {
   /** Repo-relative POSIX path. */

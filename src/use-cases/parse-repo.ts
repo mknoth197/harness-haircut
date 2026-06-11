@@ -7,7 +7,7 @@ import type { FileSnapshot, RepoSnapshot } from '../entities/adapter.js';
 import { APPLY_STATE_PATH } from '../entities/apply-state.js';
 import { ParseError } from '../entities/errors.js';
 import type { Attachment, Hook, IR, Instruction, Skill } from '../entities/ir.js';
-import { HOOK_EVENTS, isHookEvent } from '../entities/ir.js';
+import { HOOK_EVENTS, isHookEvent, SAFE_NAME_RE } from '../entities/ir.js';
 import type { Warning } from '../entities/warnings.js';
 
 export interface ParseRepoDeps {
@@ -275,9 +275,10 @@ function recordUnknownAttachment(
  * B2: Agent Skills standard name shape. Also a security boundary — the name
  * becomes an emit path segment (`.claude/skills/<name>/…`), so path
  * traversal (`../`) and YAML-breaking characters (`:`, quotes) must be
- * rejected, not just frowned upon.
+ * rejected, not just frowned upon. Shared with `init` via the entity layer
+ * (`SAFE_NAME_RE`) so both code paths enforce the identical boundary.
  */
-const SKILL_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const SKILL_NAME_RE = SAFE_NAME_RE;
 
 /** F1 EV3 + UN3: skills come from SKILL.md frontmatter; names must be unique. */
 function assembleSkills(

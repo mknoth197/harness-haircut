@@ -97,6 +97,28 @@ export class InvalidConfigError extends DomainError {
   }
 }
 
+/**
+ * A JSON merge-key dot-path contained a prototype-pollution segment
+ * (`__proto__`, `constructor`, or `prototype`). The merge key is a constant
+ * today, so this is a latent-defense guard: refusing such a path keeps the
+ * dot-path setter from ever walking onto `Object.prototype` (exit code 3,
+ * treated as an invalid-config / unsafe-input failure).
+ */
+export class UnsafeMergeKeyError extends DomainError {
+  readonly mergeKey: string;
+  readonly segment: string;
+
+  constructor(mergeKey: string, segment: string) {
+    super(
+      `unsafe merge key ${JSON.stringify(mergeKey)}: segment ${JSON.stringify(segment)} ` +
+        'is forbidden (prototype-pollution guard)',
+      3,
+    );
+    this.mergeKey = mergeKey;
+    this.segment = segment;
+  }
+}
+
 /** An OS-level filesystem failure, converted at the gateway boundary. */
 export class FileSystemError extends DomainError {
   readonly path: string;

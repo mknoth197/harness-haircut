@@ -1,5 +1,8 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createProviderFileReader } from '../../dist/index.js';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
 import type { TempRepo } from '../_helpers/tmp-repo.ts';
@@ -60,5 +63,70 @@ describe('createProviderFileReader', () => {
     const b = await repoWith({ 'AGENTS.md': 'B\n' });
     assert.equal(createProviderFileReader(a.root).read('AGENTS.md'), 'A\n');
     assert.equal(createProviderFileReader(b.root).read('AGENTS.md'), 'B\n');
+  });
+
+  // SECURITY (FIX 1): a malicious repo could point a root-instruction path
+  // (e.g. CLAUDE.md) at an external secret via a symlink; readFileSync would
+  // follow it and exfiltrate the content into canonical AGENTS.md. The reader
+  // must treat a symlink as absent, just as the snapshot walk skips them.
+  it('does not read through a symlink that escapes the repo (returns null/false)', async () => {
+    // A secret file OUTSIDE the repo, plus a normal file alongside it.
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-secret-'));
+    const secretPath = join(outside, 'id_rsa');
+    await writeFile(secretPath, 'SECRET-PRIVATE-KEY\n', 'utf8');
+
+    const repo = await repoWith({ 'AGENTS.md': '# real instructions\n' });
+    // CLAUDE.md inside the repo is a symlink to the external secret.
+    await symlink(secretPath, join(repo.root, 'CLAUDE.md'));
+
+    const reader = createProviderFileReader(repo.root);
+    // The symlinked path reads as absent — the secret is never recovered.
+    assert.equal(reader.read('CLAUDE.md'), null);
+    assert.equal(reader.exists('CLAUDE.md'), false);
+    // A normal (non-symlinked) file is unaffected.
+    assert.equal(reader.read('AGENTS.md'), '# real instructions\n');
+    assert.equal(reader.exists('AGENTS.md'), true);
+
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('treats a symlink to an in-repo file as absent too (no following)', async () => {
+    const repo = await repoWith({ 'AGENTS.md': 'A\n' });
+    // Even a link whose target is inside the repo is refused — we never follow.
+    await symlink(join(repo.root, 'AGENTS.md'), join(repo.root, 'GEMINI.md'));
+    const reader = createProviderFileReader(repo.root);
+    assert.equal(reader.read('GEMINI.md'), null);
+    assert.equal(reader.exists('GEMINI.md'), false);
+  });
+
+  // BLOCKER 1 (live bypass): the prior guard only lstat'd the LEAF. A symlinked
+  // PARENT DIR (.github → /tmp/external) with an ordinary, non-symlink real
+  // leaf behind it (copilot-instructions.md holding a secret) sailed past the
+  // leaf lstat and readFileSync followed the chain — exfiltrating the secret.
+  // Realpath-containment now resolves the WHOLE chain and rejects it as absent.
+  it('does not read through a symlinked PARENT directory that escapes the repo', async () => {
+    // External dir with a perfectly ordinary (non-symlink) secret file in it.
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-external-'));
+    await writeFile(join(outside, 'copilot-instructions.md'), 'EXFIL-SECRET\n', 'utf8');
+
+    const repo = await repoWith({ 'AGENTS.md': '# real\n' });
+    // .github is a symlink to the external dir; its leaf is a real file.
+    await symlink(outside, join(repo.root, '.github'));
+
+    const reader = createProviderFileReader(repo.root);
+    // The secret behind the symlinked parent is NOT read (treated as absent).
+    assert.equal(reader.read('.github/copilot-instructions.md'), null);
+    assert.equal(reader.exists('.github/copilot-instructions.md'), false);
+    // A normal in-repo file still reads fine.
+    assert.equal(reader.read('AGENTS.md'), '# real\n');
+
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('still reads a legitimate deep real file (containment allows in-repo paths)', async () => {
+    const repo = await repoWith({ '.agents/skills/x/SKILL.md': 'deep\n' });
+    const reader = createProviderFileReader(repo.root);
+    assert.equal(reader.read('.agents/skills/x/SKILL.md'), 'deep\n');
+    assert.equal(reader.exists('.agents/skills/x/SKILL.md'), true);
   });
 });
