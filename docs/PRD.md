@@ -1,12 +1,14 @@
 # harness-haircut — Product Requirements Document
 
-**Status:** Draft v0.3
+**Status:** Draft v0.4
 **Owner:** TBD
-**Last updated:** 2026-06-10
+**Last updated:** 2026-06-11
 
 > **Audit log (2026-05-08):** v0.1 was missing §6–14. This revision fills those sections with reasonable defaults derived from the existing goals and §5 scope table. Defaults are marked **[draft default — open to revision]** so they're easy to spot. No goal in §3 was changed; §15–16 are unchanged.
 >
 > **Audit log (2026-06-10, v0.3):** provider facts verified against current official documentation via a 10-agent research workflow — see [`docs/research/provider-matrix.md`](research/provider-matrix.md) for the full matrix with citations. Major corrections: `.agents/skills/` is read natively by Codex, Gemini CLI, and Copilot (skills projection becomes a no-op for 3 of 4 providers); Copilot reads AGENTS.md (root+nested) for the coding agent/CLI/VS Code but NOT for code review; all four providers now ship hooks, with divergent event taxonomies; canonical AGENTS.md must be pure markdown (the spec defines no frontmatter and consumers inject the file verbatim); `pre-commit` removed from the canonical hook enum (no provider has it). §9 also revised (two-hash SignedSource header). Affected sections: §2, §5, §8, §9, §10, §14.
+>
+> **Audit log (2026-06-11, v0.4):** added §17 — an optional, post-v1 AI-assisted onboarding capability (story C4) and, more importantly, the **determinism boundary** that confines any LLM use to `init --assist` and keeps it out of the deterministic `audit`/`apply` core, preserving Goal 5, idempotency, offline operation, and CI/hook safety. Includes the auth and privacy/egress posture. No change to §1–§16 behavior; the v1 tool is unaffected and the feature is opt-in.
 
 ---
 
@@ -342,6 +344,64 @@ Both artifacts are documentation + simple scripts in v1; no GitHub App, no marke
 - `apply` is **idempotent**: `apply && audit` exits 0.
 - **No silent loss of canonical sources the tool reaches.** Every lossy translation produces a warning the user can act on, and a canonical source excluded by a *file-level* `.gitignore` rule surfaces as `HH-W012` rather than vanishing. The one documented exception: a canonical file inside a directory you have fully gitignored is honored as out-of-scope and not reported (see [`docs/warnings/HH-W012.md`](warnings/HH-W012.md) "Scope / known limit").
 - Onboarding (running `init` for the first time) takes **<5 minutes** for a typical multi-tool repo.
+
+## 17. AI-assisted onboarding & the determinism boundary *(new — post-v1, optional)*
+
+**[draft default — open to revision]**
+
+The deterministic engine cannot make a *semantic* judgment — it compares normalized text. That is correct and required for `audit`/`apply`, but it makes `init`'s contradiction handling blunt: it flags differently-worded-but-equivalent files as conflicts, and resolves genuine conflicts by discarding the non-chosen candidate (the C3 review's F2 finding). An optional LLM "assist" at `init` time can improve *accuracy* on exactly those fuzzy, one-time, human-supervised tasks. This section defines the boundary that keeps that optional capability from compromising any v1 guarantee. The capability itself is specified in story **C4** ([`docs/stories/13-C4-ai-assisted-init.md`](stories/13-C4-ai-assisted-init.md)).
+
+### The determinism boundary (inviolable)
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │  DETERMINISTIC CORE — mechanical, reproducible, offline,   │
+  │  SDK-free. An LLM MUST NEVER run here.                     │
+  │  parse → IR → adapters → emit ; audit ; apply ; doctor ;  │
+  │  install-precommit                                         │
+  └──────────────────────────────────────────────────────────┘
+                         ▲  (no dependency, ever)
+  ┌──────────────────────────────────────────────────────────┐
+  │  OPTIONAL ASSIST — `init --assist` only. Fuzzy, one-time,  │
+  │  human-approved. Output becomes frozen canonical text that │
+  │  the deterministic core then owns.                         │
+  └──────────────────────────────────────────────────────────┘
+```
+
+- An LLM is invoked **only** from `init --assist` (opt-in flag). No other command — and nothing reachable from CI, pre-commit hooks, `audit`, or `apply` — ever makes a model call.
+- The assist *proposes*; a human *approves* (a diff is shown) before anything is written. Declining always falls back to today's deterministic resolver.
+- Because assist runs only at onboarding and its output is ordinary canonical markdown, **idempotency (`apply && audit → 0`) and SignedSource semantics are unaffected** — by the time the deterministic engine sees the content, it is static canonical text like any hand-authored file.
+
+### Dependency posture (Goal 5 preserved for everyone who doesn't opt in)
+
+- Provider SDKs are **optional/peer dependencies**, `import()`-ed lazily only when `--assist` is active. A default `npm i` / `npx harness-haircut`, and the entire `audit`/`apply` path, never load an SDK. [PRD Goal 5](#3-goals--non-goals) (zero AI-provider runtime deps) holds unchanged for the default install.
+- The assist resolver is a layer-3 gateway implementing the existing `ContradictionResolver` interface that C3 already injects; the entities and use-case layers stay SDK-free.
+
+### Auth — discovery & propose, never an assumed default
+
+`init --assist` runs a **paid-call-free discovery** and **proposes** the credential sources it finds; it never assumes a provider. Two source kinds, both opt-in (verified per provider in [`docs/research/provider-matrix.md`](research/provider-matrix.md#ai-assist-credential-sources--cli-headless-modes--subscription-sessions)):
+
+1. **Env API key** — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY`|`GOOGLE_API_KEY` (or a BYO endpoint for self-hosted/enterprise gateways). Deterministic and CI-safe; uses the optional, lazily-loaded provider SDK.
+2. **Subscription session** — reuse an already-logged-in provider CLI's headless mode (`claude -p` / `codex exec` / `gemini -p` / `copilot -p`) so the developer's existing Pro/Max/Plus/Copilot subscription is the credential, **no API key required**. This reintroduces only an *optional* provider-CLI dependency, invoked solely on the assist path via `execFile`.
+
+Discovery probes the binary on PATH, then an env key, then an authed-session marker (file/keychain, or a status subcommand — only `codex login status` offers a clean exit code). Every available source is shown **with its ToS/feasibility caveat** and the user chooses:
+
+- **Claude `claude -p` — sanctioned.** Anthropic provisions a separate monthly Agent SDK credit for scripted subscription use (effective 2026-06-15).
+- **Codex / Gemini — work, with caveats.** Vendors steer automation toward API keys/service accounts; subscription calls meter against plan limits.
+- **Copilot — subscription-only**, text-output (no JSON), consumes premium requests.
+
+No source found / consent declined / call fails → graceful fallback to the deterministic resolver (or a clear `fail` per config). The feature is always safe to not have. harness-haircut never performs the provider login itself — it detects and reuses an existing session, or points the user at the other discovered sources.
+
+### Model selection & persistence
+
+- **Model:** the merge is human-reviewed, so favor a fast balanced tier and never pin a rotting id. Subscription-session backend → use the **CLI's own configured default** (no `--model`). API-key backend → a **balanced mid-tier** default per provider held in an easy-to-bump constant. The resolved model is shown in the egress disclosure; `init.assist.model` / `--assist-model` overrides.
+- **Persistence:** a remembered credential-source choice is stored **per-machine, user-local** (gitignored), never in team-shared `harness-haircut.config.json`, and records only the *source kind + provider* — never a credential value. Shared config may carry non-secret policy (`init.assist`, `onUnavailable`) but not the per-developer selection.
+
+### Privacy posture
+
+- `--assist` sends canonical and provider config file **contents to a third-party API**. This is treated as publishing to an external service.
+- It is therefore: opt-in, flag-gated, and **gated on an explicit per-run egress disclosure** that names the destination provider and the files involved (consent may be remembered via config). It never runs unattended (CI/hooks/`audit`/`apply`).
+- Environments with egress restrictions (corporate proxies, air-gapped, regulated data) can ignore the feature entirely at **zero cost** — the deterministic tool is fully functional without it. Teams should not enable it on repos whose config contains sensitive material unless the provider/endpoint is organizationally approved.
 
 ---
 

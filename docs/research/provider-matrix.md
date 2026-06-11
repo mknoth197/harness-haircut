@@ -113,3 +113,28 @@ All four providers use the same **Agent Skills open standard** SKILL.md format (
 | Canonical AGENTS.md frontmatter (`scope:`) | **Invalid** — spec is pure markdown; frontmatter leaks into prompts verbatim |
 | Canonical hook enum includes `pre-commit` | No provider has it; drop (git tooling, not agent hooks) |
 | §2: rivals don't audit / no 3-layer coverage / "c2c" | crag audits; rulesync covers 3 layers shallowly; c2c doesn't exist — claims narrowed |
+
+---
+
+## AI-assist credential sources — CLI headless modes & subscription sessions
+
+**Researched 2026-06-11** (for story C4 / PRD §17). Feature context: `init --assist` discovers which AI credential sources are available and **proposes** them to the user (no assumed default). A "subscription session" means reusing a provider CLI's already-authenticated login to make one headless completion call — **no separate API key**.
+
+| Provider | Binary | Headless one-shot | Structured output | Subscription session w/o API key? | Paid-call-free auth detection | Env API key | Feasibility |
+|---|---|---|---|---|---|---|---|
+| Claude Code | `claude` | `claude -p "…"` (`--print`, GA) | `--output-format json` / `--json-schema` | ✅ default for Pro/Max; **`--bare` needs `ANTHROPIC_API_KEY`** | macOS Keychain "Claude Code-credentials"; Linux `~/.claude/.credentials.json` | `ANTHROPIC_API_KEY` (overrides subscription); `CLAUDE_CODE_OAUTH_TOKEN` for CI | **GREEN** |
+| OpenAI Codex | `codex` | `codex exec "…"` (`e`) — final msg to stdout | `--json` / `--output-schema` | ✅ ChatGPT Plus/Pro/etc. | **`codex login status` → exit 0 = logged in** (cleanest contract); `~/.codex/auth.json` | `OPENAI_API_KEY` (stateful precedence; see caveat) | **YELLOW** |
+| Gemini CLI | `gemini` | `gemini -p "…"` (`--prompt`) | `--output-format json` | ✅ Google AI Pro/Ultra OAuth | `~/.gemini/oauth_creds.json` (caching flaky in headless/cross-dir) | `GEMINI_API_KEY`; Vertex: `GOOGLE_API_KEY`/`GOOGLE_APPLICATION_CREDENTIALS` | **YELLOW** |
+| GitHub Copilot | `copilot` | `copilot -p "…"` (`-s` silent, GA 2026-02-25) | **none (text only)** | ✅ Copilot seat (GitHub token, not a model key) | keychain `copilot-cli` / `~/.copilot/config.json`; `/user` interactive | `COPILOT_GITHUB_TOKEN`→`GH_TOKEN`→`GITHUB_TOKEN`; `COPILOT_MODEL` | **YELLOW** |
+
+Model override per call: `--model` / `-m` (Copilot: `--model` or `COPILOT_MODEL`); else the CLI's configured default.
+
+**Feasibility notes & ToS caveats (must be surfaced to the user at selection time):**
+- **Claude — GREEN, sanctioned.** From **2026-06-15** Anthropic provisions a *separate monthly Agent SDK credit* for exactly this scripted `claude -p` subscription use — programmatic single calls are blessed, not merely tolerated. Plain `claude -p` uses the subscription; `--bare` skips OAuth/keychain so it needs an API key.
+- **Codex — YELLOW.** Works on the ChatGPT session, but OpenAI *recommends API keys for programmatic/CI* use; env-vs-session precedence is stateful in `auth.json` (re-`codex login --with-api-key` to switch — issues #2638/#2733/#3286); calls meter against agentic usage limits.
+- **Gemini — YELLOW.** OAuth subscription works headless, but caching is flaky cross-dir/headless, Google steers CI toward service accounts, and consumer-subscription automated-use limits are not clearly documented. (Also note the 2026-06-18 consumer-auth sunset above.)
+- **Copilot — YELLOW.** GA headless built for scripting on the existing Copilot subscription (no model key), but **no JSON output** (text-only `-s`) and every call consumes a premium request / AI credit (402 over quota).
+
+**Discovery ranking (for proposal ordering, not auto-selection):** per provider — explicit env **API key** (deterministic, CI-safe, billed-as-expected) ranks above an **authed subscription session** (ToS/metering caveats) above nothing. Discovery probes (a) binary on PATH, (b) env key, (c) authed-session file/keychain presence (prefer a status subcommand where one exists — only Codex has a clean exit-code contract). The user is shown every available source **with its caveat** and **chooses**; nothing is assumed.
+
+Sources: code.claude.com/docs/en/headless + /authentication + support.claude.com article 15036540 (Agent SDK credit, eff. 2026-06-15); developers.openai.com/codex/noninteractive + /auth + help.openai.com 11369540; github.com/google-gemini/gemini-cli docs/cli/headless.md + get-started/authentication.mdx; docs.github.com Copilot CLI programmatic reference + github.blog GA changelog 2026-02-25. All checked 2026-06-11.
