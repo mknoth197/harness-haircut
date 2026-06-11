@@ -1,9 +1,42 @@
+import { execFile } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { DomainError, InvalidConfigError } from './entities/errors.js';
 import type { ProviderId, ProjectionContext } from './entities/adapter.js';
+import {
+  checkEndpointPolicy,
+  renderEgressDisclosure,
+  renderEgressPreview,
+  EGRESS_CONSENT_PROMPT,
+} from './entities/index.js';
+import type {
+  CandidateText,
+  EgressDestination,
+  EgressFlags,
+  EgressPlan,
+} from './entities/index.js';
+import {
+  createDiscoveryProbes,
+  discoverCredentialSources,
+} from './gateways/ai-credentials.js';
+import type { CredentialSource } from './gateways/ai-credentials.js';
+import { buildAiResolver } from './gateways/ai-resolver.js';
+import type { AssistBackend } from './gateways/ai-resolver.js';
+import {
+  createCliBackend,
+  createSdkBackend,
+  AssistBackendUnavailableError,
+} from './gateways/assist-backends.js';
+import type { CliSpawn } from './gateways/assist-backends.js';
+import {
+  assistStorePath,
+  readRememberedSource,
+  writeRememberedSource,
+} from './gateways/assist-persistence.js';
 import { APPLY_STATE_PATH, parseState, serializeState } from './entities/apply-state.js';
 import type { ApplyState } from './entities/apply-state.js';
 import { createProviderFileReader } from './gateways/provider-files.js';
@@ -25,7 +58,7 @@ import type { InstallReport } from './use-cases/install-precommit.js';
 import { createPrecommitGateway } from './gateways/precommit.js';
 import { doctor } from './use-cases/doctor.js';
 import type { DoctorReport } from './use-cases/doctor.js';
-import type { Contradiction, Resolution } from './entities/contradiction.js';
+import type { Contradiction, ContradictionResolver, Resolution } from './entities/contradiction.js';
 
 export type ExitCode = 0 | 1 | 2 | 3 | 64 | 70;
 
@@ -33,29 +66,52 @@ export interface ParsedArgs {
   command: string | null;
   flags: Record<string, string | boolean>;
   positional: string[];
+  /** Repeatable value flags accumulated across occurrences (e.g. `--assist-include`). */
+  repeated: Record<string, string[]>;
   /** Set when argv could not be parsed (e.g. value-flag missing its value). */
   error?: string;
 }
 
 const KNOWN_COMMANDS = new Set(['init', 'audit', 'apply', 'doctor', 'install-precommit']);
 
-const VALUE_FLAGS = new Set(['--cwd', '--config']);
+const VALUE_FLAGS = new Set(['--cwd', '--config', '--assist-model']);
+
+/** Value flags that may appear more than once; values accumulate into `repeated`. */
+const REPEATABLE_VALUE_FLAGS = new Set(['--assist-include', '--assist-allow-secret']);
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags: Record<string, string | boolean> = {};
+  const repeated: Record<string, string[]> = {};
   const positional: string[] = [];
   let command: string | null = null;
+
+  const pushRepeated = (key: string, value: string): void => {
+    (repeated[key] ??= []).push(value);
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg.startsWith('--')) {
       const eq = arg.indexOf('=');
       if (eq !== -1) {
-        flags[arg.slice(0, eq)] = arg.slice(eq + 1);
+        const key = arg.slice(0, eq);
+        const value = arg.slice(eq + 1);
+        if (REPEATABLE_VALUE_FLAGS.has(key)) {
+          pushRepeated(key, value);
+        } else {
+          flags[key] = value;
+        }
+      } else if (REPEATABLE_VALUE_FLAGS.has(arg)) {
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith('-')) {
+          return { command, flags, positional, repeated, error: `missing value for ${arg}` };
+        }
+        pushRepeated(arg, next);
+        i += 1;
       } else if (VALUE_FLAGS.has(arg)) {
         const next = argv[i + 1];
         if (next === undefined || next.startsWith('-')) {
-          return { command, flags, positional, error: `missing value for ${arg}` };
+          return { command, flags, positional, repeated, error: `missing value for ${arg}` };
         }
         flags[arg] = next;
         i += 1;
@@ -71,7 +127,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     }
   }
 
-  return { command, flags, positional };
+  return { command, flags, positional, repeated };
 }
 
 async function readPackageVersion(): Promise<string> {
@@ -109,6 +165,14 @@ function helpText(): string {
     'init options:',
     '  --dry-run           Print the planned canonical layout and exit without writing',
     '  --non-interactive   Never prompt; fail (exit 1) on any unresolved contradiction',
+    '  --assist            Opt-in AI-assisted merge (discovers a credential source and',
+    '                      proposes a semantic merge; every send is disclosed, every',
+    '                      merge human-approved). Cannot combine with --non-interactive.',
+    '  --assist-include <glob>       Also send a normally-withheld file class (repeatable)',
+    '  --assist-allow-secret <rule>  Redact (not block) a matched secret rule (repeatable)',
+    '  --assist-model <id>           Override the model for the chosen backend',
+    '  --assist-yes        Pre-approve egress for the run (the disclosure still prints)',
+    '  --no-preview        Suppress the post-redaction body preview (list/counts still show)',
     '',
     'apply options:',
     '  --dry-run           Print the would-emit plan and exit without writing',
@@ -231,6 +295,14 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
     // Read the raw config text (or null when absent) here in layer 4; the use
     // case parses it so an invalid config surfaces as the doctor's exit 3.
     const { raw, configPath, explicitConfigMissing } = await readConfigText(cwd, configFlag);
+    // Reuse the same paid-call-free discovery `init --assist` uses, so doctor
+    // reports the available AI-assist credential sources WITHOUT a model call.
+    const assistSources = discoverCredentialSources(createDiscoveryProbes()).map((source) => ({
+      provider: source.provider,
+      kind: source.kind,
+      caveat: source.caveat,
+      detail: source.detail,
+    }));
     report = await doctor({
       version: await readPackageVersion(),
       nodeVersion: process.version,
@@ -240,6 +312,7 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       configRaw: raw,
       configPath,
       explicitConfigMissing,
+      assistSources,
     });
   } catch (err) {
     if (err instanceof DomainError) {
@@ -282,6 +355,16 @@ function renderDoctorReport(report: DoctorReport): string {
     lines.push(`  disabled      ${report.config.providersDisabled.join(', ') || '(none)'}`);
     lines.push(`  gemini.mode   ${report.config.gemini.mode}`);
     lines.push(`  warningsAsErrors ${report.config.warningsAsErrors}`);
+  }
+  lines.push('');
+  if (report.assistSources.length > 0) {
+    lines.push(`AI-assist sources (for \`init --assist\`; nothing is sent without consent):`);
+    for (const source of report.assistSources) {
+      lines.push(`  ${source.provider} [${source.kind}]  ${source.detail}`);
+      lines.push(`    caveat: ${source.caveat}`);
+    }
+  } else {
+    lines.push('AI-assist sources: none discovered (set a provider API key or log in to a provider CLI).');
   }
   if (report.warnings.length > 0) {
     lines.push('');
@@ -598,46 +681,270 @@ function previewCandidate(text: string): string[] {
 }
 
 /**
- * Interactive contradiction resolver for `init` (C3 EV2/EV3) over
- * `node:readline` — a numbered-choice prompt rather than the `prompts` /
- * `@inquirer/prompts` dependency the story names, to keep PRD goal 5's
- * zero-runtime-deps promise. The use case (layer 2) stays pure; this layer-4
- * function is the only place that touches stdin. It lists each candidate
- * (provider + path + a multi-line preview) plus a final "skip / write blank"
- * option, reads one number, and maps it to a `Resolution`. An out-of-range
+ * Reads one trimmed line, given a question. A run uses a SINGLE shared
+ * implementation backed by one `node:readline` interface (see `runInit`), so
+ * the several sequential prompts on the `init --assist` path — source
+ * selection, egress consent, merge approval, then the deterministic fallback —
+ * never lose buffered input. (Opening a fresh interface per prompt and closing
+ * it discards readline's read-ahead buffer, which deadlocks piped stdin after
+ * the first prompt.)
+ */
+type Prompt = (question: string) => Promise<string>;
+
+/**
+ * Interactive contradiction resolver for `init` (C3 EV2/EV3): a numbered-choice
+ * prompt over the shared `Prompt` (no `prompts`/`@inquirer` dependency, keeping
+ * PRD goal 5's zero-runtime-deps promise). The use case (layer 2) stays pure;
+ * this layer-4 function is the only place that maps stdin to a `Resolution`. It
+ * lists each candidate (provider + path + a multi-line preview) plus a final
+ * "skip / write blank" option, reads one number, and maps it. An out-of-range
  * answer, empty input, or EOF (Ctrl-D / piped stdin exhausted) resolves to
  * `{ kind: 'unresolved' }`, which fails the run (OPT1) without writing.
  */
-function readlineResolver(io: RunIO): (contradiction: Contradiction) => Promise<Resolution> {
-  return (contradiction: Contradiction): Promise<Resolution> =>
-    new Promise<Resolution>((resolveAnswer) => {
-      const rl = createInterface({ input: process.stdin, output: io.stdout });
-      const lines: string[] = [];
-      lines.push(`Contradiction in "${contradiction.slot}" — pick the canonical answer:`);
-      contradiction.candidates.forEach((candidate, index) => {
-        const preview = previewCandidate(candidate.text);
-        lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}):`);
-        for (const previewLine of preview) {
-          lines.push(`       ${previewLine}`);
-        }
-      });
-      const skipChoice = contradiction.candidates.length + 1;
-      lines.push(`  ${skipChoice}) skip / write blank for this slot`);
-      io.stdout.write(`${lines.join('\n')}\n`);
-      rl.question(`Choice [1-${skipChoice}]: `, (answer) => {
-        rl.close();
-        const n = Number.parseInt(answer.trim(), 10);
-        if (!Number.isInteger(n) || n < 1 || n > skipChoice) {
-          resolveAnswer({ kind: 'unresolved' });
-          return;
-        }
-        if (n === skipChoice) {
-          resolveAnswer({ kind: 'skip' });
-          return;
-        }
-        resolveAnswer({ kind: 'choose', index: n - 1 });
-      });
+function readlineResolver(io: RunIO, prompt: Prompt): ContradictionResolver {
+  return async (contradiction: Contradiction): Promise<Resolution> => {
+    const lines: string[] = [];
+    lines.push(`Contradiction in "${contradiction.slot}" — pick the canonical answer:`);
+    contradiction.candidates.forEach((candidate, index) => {
+      const preview = previewCandidate(candidate.text);
+      lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}):`);
+      for (const previewLine of preview) {
+        lines.push(`       ${previewLine}`);
+      }
     });
+    const skipChoice = contradiction.candidates.length + 1;
+    lines.push(`  ${skipChoice}) skip / write blank for this slot`);
+    io.stdout.write(`${lines.join('\n')}\n`);
+    const answer = await prompt(`Choice [1-${skipChoice}]: `);
+    const n = Number.parseInt(answer.trim(), 10);
+    if (!Number.isInteger(n) || n < 1 || n > skipChoice) {
+      return { kind: 'unresolved' };
+    }
+    if (n === skipChoice) {
+      return { kind: 'skip' };
+    }
+    return { kind: 'choose', index: n - 1 };
+  };
+}
+
+/** Real CLI spawn for the subscription-session backend (execFile, never a shell). */
+const realCliSpawn: CliSpawn = (request) =>
+  new Promise((resolveResult) => {
+    const child = execFile(
+      request.binary,
+      [...request.args],
+      {
+        cwd: request.cwd,
+        env: request.env,
+        timeout: request.timeoutMs,
+        encoding: 'utf8',
+        maxBuffer: 16 * 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        // execFile reports a non-zero exit / spawn failure / timeout via `error`;
+        // surface a non-zero exitCode so the backend treats it as a failed call.
+        const code = error && typeof error.code === 'number' ? error.code : error ? 1 : 0;
+        resolveResult({ stdout: stdout ?? '', stderr: stderr ?? '', exitCode: code });
+      },
+    );
+    // Deliver the prompt on stdin so content never lands in argv or on disk.
+    child.stdin?.end(request.input);
+  });
+
+/** Provider → env var names holding an API key, in precedence order (for SDK backend). */
+const PROVIDER_API_KEY_ENV: Record<ProviderId, readonly string[]> = {
+  claude: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'],
+  codex: ['OPENAI_API_KEY'],
+  gemini: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
+  copilot: ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'],
+};
+
+/** Builds the model-talking backend for a chosen source (SDK or CLI-headless). */
+function backendForSource(
+  source: CredentialSource,
+  cwd: string,
+  model: string | null,
+): AssistBackend {
+  if (source.kind === 'api-key') {
+    const envName = PROVIDER_API_KEY_ENV[source.provider].find(
+      (name) => (process.env[name] ?? '') !== '',
+    );
+    const apiKey = envName !== undefined ? (process.env[envName] ?? '') : '';
+    if (apiKey === '') {
+      throw new AssistBackendUnavailableError(
+        `no API key found for ${source.provider} (expected one of ${PROVIDER_API_KEY_ENV[source.provider].join(', ')}).`,
+      );
+    }
+    return createSdkBackend({
+      provider: source.provider,
+      model,
+      apiKey,
+      load: (moduleName) => import(moduleName),
+    });
+  }
+  return createCliBackend({
+    provider: source.provider,
+    model,
+    repoRoot: cwd,
+    // A fresh empty scratch dir OUTSIDE the repo (Finding 1): the provider CLI
+    // cannot auto-discover the repo's CLAUDE.md / skills / hooks / MCP.
+    makeScratchDir: () => mkdtempSync(join(tmpdir(), 'hh-assist-')),
+    spawn: realCliSpawn,
+  });
+}
+
+/** A short unified-ish diff for the merge-approval prompt (EV2). */
+function renderMergeDiff(candidates: readonly CandidateText[], proposed: string): string {
+  const lines: string[] = ['AI-proposed merged text:'];
+  lines.push('────────────────────────────────────');
+  for (const line of proposed.split('\n')) {
+    lines.push(`+ ${line}`);
+  }
+  lines.push('────────────────────────────────────');
+  lines.push(`(supersedes ${candidates.length} candidate(s): ${candidates.map((c) => c.path).join(', ')})`);
+  return lines.join('\n');
+}
+
+/**
+ * Builds the `init --assist` AI resolver, or returns null to fall back to the
+ * deterministic resolver. Runs the paid-call-free discovery, proposes the
+ * sources (U4), applies the approved-endpoint policy (C5 OPT1) and the
+ * `init.assist.provider` preference, lets the user choose, builds the chosen
+ * backend, and composes `buildAiResolver` with the layer-4 egress-consent
+ * (EV3/EV4) and merge-approval (EV2) prompts. Throws a DomainError (exit 3)
+ * for OPT1 `fail` / UN2 unavailable; never returns when assist must hard-fail.
+ */
+async function buildAssistResolver(opts: {
+  cwd: string;
+  config: HarnessConfig;
+  parsed: ParsedArgs;
+  io: RunIO;
+  prompt: Prompt;
+  fallback: ContradictionResolver;
+}): Promise<ContradictionResolver | null> {
+  const { config, parsed, io, prompt, fallback, cwd } = opts;
+  const assist = config.assist;
+  const warn = (message: string): void => {
+    io.stderr.write(`harness-haircut: ${message}\n`);
+  };
+
+  // Discover, then narrow to approved endpoints (C5 OPT1) and order by the
+  // configured provider preference (pre-select only, never auto-run).
+  const endpointPolicy = { policy: assist.endpointPolicy, approved: assist.approved };
+  let sources = discoverCredentialSources(createDiscoveryProbes()).filter(
+    (source) => checkEndpointPolicy(endpointPolicy, source.provider).allowed,
+  );
+  if (assist.provider !== null) {
+    sources = [...sources].sort((a, b) => {
+      const ap = a.provider === assist.provider ? 0 : 1;
+      const bp = b.provider === assist.provider ? 0 : 1;
+      return ap - bp;
+    });
+  }
+
+  if (sources.length === 0) {
+    if (assist.onUnavailable === 'fail') {
+      throw new AssistBackendUnavailableError(
+        '--assist found no usable AI credential source. Set a provider API key ' +
+          '(e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) or log in to a ' +
+          'provider CLI (claude / codex / gemini / copilot), or drop --assist.',
+      );
+    }
+    warn('--assist found no AI credential source; using the deterministic resolver.');
+    return null;
+  }
+
+  // Propose every discovered source with its caveat (U4/EV5); the user chooses.
+  const remembered = readRememberedSource(assistStorePath());
+  io.stdout.write('AI-assist credential sources discovered (choose one):\n');
+  sources.forEach((source, index) => {
+    const isRemembered =
+      remembered !== null &&
+      remembered.provider === source.provider &&
+      remembered.kind === source.kind;
+    io.stdout.write(
+      `  ${index + 1}) ${source.provider} [${source.kind}]${isRemembered ? ' (remembered)' : ''}\n` +
+        `       ${source.detail}\n` +
+        `       caveat: ${source.caveat}\n`,
+    );
+  });
+  const skipChoice = sources.length + 1;
+  io.stdout.write(`  ${skipChoice}) none — use the deterministic resolver\n`);
+  const answer = await prompt(`Choice [1-${skipChoice}]: `);
+  const choice = Number.parseInt(answer, 10);
+  if (!Number.isInteger(choice) || choice < 1 || choice >= skipChoice) {
+    warn('no AI source selected; using the deterministic resolver.');
+    return null;
+  }
+  const source = sources[choice - 1]!;
+
+  const model =
+    typeof parsed.flags['--assist-model'] === 'string'
+      ? (parsed.flags['--assist-model'] as string)
+      : assist.model;
+
+  let backend: AssistBackend;
+  try {
+    backend = backendForSource(source, cwd, model);
+  } catch (err) {
+    if (err instanceof DomainError) {
+      throw err; // UN2 — surfaced as exit 3 by the caller.
+    }
+    throw err;
+  }
+
+  // Remember the choice (kind + provider only) per-machine for next time.
+  try {
+    writeRememberedSource(assistStorePath(), { provider: source.provider, kind: source.kind });
+  } catch {
+    // Persistence is best-effort; a read-only home must not break --assist.
+  }
+
+  const egressFlags: EgressFlags = {
+    include: parsed.repeated['--assist-include'] ?? [],
+    optInPaths: [],
+    allowSecretRules: parsed.repeated['--assist-allow-secret'] ?? [],
+  };
+  const assistYes = parsed.flags['--assist-yes'] === true;
+  const showPreview = parsed.flags['--no-preview'] !== true;
+  let consentRemembered = false;
+
+  // EV3/EV4 — print the (non-suppressible) disclosure + optional preview, then
+  // require an explicit affirmative. A run-level "yes" (or --assist-yes) skips
+  // re-prompting but STILL prints the file list/counts/summary (UN2).
+  const confirmEgress = async (plan: EgressPlan, destination: EgressDestination): Promise<boolean> => {
+    io.stdout.write(renderEgressDisclosure(plan, destination));
+    if (showPreview) {
+      io.stdout.write(renderEgressPreview(plan));
+    }
+    if (assistYes || consentRemembered) {
+      io.stdout.write('egress consent: pre-approved for this run.\n');
+      return true;
+    }
+    const reply = await prompt(EGRESS_CONSENT_PROMPT);
+    const yes = reply.toLowerCase() === 'y' || reply.toLowerCase() === 'yes';
+    if (yes) {
+      consentRemembered = true;
+    }
+    return yes;
+  };
+
+  // EV2 — show the proposed merge and require explicit approval; decline → fallback.
+  const approveMerge = async (
+    _slot: string,
+    proposedText: string,
+    candidates: readonly CandidateText[],
+  ): Promise<boolean> => {
+    io.stdout.write(`${renderMergeDiff(candidates, proposedText)}\n`);
+    const reply = await prompt('Write this merged text? [y/N]: ');
+    return reply.toLowerCase() === 'y' || reply.toLowerCase() === 'yes';
+  };
+
+  warn(
+    `AI-assist enabled via ${source.provider} [${source.kind}]; ` +
+      'every send is disclosed and every merge is human-approved.',
+  );
+  return buildAiResolver({ backend, egressFlags, confirmEgress, approveMerge, fallback, warn });
 }
 
 async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
@@ -648,10 +955,36 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const json = parsed.flags['--json'] === true;
   const dryRun = parsed.flags['--dry-run'] === true;
   const nonInteractive = parsed.flags['--non-interactive'] === true;
+  const assistRequested = parsed.flags['--assist'] === true;
+
+  // A SINGLE readline interface for the whole run, created lazily on the first
+  // prompt and closed once in `finally`. Reusing one interface (rather than
+  // opening/closing one per prompt) keeps the several sequential `init --assist`
+  // prompts from losing readline's buffered read-ahead.
+  let rl: ReturnType<typeof createInterface> | undefined;
+  const prompt: Prompt = (question) => {
+    rl ??= createInterface({ input: process.stdin, output: io.stdout });
+    return new Promise<string>((resolveAnswer) => {
+      rl!.question(question, (answer) => resolveAnswer(answer.trim()));
+    });
+  };
 
   let report: InitReport;
   try {
     const config = await readConfig(cwd, configFlag);
+    const assistEnabled = assistRequested || config.assist.enabled;
+
+    // OPT2 — `--assist` (or config-enabled assist) needs interaction (source
+    // selection + merge approval), so it fails CLOSED under --non-interactive
+    // rather than silently auto-selecting a source or auto-accepting a merge.
+    if (assistEnabled && nonInteractive) {
+      io.stderr.write(
+        'harness-haircut: --assist cannot be combined with --non-interactive ' +
+          '(credential selection and merge approval both require prompts).\n',
+      );
+      return 1;
+    }
+
     const reader = createProviderFileReader(cwd);
     const writer = createFileWriter(cwd);
     const enabled = enabledProviders(config);
@@ -663,17 +996,28 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       }
       return ctx;
     };
+
+    // Resolver selection: --non-interactive uses the unresolved stub (the use
+    // case fails first on any contradiction); assist (interactive) discovers,
+    // proposes, and wires the AI resolver over a deterministic fallback;
+    // otherwise the plain readline numbered-choice prompt.
+    let resolveContradiction: ContradictionResolver;
+    if (nonInteractive) {
+      resolveContradiction = () => Promise.resolve<Resolution>({ kind: 'unresolved' });
+    } else if (assistEnabled) {
+      const fallback = readlineResolver(io, prompt);
+      resolveContradiction =
+        (await buildAssistResolver({ cwd, config, parsed, io, prompt, fallback })) ?? fallback;
+    } else {
+      resolveContradiction = readlineResolver(io, prompt);
+    }
+
     report = await init({
       snapshot: () => readInitSnapshot(cwd),
       reader,
       writer,
       adapters,
-      // --non-interactive never reaches a prompt (the use case fails first on
-      // any contradiction), so a no-prompt stub is correct there; otherwise
-      // wire the readline numbered-choice prompt.
-      resolveContradiction: nonInteractive
-        ? () => Promise.resolve<Resolution>({ kind: 'unresolved' })
-        : readlineResolver(io),
+      resolveContradiction,
       // C3 reuses C2. init has just written canonical files, so the tree is
       // expected dirty during onboarding — apply runs with allowDirty so the
       // freshly-written canonical layout is projected. The init-level prompt
@@ -702,6 +1046,8 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
     }
     throw err;
+  } finally {
+    rl?.close();
   }
 
   if (json) {

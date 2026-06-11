@@ -55,9 +55,18 @@ export interface Contradiction {
  * `candidates[index]`; `{ kind: 'skip' }` writes nothing for the slot;
  * `{ kind: 'unresolved' }` signals the resolver could not decide (e.g.
  * `--non-interactive`), which fails the run (OPT1, exit 1).
+ *
+ * `{ kind: 'merge', text }` (C4, #28) is the AI-assist outcome: the resolver
+ * proposed — and the human approved (EV2) — a single MERGED canonical text
+ * that supersedes ALL candidates. The use case writes `text` verbatim for the
+ * slot and backs up every original candidate (none was "chosen", so F2's
+ * no-silent-loss backup still applies to all of them). A deterministic
+ * resolver never returns this; only the injected `aiResolver` does, and only
+ * after the egress/consent gate and an explicit human approval.
  */
 export type Resolution =
   | { kind: 'choose'; index: number }
+  | { kind: 'merge'; text: string }
   | { kind: 'skip' }
   | { kind: 'unresolved' };
 

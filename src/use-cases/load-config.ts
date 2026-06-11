@@ -14,6 +14,33 @@ import { InvalidConfigError } from '../entities/errors.js';
 
 export type GeminiMode = 'settings' | 'shim';
 
+/** OPT1 behavior when `init --assist` discovers no usable credential source. */
+export type AssistOnUnavailable = 'fallback' | 'fail';
+
+/** C5 OPT1 endpoint posture; `approved-only` is recommended for corp installs. */
+export type AssistEndpointPolicy = 'any' | 'approved-only';
+
+/**
+ * C4 (#28) / PRD §17 AI-assist policy — team-shared, NON-secret knobs only.
+ * The per-developer credential CHOICE is never stored here (it lives in a
+ * gitignored, user-local file). All fields have safe defaults so omitting the
+ * `init.assist` block leaves assist OFF.
+ */
+export interface AssistConfig {
+  /** Whether `init` may use the AI resolver without the `--assist` flag. */
+  enabled: boolean;
+  /** OPT1: on no discovered source, fall back to deterministic (default) or fail. */
+  onUnavailable: AssistOnUnavailable;
+  /** C5 OPT1: restrict egress to an approved provider/endpoint allowlist. */
+  endpointPolicy: AssistEndpointPolicy;
+  /** Approved provider ids when `endpointPolicy === 'approved-only'`. */
+  approved: ProviderId[];
+  /** Optional preferred provider — pre-selects in discovery, never overrides it. */
+  provider: ProviderId | null;
+  /** Optional model override (else CLI-default for session / balanced-tier for SDK). */
+  model: string | null;
+}
+
 export interface HarnessConfig {
   /** Providers explicitly listed as enabled; `null` means "all four". */
   providers: ProviderId[] | null;
@@ -24,9 +51,22 @@ export interface HarnessConfig {
   /** Reserved for C2 (`apply`); parsed here so the schema validates whole. */
   writeGitignore: boolean;
   gemini: { mode: GeminiMode };
+  /** C4 AI-assist policy (PRD §17); defaults leave assist disabled. */
+  assist: AssistConfig;
 }
 
 const ALL_PROVIDERS: readonly ProviderId[] = ['copilot', 'claude', 'codex', 'gemini'];
+
+export function defaultAssistConfig(): AssistConfig {
+  return {
+    enabled: false,
+    onUnavailable: 'fallback',
+    endpointPolicy: 'any',
+    approved: [],
+    provider: null,
+    model: null,
+  };
+}
 
 export function defaultConfig(): HarnessConfig {
   return {
@@ -35,6 +75,7 @@ export function defaultConfig(): HarnessConfig {
     warningsAsErrors: false,
     writeGitignore: true,
     gemini: { mode: 'settings' },
+    assist: defaultAssistConfig(),
   };
 }
 
@@ -136,7 +177,82 @@ export function loadConfig(raw: string | null, path = 'harness-haircut.config.js
     }
   }
 
+  // C4 AI-assist policy: `init.assist` may be `true` (enable with defaults) or
+  // an object of non-secret knobs. The per-developer credential CHOICE is
+  // never read from here — only team-shareable policy.
+  const init = obj['init'];
+  if (init !== undefined) {
+    if (init === null || typeof init !== 'object' || Array.isArray(init)) {
+      throw new InvalidConfigError(path, '"init" must be an object');
+    }
+    config.assist = readAssistConfig((init as Record<string, unknown>)['assist'], path);
+  }
+
   return config;
+}
+
+function readAssistConfig(value: unknown, path: string): AssistConfig {
+  const assist = defaultAssistConfig();
+  if (value === undefined) {
+    return assist;
+  }
+  // Shorthand: `"assist": true` enables with all defaults.
+  if (typeof value === 'boolean') {
+    assist.enabled = value;
+    return assist;
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InvalidConfigError(path, '"init.assist" must be a boolean or an object');
+  }
+  const obj = value as Record<string, unknown>;
+  assist.enabled = readBoolean(obj['enabled'], 'init.assist.enabled', path, assist.enabled);
+
+  const onUnavailable = obj['onUnavailable'];
+  if (onUnavailable !== undefined) {
+    if (onUnavailable !== 'fallback' && onUnavailable !== 'fail') {
+      throw new InvalidConfigError(
+        path,
+        `"init.assist.onUnavailable" must be "fallback" or "fail", got ${JSON.stringify(onUnavailable)}`,
+      );
+    }
+    assist.onUnavailable = onUnavailable;
+  }
+
+  const endpointPolicy = obj['endpointPolicy'];
+  if (endpointPolicy !== undefined) {
+    if (endpointPolicy !== 'any' && endpointPolicy !== 'approved-only') {
+      throw new InvalidConfigError(
+        path,
+        `"init.assist.endpointPolicy" must be "any" or "approved-only", got ${JSON.stringify(endpointPolicy)}`,
+      );
+    }
+    assist.endpointPolicy = endpointPolicy;
+  }
+
+  if (obj['approved'] !== undefined) {
+    assist.approved = readProviderArray(obj['approved'], 'init.assist.approved', path);
+  }
+
+  const provider = obj['provider'];
+  if (provider !== undefined && provider !== null) {
+    if (!isProviderId(provider)) {
+      throw new InvalidConfigError(
+        path,
+        `"init.assist.provider" must be a provider id (${ALL_PROVIDERS.join(', ')}), got ${JSON.stringify(provider)}`,
+      );
+    }
+    assist.provider = provider;
+  }
+
+  const model = obj['model'];
+  if (model !== undefined && model !== null) {
+    if (typeof model !== 'string' || model === '') {
+      throw new InvalidConfigError(path, '"init.assist.model" must be a non-empty string');
+    }
+    assist.model = model;
+  }
+
+  return assist;
 }
 
 /**

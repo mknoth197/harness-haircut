@@ -21,6 +21,20 @@ import { DomainError } from '../entities/errors.js';
 import { loadConfig } from './load-config.js';
 import type { HarnessConfig } from './load-config.js';
 
+/**
+ * A discovered AI-assist credential source, reported by `doctor` for
+ * visibility (C4 acceptance). Mirrors the gateway's `CredentialSource` shape
+ * without importing layer 3 — the composition root runs the (paid-call-free)
+ * discovery and passes the result in, so `doctor` stays a pure use case and
+ * never makes a model call.
+ */
+export interface DoctorAssistSource {
+  provider: string;
+  kind: string;
+  caveat: string;
+  detail: string;
+}
+
 export interface DoctorReport {
   /** The harness-haircut package version (injected from package.json). */
   version: string;
@@ -34,6 +48,11 @@ export interface DoctorReport {
   config: HarnessConfig | null;
   /** Human-readable environment/config warnings (e.g. an invalid config). */
   warnings: string[];
+  /**
+   * AI-assist credential sources discovered on this machine (C4) — empty when
+   * none, or when assist discovery was not run. Reported, never acted on.
+   */
+  assistSources: DoctorAssistSource[];
   /** PRD §7: 0 healthy · 3 invalid config. */
   exitCode: 0 | 3;
 }
@@ -60,6 +79,11 @@ export interface DoctorDeps {
    * a config that is not there — doctor surfaces it as a warning.
    */
   explicitConfigMissing?: boolean;
+  /**
+   * AI-assist sources discovered by the composition root (paid-call-free); the
+   * use case just reports them. Omitted → reported as empty (no discovery run).
+   */
+  assistSources?: DoctorAssistSource[];
 }
 
 export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
@@ -104,6 +128,7 @@ export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
     detectedProviders,
     config,
     warnings,
+    assistSources: deps.assistSources ?? [],
     exitCode,
   };
 }

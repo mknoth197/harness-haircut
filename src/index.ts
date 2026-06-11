@@ -31,6 +31,46 @@ export { instructionSourceEntry, skillSourceEntry } from './adapters/source-mani
 export { readRepoSnapshot, readInitSnapshot } from './gateways/filesystem.js';
 export { createProviderFileReader } from './gateways/provider-files.js';
 
+export {
+  discoverCredentialSources,
+  createDiscoveryProbes,
+} from './gateways/ai-credentials.js';
+export type {
+  CredentialSource,
+  CredentialKind,
+  DiscoveryProbes,
+} from './gateways/ai-credentials.js';
+export { buildAiResolver } from './gateways/ai-resolver.js';
+export type {
+  AssistBackend,
+  AssistRequest,
+  AssistProposal,
+  AiResolverDeps,
+} from './gateways/ai-resolver.js';
+export {
+  buildAssistPrompt,
+  parseAssistResponse,
+  cliInvocation,
+  curatedEnv,
+  createCliBackend,
+  createSdkBackend,
+  AssistBackendUnavailableError,
+} from './gateways/assist-backends.js';
+export type {
+  CliSpawn,
+  CliSpawnRequest,
+  CliSpawnResult,
+  CliBackendConfig,
+  SdkBackendConfig,
+  SdkLoader,
+} from './gateways/assist-backends.js';
+export {
+  assistStorePath,
+  readRememberedSource,
+  writeRememberedSource,
+} from './gateways/assist-persistence.js';
+export type { RememberedSource } from './gateways/assist-persistence.js';
+
 export { parseRepo } from './use-cases/parse-repo.js';
 export type { ParseRepoDeps, ParseRepoResult } from './use-cases/parse-repo.js';
 
@@ -73,10 +113,16 @@ export {
 export type { InMemoryPrecommitGateway } from './gateways/precommit.js';
 
 export { doctor } from './use-cases/doctor.js';
-export type { DoctorReport, DoctorDeps } from './use-cases/doctor.js';
+export type { DoctorReport, DoctorDeps, DoctorAssistSource } from './use-cases/doctor.js';
 
 export { isWorkingTreeDirty } from './gateways/git.js';
 export { createFileWriter } from './gateways/fs-writer.js';
 
-export { loadConfig, defaultConfig, enabledProviders } from './use-cases/load-config.js';
-export type { HarnessConfig, GeminiMode } from './use-cases/load-config.js';
+export { loadConfig, defaultConfig, defaultAssistConfig, enabledProviders } from './use-cases/load-config.js';
+export type {
+  HarnessConfig,
+  GeminiMode,
+  AssistConfig,
+  AssistOnUnavailable,
+  AssistEndpointPolicy,
+} from './use-cases/load-config.js';
