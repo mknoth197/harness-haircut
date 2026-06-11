@@ -71,6 +71,7 @@ Each file in this directory is one user story written in EARS syntax (Easy Appro
 | 12 | I1 | [CI integration](11-I1-ci-integration.md) | C1, C2 |
 | 13 | I2 | [npm distribution](12-I2-npm-distribution.md) | everything |
 | 14 | C4 | [AI-assisted init merge (optional, post-v1)](13-C4-ai-assisted-init.md) | C3 |
+| 15 | C5 | [Assist egress redaction & guardrails (security gate for C4)](14-C5-assist-egress-redaction.md) | C4 |
 
 ## Parallelization notes
 
