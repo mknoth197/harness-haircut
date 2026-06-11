@@ -297,4 +297,32 @@ describe('isIgnored (pure matcher)', () => {
     assert.equal(ignored('**/logs\n', 'logs', true), true);
     assert.equal(ignored('**/logs\n', 'a/b/logs', true), true);
   });
+
+  // SECURITY (FIX 4): an attacker-controlled root .gitignore could pack a line
+  // with hundreds of wildcards to trigger super-linear regex backtracking. Such
+  // a line is skipped (never compiled), so it neither hangs nor takes effect,
+  // while normal patterns alongside it still work.
+  it('skips a pathological wildcard-heavy line without compiling or hanging', () => {
+    const pathological = `${'*'.repeat(200)}\n`;
+    const patterns = parseGitignore(pathological);
+    assert.equal(patterns.length, 0, 'the wildcard bomb compiled to no pattern');
+    // A path that the (skipped) bomb would have matched is NOT ignored.
+    assert.equal(ignored(pathological, 'a/b/c/d/e.txt'), false);
+    // Evaluating it must return quickly (no catastrophic backtracking).
+    const start = Date.now();
+    ignored(pathological, 'a'.repeat(80));
+    assert.ok(Date.now() - start < 1000, 'matcher returned promptly');
+  });
+
+  it('skips an over-long .gitignore line but keeps a normal one alongside it', () => {
+    const gitignore = `${'a'.repeat(2000)}\n*.bak\n`;
+    const patterns = parseGitignore(gitignore);
+    assert.equal(patterns.length, 1, 'only the normal pattern compiled');
+    assert.equal(ignored(gitignore, 'x.bak'), true);
+  });
+
+  it('still compiles a legitimate pattern with a handful of wildcards', () => {
+    // A realistic multi-wildcard pattern stays under the cap and works.
+    assert.equal(ignored('build/**/*.min.*\n', 'build/a/b/x.min.js'), true);
+  });
 });

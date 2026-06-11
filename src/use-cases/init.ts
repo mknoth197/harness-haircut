@@ -49,6 +49,7 @@ import type {
   RepoSnapshot,
 } from '../entities/adapter.js';
 import type { Attachment } from '../entities/ir.js';
+import { isSafeName } from '../entities/ir.js';
 import type { ApplyReport } from './apply.js';
 import type {
   CandidateText,
@@ -269,14 +270,29 @@ function skillNameFromPath(path: string, prefix: string): string | null {
  * Discovers skills across the provider skill roots, keyed by name. The first
  * root to define a name wins as the canonical content; same-name skills from a
  * later root are recorded so the caller can detect a body conflict.
+ *
+ * SECURITY: a skill name becomes an emit path segment (`.agents/skills/<name>/`
+ * and downstream `.claude/skills/<name>/`), so every discovered name is gated
+ * through the same safe-name rule `parseRepo` enforces (`isSafeName`). An
+ * unsafe name (path traversal, frontmatter-breaking chars) is dropped here and
+ * its source path returned in `rejected` so the caller can note it rather than
+ * writing a partial canonical layout that `apply` would then reject.
  */
-function discoverSkills(snapshot: RepoSnapshot): Map<string, DiscoveredSkill[]> {
+function discoverSkills(snapshot: RepoSnapshot): {
+  byName: Map<string, DiscoveredSkill[]>;
+  rejected: string[];
+} {
   const byName = new Map<string, DiscoveredSkill[]>();
+  const rejected: string[] = [];
   const sorted = [...snapshot.files].sort(byPath);
   for (const root of SKILL_SOURCE_ROOTS) {
     for (const file of sorted) {
       const name = skillNameFromPath(file.path, root.prefix);
       if (name === null) {
+        continue;
+      }
+      if (!isSafeName(name)) {
+        rejected.push(file.path);
         continue;
       }
       const folder = `${root.prefix}${name}`;
@@ -301,7 +317,7 @@ function discoverSkills(snapshot: RepoSnapshot): Map<string, DiscoveredSkill[]> 
       }
     }
   }
-  return byName;
+  return { byName, rejected };
 }
 
 /**
@@ -315,9 +331,11 @@ function discoverSkills(snapshot: RepoSnapshot): Map<string, DiscoveredSkill[]> 
 function discoverFragments(snapshot: RepoSnapshot): {
   byName: Map<string, DiscoveredFragment[]>;
   unparseable: string[];
+  rejected: string[];
 } {
   const byName = new Map<string, DiscoveredFragment[]>();
   const unparseable: string[] = [];
+  const rejected: string[] = [];
   const sorted = [...snapshot.files].sort(byPath);
   for (const root of FRAGMENT_SOURCE_ROOTS) {
     for (const file of sorted) {
@@ -330,6 +348,13 @@ function discoverFragments(snapshot: RepoSnapshot): {
         continue;
       }
       const name = fragmentNameFromSource(file.path);
+      // SECURITY: the fragment name becomes `.agents/instructions/<name>.md`,
+      // so it is gated through the same safe-name rule as skills/parseRepo. An
+      // unsafe name (derived from a hostile filename) is dropped + reported.
+      if (!isSafeName(name)) {
+        rejected.push(file.path);
+        continue;
+      }
       const discovered: DiscoveredFragment = {
         name,
         providerId: root.providerId,
@@ -345,7 +370,7 @@ function discoverFragments(snapshot: RepoSnapshot): {
       }
     }
   }
-  return { byName, unparseable };
+  return { byName, unparseable, rejected };
 }
 
 /** Canonical `.agents/instructions/<name>.md` text: a `scope:` frontmatter over the body. */
@@ -416,9 +441,12 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- step 3: build candidate canonical IR by union ----
   const rootCandidates = gatherRootCandidates(deps.reader);
-  const skillsByName = discoverSkills(snapshot);
-  const { byName: fragmentsByName, unparseable: unparseableFragments } =
-    discoverFragments(snapshot);
+  const { byName: skillsByName, rejected: rejectedSkills } = discoverSkills(snapshot);
+  const {
+    byName: fragmentsByName,
+    unparseable: unparseableFragments,
+    rejected: rejectedFragments,
+  } = discoverFragments(snapshot);
 
   // ---- step 4: identify contradictions (EV1 agree → none; EV2 disagree) ----
   const contradictions: Contradiction[] = [];
@@ -614,6 +642,24 @@ export async function init(deps: InitDeps): Promise<InitReport> {
         `(${unparseableFragments.sort().join(', ')}) — no applyTo:/paths: frontmatter to derive a ` +
         'scope from. They were left in place; add `scope:` frontmatter under .agents/instructions/ ' +
         'by hand and re-run `harness-haircut apply` to bring them under canonical ownership.',
+    );
+  }
+  // FIX 2(a): a discovered skill/fragment whose name is not a safe path segment
+  // is skipped BEFORE any write (never partially written then failed at apply),
+  // and surfaced here so the source is never dropped silently (PRD goal 3).
+  if (rejectedSkills.length > 0) {
+    notes.push(
+      `skipped ${rejectedSkills.length} skill(s) with an unsafe name ` +
+        `(${rejectedSkills.sort().join(', ')}) — skill folder names must match ` +
+        '^[a-z0-9]+(-[a-z0-9]+)*$ to be safe as canonical path segments. Rename the ' +
+        'folder(s) and re-run `harness-haircut init`.',
+    );
+  }
+  if (rejectedFragments.length > 0) {
+    notes.push(
+      `skipped ${rejectedFragments.length} scoped instruction file(s) with an unsafe ` +
+        `derived name (${rejectedFragments.sort().join(', ')}) — the canonical fragment name ` +
+        'must match ^[a-z0-9]+(-[a-z0-9]+)*$. Rename the file(s) and re-run `harness-haircut init`.',
     );
   }
 

@@ -15,13 +15,38 @@
  * crosses the layer boundary (architecture rules); a directory at the path,
  * like a missing file, reads as `null`.
  */
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ProviderFileReader } from '../entities/adapter.js';
 import { FileSystemError } from '../entities/errors.js';
 
 function toAbsolute(root: string, relPath: string): string {
   return join(root, ...relPath.split('/'));
+}
+
+/**
+ * SECURITY: never read *through* a symlink. `init` reads the fixed
+ * root-instruction paths (AGENTS.md, CLAUDE.md, GEMINI.md,
+ * .github/copilot-instructions.md) through this reader and recovers their
+ * content into canonical AGENTS.md, which is then projected into every
+ * provider file and committed. A malicious repo could point one of those
+ * paths at, e.g., ~/.ssh/id_rsa or ~/.aws/credentials; `readFileSync` follows
+ * symlinks and would exfiltrate the target. So we `lstat` first and treat any
+ * symlink as ABSENT (return null / exists=false) — exactly how the snapshot
+ * walk in `filesystem.ts` skips symlinked entries. A missing path (ENOENT)
+ * also has no link, so this is purely additive over the prior behavior.
+ */
+function isSymlink(abs: string): boolean {
+  try {
+    return lstatSync(abs).isSymbolicLink();
+  } catch (err) {
+    // ENOENT (nothing there) → not a symlink; any other error surfaces below
+    // when the real read/stat is attempted (or via FileSystemError).
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw new FileSystemError(abs, err);
+  }
 }
 
 /**
@@ -34,6 +59,10 @@ export function createProviderFileReader(root: string): ProviderFileReader {
   return {
     read(relPath: string): string | null {
       const abs = toAbsolute(root, relPath);
+      // SECURITY: a symlink reads as absent — never follow it (see isSymlink).
+      if (isSymlink(abs)) {
+        return null;
+      }
       let content: string;
       try {
         content = readFileSync(abs, 'utf8');
@@ -50,6 +79,11 @@ export function createProviderFileReader(root: string): ProviderFileReader {
     },
     exists(relPath: string): boolean {
       const abs = toAbsolute(root, relPath);
+      // SECURITY: a symlink (even one pointing at a real file) is reported as
+      // absent so callers never act on a link they would refuse to read.
+      if (isSymlink(abs)) {
+        return false;
+      }
       try {
         return existsSync(abs) && statSync(abs).isFile();
       } catch (err) {

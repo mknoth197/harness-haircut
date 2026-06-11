@@ -48,9 +48,38 @@ export interface IgnorePattern {
  *   - nested .gitignore files and $GIT_DIR/info/exclude are not consulted
  *     (root .gitignore only)
  */
+/**
+ * SECURITY (ReDoS cap): a root `.gitignore` is attacker-controlled when
+ * onboarding an untrusted repo. The hand-rolled glob-to-regex compiler emits a
+ * single-segment or multi-segment matcher group per `*` / `**`; a line with
+ * very many wildcards can produce a regex that backtracks super-linearly.
+ * Lines that are implausibly long, or that pack in an unreasonable number of
+ * wildcard chars, cannot be a real ignore rule — so we skip them (uncompiled)
+ * rather than risk a hang. Generous limits keep every legitimate pattern working.
+ */
+const MAX_GITIGNORE_LINE_LENGTH = 1000;
+const MAX_GITIGNORE_WILDCARDS = 50;
+
+function tooComplexToCompile(line: string): boolean {
+  if (line.length > MAX_GITIGNORE_LINE_LENGTH) {
+    return true;
+  }
+  let wildcards = 0;
+  for (const ch of line) {
+    if (ch === '*') {
+      wildcards++;
+    }
+  }
+  return wildcards > MAX_GITIGNORE_WILDCARDS;
+}
+
 function compilePattern(line: string): IgnorePattern | null {
   const trimmed = line.trim();
   if (trimmed === '' || trimmed.startsWith('#')) {
+    return null;
+  }
+  // SECURITY: skip a pathological line before it reaches the regex compiler.
+  if (tooComplexToCompile(trimmed)) {
     return null;
   }
   let pattern = trimmed;

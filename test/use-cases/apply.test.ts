@@ -294,6 +294,56 @@ describe('apply() — UN2 malformed merge-key target', () => {
   });
 });
 
+describe('apply() — prototype-pollution guard (FIX 3, security hardening)', () => {
+  it('rejects a merge key containing __proto__ and does not pollute Object.prototype', async () => {
+    const repo = await setup(CANONICAL);
+    const reader = createProviderFileReader(repo.root);
+    const writer = createFileWriter(repo.root);
+    // A synthetic merge-key adapter whose mergeKey carries a __proto__ segment.
+    const pollutingAdapter = {
+      id: 'codex' as ProviderId,
+      project: () => ({
+        files: [
+          {
+            path: 'evil.json',
+            body: JSON.stringify({ polluted: true }),
+            mode: 'merge-key' as const,
+            mergeKey: '__proto__.polluted',
+          },
+        ],
+        warnings: [],
+        surfaces: {
+          instructions: 'native' as const,
+          skills: 'native' as const,
+          hooks: 'native' as const,
+        },
+      }),
+      detectExisting: () => null,
+    };
+    await assert.rejects(
+      () =>
+        apply({
+          parse: () => parseRepo({ readRepo: () => readRepoSnapshot(repo.root) }),
+          adapters: [pollutingAdapter],
+          reader,
+          writer,
+          contextFor: contextFactory(repo.root, reader),
+          isDirty: () => Promise.resolve(false),
+          confirm: () => Promise.resolve(false),
+          readState: () => parseState(reader.read(APPLY_STATE_PATH)),
+          writeState: () => {},
+          flags: { allowDirty: false, dryRun: false, nonInteractive: false },
+        }),
+      (err: unknown) =>
+        err instanceof Error &&
+        (err as { exitCode?: number }).exitCode === 3 &&
+        /__proto__/.test(err.message),
+    );
+    // Object.prototype was not polluted by the rejected merge.
+    assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
+  });
+});
+
 describe('apply() — STATE1 dirty tree', () => {
   it('refuses with exit 1 on a dirty tree without --allow-dirty (writes nothing)', async () => {
     const repo = await setup(CANONICAL);

@@ -46,7 +46,11 @@ import type {
 } from '../entities/adapter.js';
 import type { ApplyState } from '../entities/apply-state.js';
 import { classifyHeaderless, contentHash } from '../entities/apply-state.js';
-import { EmitPathCollisionError, MalformedProviderConfigError } from '../entities/errors.js';
+import {
+  EmitPathCollisionError,
+  MalformedProviderConfigError,
+  UnsafeMergeKeyError,
+} from '../entities/errors.js';
 import type { FileWriter } from '../entities/file-writer.js';
 import type { IR } from '../entities/ir.js';
 import { detectHeaderPlacement, verifyAgainstExpected } from '../entities/signed-source.js';
@@ -128,6 +132,7 @@ function resolveOwnedValue(
   mergeKey: string,
 ): { found: boolean; value: unknown } {
   const segments = mergeKey.split('.');
+  assertSafeMergeKey(mergeKey, segments); // never read through __proto__/constructor
   let current: unknown = root;
   for (const segment of segments) {
     if (current === null || typeof current !== 'object' || Array.isArray(current)) {
@@ -142,9 +147,26 @@ function resolveOwnedValue(
   return { found: true, value: current };
 }
 
+/**
+ * SECURITY (prototype-pollution guard): forbid dot-path segments that would
+ * let a setter walk onto `Object.prototype` / a constructor. The merge key is
+ * a constant today, so this is latent defense — but assigning through e.g.
+ * `__proto__.polluted` would corrupt every object in the process.
+ */
+const FORBIDDEN_SEGMENTS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function assertSafeMergeKey(mergeKey: string, segments: readonly string[]): void {
+  for (const segment of segments) {
+    if (FORBIDDEN_SEGMENTS.has(segment)) {
+      throw new UnsafeMergeKeyError(mergeKey, segment);
+    }
+  }
+}
+
 /** Sets a dot-path value, creating intermediate objects, preserving siblings. */
 function setOwnedValue(root: Record<string, unknown>, mergeKey: string, value: unknown): void {
   const segments = mergeKey.split('.');
+  assertSafeMergeKey(mergeKey, segments); // reject __proto__/constructor/prototype
   let cursor = root;
   for (let i = 0; i < segments.length - 1; i++) {
     const seg = segments[i]!;
