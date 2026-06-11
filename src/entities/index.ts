@@ -7,3 +7,6 @@ export * from './file-writer.js';
 export * from './apply-state.js';
 export * from './contradiction.js';
 export * from './instruction-source.js';
+export * from './secret-scan.js';
+export * from './egress-policy.js';
+export * from './egress-disclosure.js';
