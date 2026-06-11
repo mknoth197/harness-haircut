@@ -10,9 +10,9 @@
 
 | Class | Egress default | Why |
 |---|---|---|
-| `AGENTS.md` (root+nested), `.agents/instructions/**`, `.github/instructions/**`, `.claude/rules/**` | **ALLOW** (prose) | The only thing the merge reasons about. |
-| `.agents/skills/**/SKILL.md` body | **OPT-IN** | Skill bodies embed example calls / internal URLs / tokens. |
-| `.agents/skills/**` sibling attachments | **HARD DENY** | Scripts/assets/`.env`; highest secret density. |
+| `AGENTS.md` (root+nested), root `CLAUDE.md`/`GEMINI.md`/`.github/copilot-instructions.md`, `.agents/instructions/**`, `.github/instructions/**`, `.claude/rules/**` | **ALLOW** (prose) | The only thing the merge reasons about. `CLAUDE.md`/`GEMINI.md` are root-only shims — a *nested* `CLAUDE.md`/`GEMINI.md` is not a thing this tool emits, so it is **not** prose-by-path (it denies via the catch-all). |
+| `{.agents,.claude,.codex}/skills/<name>/SKILL.md` body | **OPT-IN** | Skill bodies embed example calls / internal URLs / tokens. |
+| `**/skills/**` sibling attachments | **HARD DENY** | Scripts/assets/`.env`; highest secret density. Classification is **segment-aware**: any path through a `skills`/`hooks` directory, or through a `.harness-haircut-init-backup` segment at any depth, hard-denies regardless of a prose-looking basename. |
 | `.agents/hooks/**` (`*.sh`,`*.js`) | **HARD DENY** | Executable; deploy creds, internal hosts. |
 | `.claude/settings.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/settings.json` | **HARD DENY** | env / tokens / MCP URLs. |
 | `.agents/.harness-state.json`, `.harness-haircut-init-backup/**` | **HARD DENY** | Tool bookkeeping / unchosen backups. |
@@ -22,7 +22,9 @@ Enforce on the **resolver candidate bytes** (`root-instructions`/`fragment:*` = 
 
 ## Secret scan before send — hard block by default (C5)
 
-Runs on **every byte that would leave** (an allowlisted `AGENTS.md` can still carry a token — this very repo's docs reference a corporate email, `CLAUDE_TOKEN`, an internal CA). High-confidence rules hard-block the run (AWS `AKIA…`, PEM private keys, JWT, `ghp_/gho_/…`, `glpat-`, Slack `xox*`, Google `AIza…`, OpenAI `sk-…`, Anthropic `sk-ant-…`, npm tokens, high-entropy strings adjacent to `token|secret|password|api_key|credential`). Medium (internal IPs/hosts, emails) → WARN. `--assist-allow-secret <rule>` downgrades block → redaction with a stable `[REDACTED:<rule>]` placeholder. Default is block, not redact.
+Runs on **every byte that would leave** (an allowlisted `AGENTS.md` can still carry a token — this very repo's docs reference a corporate email, `CLAUDE_TOKEN`, an internal CA). High-confidence rules hard-block the run (AWS `AKIA…`, PEM private keys, JWT, `ghp_/gho_/…`, `glpat-`, Slack `xox*`, Google `AIza…`, OpenAI `sk-…`, Anthropic `sk-ant-…`, npm tokens, long hex secrets and high-entropy strings adjacent to `token|secret|passwd|password|api[_-]?key|credential`). Medium (internal IPs/hosts, emails) → WARN. `--assist-allow-secret <rule>` downgrades block → redaction with a stable `[REDACTED:<rule>]` placeholder. Default is block, not redact.
+
+Detection is hardened against trivial evasion (C5 review): the shape rules match their distinctive prefix even when a token is glued immediately after a word char (no leading `\b`); a format/zero-width-char (`\p{Cf}`) pre-pass stops an invisible char from splitting a token; keyword adjacency spans the candidate's line **plus the line above** with LF/CRLF/CR normalized; and a dedicated long-hex rule catches 64-hex CI tokens that sit just under the entropy floor. (Homoglyph-substituted credentials remain the inherent limit of a regex scanner — a tracked follow-up, not v1-blocking.)
 
 ## CLI-session must not amplify (Finding 1 — High)
 
