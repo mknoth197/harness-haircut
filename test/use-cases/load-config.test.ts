@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadConfig, defaultConfig, enabledProviders } from '../../dist/index.js';
+import { loadConfig, defaultConfig, defaultAssistConfig, enabledProviders } from '../../dist/index.js';
 import { InvalidConfigError } from '../../dist/index.js';
 
 describe('loadConfig — defaults', () => {
@@ -80,5 +80,115 @@ describe('loadConfig — invalid input', () => {
       () => loadConfig('{"gemini":{"mode":"yaml"}}'),
       (err: unknown) => err instanceof InvalidConfigError && /gemini\.mode/.test(err.message),
     );
+  });
+});
+
+describe('loadConfig() init.assist (C4)', () => {
+  it('defaults assist to disabled with safe knobs when the config is absent', () => {
+    const config = loadConfig(null);
+    assert.deepEqual(config.assist, defaultAssistConfig());
+    assert.deepEqual(config.assist, {
+      enabled: false,
+      onUnavailable: 'fallback',
+      endpointPolicy: 'any',
+      approved: [],
+      provider: null,
+      model: null,
+    });
+  });
+
+  it('treats the shorthand "assist": true as enabled with every other field default', () => {
+    const config = loadConfig('{"init":{"assist":true}}');
+    assert.equal(config.assist.enabled, true);
+    assert.deepEqual(config.assist, { ...defaultAssistConfig(), enabled: true });
+  });
+
+  it('treats the shorthand "assist": false as explicitly disabled', () => {
+    const config = loadConfig('{"init":{"assist":false}}');
+    assert.deepEqual(config.assist, defaultAssistConfig());
+  });
+
+  it('reads every field of a full assist object', () => {
+    const config = loadConfig(
+      '{"init":{"assist":{"enabled":true,"onUnavailable":"fail",' +
+        '"endpointPolicy":"approved-only","approved":["claude"],' +
+        '"provider":"claude","model":"my-model"}}}',
+    );
+    assert.deepEqual(config.assist, {
+      enabled: true,
+      onUnavailable: 'fail',
+      endpointPolicy: 'approved-only',
+      approved: ['claude'],
+      provider: 'claude',
+      model: 'my-model',
+    });
+  });
+
+  it('defaults assist when the init block omits the assist key', () => {
+    const config = loadConfig('{"init":{}}');
+    assert.deepEqual(config.assist, defaultAssistConfig());
+  });
+
+  it('rejects an onUnavailable value outside {fallback, fail}', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":{"onUnavailable":"retry"}}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects an endpointPolicy value outside {any, approved-only}', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":{"endpointPolicy":"none"}}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects an approved list containing an unknown provider', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":{"approved":["cursor"]}}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects a provider that is not a known id', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":{"provider":"cursor"}}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects an empty-string model', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":{"model":""}}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects a non-string model', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":{"model":123}}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects an init that is not an object', () => {
+    assert.throws(
+      () => loadConfig('{"init":"assist"}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('rejects an init.assist that is neither a boolean nor an object', () => {
+    assert.throws(
+      () => loadConfig('{"init":{"assist":42}}'),
+      (err: unknown) => err instanceof InvalidConfigError && err.exitCode === 3,
+    );
+  });
+
+  it('parses a config that also sets providers and gemini, defaulting assist when init is absent', () => {
+    const config = loadConfig('{"providers":["claude"],"gemini":{"mode":"shim"}}');
+    assert.deepEqual(config.providers, ['claude']);
+    assert.equal(config.gemini.mode, 'shim');
+    assert.deepEqual(config.assist, defaultAssistConfig());
   });
 });

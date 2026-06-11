@@ -40,6 +40,19 @@
     "typescript-eslint": "^8.0.0"
   },
   "license": "MIT",
+  "comments": {
+    "peerDependencies": "Provider SDKs for the OPTIONAL `init --assist` API-key backend only (PRD §17). Declared optional so a default install pulls NOTHING (zero-dep core); they are dynamically import()-ed lazily and only when a user picks an api-key source. Absent SDK -> exit 3 with an install hint. The subscription-session backend needs no SDK (it shells out to the provider CLI)."
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": "*",
+    "openai": "*",
+    "@google/generative-ai": "*"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": { "optional": true },
+    "openai": { "optional": true },
+    "@google/generative-ai": { "optional": true }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mknoth197/harness-haircut.git"

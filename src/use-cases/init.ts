@@ -403,10 +403,17 @@ function allAgree(candidates: CandidateText[]): boolean {
   return candidates.every((candidate) => candidate.normalizedText === first);
 }
 
-/** Applies a resolution to a candidate list → chosen text, or null for skip/empty. */
+/**
+ * Applies a resolution to a candidate list → the text to write, or null for
+ * skip/unresolved. `merge` (C4) writes the AI-proposed, human-approved text
+ * verbatim; `choose` writes the selected candidate's original text.
+ */
 function chosenText(candidates: CandidateText[], resolution: Resolution): string | null {
   if (resolution.kind === 'choose') {
     return candidates[resolution.index]?.text ?? null;
+  }
+  if (resolution.kind === 'merge') {
+    return resolution.text;
   }
   return null;
 }
@@ -548,7 +555,9 @@ export async function init(deps: InitDeps): Promise<InitReport> {
       rootOrigin =
         resolution.kind === 'choose'
           ? `chose ${rootCandidates[resolution.index]?.providerId ?? '?'} (${rootCandidates[resolution.index]?.path ?? '?'})`
-          : 'skipped';
+          : resolution.kind === 'merge'
+            ? `ai-merged (${rootCandidates.map((c) => c.providerId).join(', ')})`
+            : 'skipped';
     }
   }
 
@@ -567,6 +576,17 @@ export async function init(deps: InitDeps): Promise<InitReport> {
           : chosen.providerId;
     } else {
       const resolution = resolutionBySlot.get(`skill:${name}`)!;
+      // C4 merge: write the AI-proposed, human-approved SKILL.md body verbatim
+      // (no sibling attachments — the merge superseded only the body text; all
+      // original candidates are still backed up by F2).
+      if (resolution.kind === 'merge') {
+        plannedSkillWrites.push({
+          path: `.agents/skills/${name}/SKILL.md`,
+          content: resolution.text,
+          origin: `ai-merged (${discovered.map((s) => s.providerId).join(', ')})`,
+        });
+        continue;
+      }
       chosen = resolution.kind === 'choose' ? discovered[resolution.index] ?? null : null;
       origin = resolution.kind === 'choose' ? `chose ${chosen?.providerId ?? '?'}` : 'skipped';
     }
@@ -607,6 +627,17 @@ export async function init(deps: InitDeps): Promise<InitReport> {
           : chosen.providerId;
     } else {
       const resolution = resolutionBySlot.get(`fragment:${name}`)!;
+      // C4 merge: the resolver merged the FULL canonical fragment texts (each
+      // candidate's `text` is already its `fragmentCanonicalText`), so write
+      // the approved merged text verbatim — do NOT re-wrap the scope header.
+      if (resolution.kind === 'merge') {
+        plannedFragmentWrites.push({
+          path: `.agents/instructions/${name}.md`,
+          content: resolution.text,
+          origin: `ai-merged (${discovered.map((f) => f.providerId).join(', ')})`,
+        });
+        continue;
+      }
       chosen = resolution.kind === 'choose' ? discovered[resolution.index] ?? null : null;
       origin = resolution.kind === 'choose' ? `chose ${chosen?.providerId ?? '?'}` : 'skipped';
     }
@@ -813,7 +844,12 @@ function backupNotes(
     const sources = notChosen
       .map((c) => `${c.path} -> ${INIT_BACKUP_DIR}/${sanitizeBackupName(c.path)}`)
       .join(', ');
-    const verb = resolution.kind === 'choose' ? 'not chosen' : 'skipped';
+    const verb =
+      resolution.kind === 'choose'
+        ? 'not chosen'
+        : resolution.kind === 'merge'
+          ? 'superseded by the AI-merged text'
+          : 'skipped';
     notes.push(
       `contradiction "${contradiction.slot}": ${notChosen.length} ${verb} candidate(s) ` +
         `had their original content backed up (${sources}).`,
