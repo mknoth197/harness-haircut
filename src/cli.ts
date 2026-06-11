@@ -681,57 +681,50 @@ function previewCandidate(text: string): string[] {
 }
 
 /**
- * Interactive contradiction resolver for `init` (C3 EV2/EV3) over
- * `node:readline` — a numbered-choice prompt rather than the `prompts` /
- * `@inquirer/prompts` dependency the story names, to keep PRD goal 5's
- * zero-runtime-deps promise. The use case (layer 2) stays pure; this layer-4
- * function is the only place that touches stdin. It lists each candidate
- * (provider + path + a multi-line preview) plus a final "skip / write blank"
- * option, reads one number, and maps it to a `Resolution`. An out-of-range
+ * Reads one trimmed line, given a question. A run uses a SINGLE shared
+ * implementation backed by one `node:readline` interface (see `runInit`), so
+ * the several sequential prompts on the `init --assist` path — source
+ * selection, egress consent, merge approval, then the deterministic fallback —
+ * never lose buffered input. (Opening a fresh interface per prompt and closing
+ * it discards readline's read-ahead buffer, which deadlocks piped stdin after
+ * the first prompt.)
+ */
+type Prompt = (question: string) => Promise<string>;
+
+/**
+ * Interactive contradiction resolver for `init` (C3 EV2/EV3): a numbered-choice
+ * prompt over the shared `Prompt` (no `prompts`/`@inquirer` dependency, keeping
+ * PRD goal 5's zero-runtime-deps promise). The use case (layer 2) stays pure;
+ * this layer-4 function is the only place that maps stdin to a `Resolution`. It
+ * lists each candidate (provider + path + a multi-line preview) plus a final
+ * "skip / write blank" option, reads one number, and maps it. An out-of-range
  * answer, empty input, or EOF (Ctrl-D / piped stdin exhausted) resolves to
  * `{ kind: 'unresolved' }`, which fails the run (OPT1) without writing.
  */
-function readlineResolver(io: RunIO): (contradiction: Contradiction) => Promise<Resolution> {
-  return (contradiction: Contradiction): Promise<Resolution> =>
-    new Promise<Resolution>((resolveAnswer) => {
-      const rl = createInterface({ input: process.stdin, output: io.stdout });
-      const lines: string[] = [];
-      lines.push(`Contradiction in "${contradiction.slot}" — pick the canonical answer:`);
-      contradiction.candidates.forEach((candidate, index) => {
-        const preview = previewCandidate(candidate.text);
-        lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}):`);
-        for (const previewLine of preview) {
-          lines.push(`       ${previewLine}`);
-        }
-      });
-      const skipChoice = contradiction.candidates.length + 1;
-      lines.push(`  ${skipChoice}) skip / write blank for this slot`);
-      io.stdout.write(`${lines.join('\n')}\n`);
-      rl.question(`Choice [1-${skipChoice}]: `, (answer) => {
-        rl.close();
-        const n = Number.parseInt(answer.trim(), 10);
-        if (!Number.isInteger(n) || n < 1 || n > skipChoice) {
-          resolveAnswer({ kind: 'unresolved' });
-          return;
-        }
-        if (n === skipChoice) {
-          resolveAnswer({ kind: 'skip' });
-          return;
-        }
-        resolveAnswer({ kind: 'choose', index: n - 1 });
-      });
+function readlineResolver(io: RunIO, prompt: Prompt): ContradictionResolver {
+  return async (contradiction: Contradiction): Promise<Resolution> => {
+    const lines: string[] = [];
+    lines.push(`Contradiction in "${contradiction.slot}" — pick the canonical answer:`);
+    contradiction.candidates.forEach((candidate, index) => {
+      const preview = previewCandidate(candidate.text);
+      lines.push(`  ${index + 1}) ${candidate.providerId} (${candidate.path}):`);
+      for (const previewLine of preview) {
+        lines.push(`       ${previewLine}`);
+      }
     });
-}
-
-/** Reads one trimmed line from stdin with a prompt (layer-4 stdio helper). */
-function askLine(io: RunIO, question: string): Promise<string> {
-  return new Promise<string>((resolveAnswer) => {
-    const rl = createInterface({ input: process.stdin, output: io.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolveAnswer(answer.trim());
-    });
-  });
+    const skipChoice = contradiction.candidates.length + 1;
+    lines.push(`  ${skipChoice}) skip / write blank for this slot`);
+    io.stdout.write(`${lines.join('\n')}\n`);
+    const answer = await prompt(`Choice [1-${skipChoice}]: `);
+    const n = Number.parseInt(answer.trim(), 10);
+    if (!Number.isInteger(n) || n < 1 || n > skipChoice) {
+      return { kind: 'unresolved' };
+    }
+    if (n === skipChoice) {
+      return { kind: 'skip' };
+    }
+    return { kind: 'choose', index: n - 1 };
+  };
 }
 
 /** Real CLI spawn for the subscription-session backend (execFile, never a shell). */
@@ -826,9 +819,10 @@ async function buildAssistResolver(opts: {
   config: HarnessConfig;
   parsed: ParsedArgs;
   io: RunIO;
+  prompt: Prompt;
   fallback: ContradictionResolver;
 }): Promise<ContradictionResolver | null> {
-  const { config, parsed, io, fallback, cwd } = opts;
+  const { config, parsed, io, prompt, fallback, cwd } = opts;
   const assist = config.assist;
   const warn = (message: string): void => {
     io.stderr.write(`harness-haircut: ${message}\n`);
@@ -876,7 +870,7 @@ async function buildAssistResolver(opts: {
   });
   const skipChoice = sources.length + 1;
   io.stdout.write(`  ${skipChoice}) none — use the deterministic resolver\n`);
-  const answer = await askLine(io, `Choice [1-${skipChoice}]: `);
+  const answer = await prompt(`Choice [1-${skipChoice}]: `);
   const choice = Number.parseInt(answer, 10);
   if (!Number.isInteger(choice) || choice < 1 || choice >= skipChoice) {
     warn('no AI source selected; using the deterministic resolver.');
@@ -927,7 +921,7 @@ async function buildAssistResolver(opts: {
       io.stdout.write('egress consent: pre-approved for this run.\n');
       return true;
     }
-    const reply = await askLine(io, EGRESS_CONSENT_PROMPT);
+    const reply = await prompt(EGRESS_CONSENT_PROMPT);
     const yes = reply.toLowerCase() === 'y' || reply.toLowerCase() === 'yes';
     if (yes) {
       consentRemembered = true;
@@ -942,7 +936,7 @@ async function buildAssistResolver(opts: {
     candidates: readonly CandidateText[],
   ): Promise<boolean> => {
     io.stdout.write(`${renderMergeDiff(candidates, proposedText)}\n`);
-    const reply = await askLine(io, 'Write this merged text? [y/N]: ');
+    const reply = await prompt('Write this merged text? [y/N]: ');
     return reply.toLowerCase() === 'y' || reply.toLowerCase() === 'yes';
   };
 
@@ -962,6 +956,18 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const dryRun = parsed.flags['--dry-run'] === true;
   const nonInteractive = parsed.flags['--non-interactive'] === true;
   const assistRequested = parsed.flags['--assist'] === true;
+
+  // A SINGLE readline interface for the whole run, created lazily on the first
+  // prompt and closed once in `finally`. Reusing one interface (rather than
+  // opening/closing one per prompt) keeps the several sequential `init --assist`
+  // prompts from losing readline's buffered read-ahead.
+  let rl: ReturnType<typeof createInterface> | undefined;
+  const prompt: Prompt = (question) => {
+    rl ??= createInterface({ input: process.stdin, output: io.stdout });
+    return new Promise<string>((resolveAnswer) => {
+      rl!.question(question, (answer) => resolveAnswer(answer.trim()));
+    });
+  };
 
   let report: InitReport;
   try {
@@ -999,11 +1005,11 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
     if (nonInteractive) {
       resolveContradiction = () => Promise.resolve<Resolution>({ kind: 'unresolved' });
     } else if (assistEnabled) {
-      const fallback = readlineResolver(io);
+      const fallback = readlineResolver(io, prompt);
       resolveContradiction =
-        (await buildAssistResolver({ cwd, config, parsed, io, fallback })) ?? fallback;
+        (await buildAssistResolver({ cwd, config, parsed, io, prompt, fallback })) ?? fallback;
     } else {
-      resolveContradiction = readlineResolver(io);
+      resolveContradiction = readlineResolver(io, prompt);
     }
 
     report = await init({
@@ -1040,6 +1046,8 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
     }
     throw err;
+  } finally {
+    rl?.close();
   }
 
   if (json) {

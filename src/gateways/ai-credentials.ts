@@ -4,17 +4,18 @@
  * `init --assist` never assumes a provider: it runs a **paid-call-free**
  * discovery that probes, per provider, (a) the CLI binary on PATH, (b) an env
  * API key, and (c) an authenticated subscription session (a session
- * file/keychain marker, or a status subcommand where one exists), then
- * PROPOSES every source it finds for the user to choose (PRD §17, the
- * provider matrix's "AI-assist credential sources" section). NO model call is
- * ever made here, and NO source is auto-selected.
+ * file/keychain marker), then PROPOSES every source it finds for the user to
+ * choose (PRD §17, the provider matrix's "AI-assist credential sources"
+ * section). NO model call is ever made here, and NO source is auto-selected.
  *
  * Purity boundary: the ranking + caveat logic is a pure function of an
  * injected `DiscoveryProbes` (so tests run fully offline). Only
- * `createDiscoveryProbes` touches the real world (env, PATH, a status
- * subcommand) — and even then it spawns ONLY a paid-call-free status probe,
- * never a completion. The deterministic core (`audit`/`apply`/CI/hooks) never
- * imports this module; only `init --assist` and `doctor` do.
+ * `createDiscoveryProbes` touches the real world (env, PATH walk, file/keychain
+ * presence). It NEVER execs a PATH-resolved provider binary (that would give a
+ * PATH-shadowing untrusted repo code execution from `doctor`); the only process
+ * it spawns is the ABSOLUTE `/usr/bin/security` (macOS keychain presence), in a
+ * neutral cwd with a minimal env. The deterministic core (`audit`/`apply`/CI/
+ * hooks) never imports this module; only `init --assist` and `doctor` do.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -53,7 +54,7 @@ export interface DiscoveryProbes {
   /**
    * Detect an authenticated subscription session WITHOUT a paid call. Returns
    * a short detail string (e.g. `~/.codex/auth.json present`) when a session
-   * is found, or null. May run a paid-call-free status subcommand.
+   * is found, or null. Exec-free except the absolute-path macOS keychain probe.
    */
   detectSession: (provider: ProviderId) => string | null;
 }
@@ -190,11 +191,12 @@ function detectRealSession(provider: ProviderId): string | null {
       return null;
     }
     case 'codex': {
-      // The cleanest contract in the matrix: `codex login status` exits 0 when
-      // logged in. This is a paid-call-FREE status probe, not a completion.
-      if (statusExitZero('codex', ['login', 'status'])) {
-        return '`codex login status` exit 0';
-      }
+      // SECURITY: we deliberately do NOT exec `codex login status` here. `codex`
+      // is a PATH-resolved bare name; running it during discovery (which `doctor`
+      // also reaches, in an untrusted repo) would give a PATH-shadowing binary
+      // arbitrary code execution with the inherited cwd/env — bypassing every
+      // isolation the completion path applies. The auth-file presence is an
+      // exec-free marker that detects the same session.
       if (existsSync(join(home, '.codex', 'auth.json'))) {
         return '~/.codex/auth.json present';
       }
@@ -220,23 +222,20 @@ function detectRealSession(provider: ProviderId): string | null {
   }
 }
 
-/** macOS Keychain presence check — never reads the secret, only its existence. */
+/**
+ * macOS Keychain presence check — never reads the secret, only its existence.
+ * Uses the ABSOLUTE `/usr/bin/security` (so a PATH-shadowing repo binary can
+ * never be run in its place) in a neutral cwd with a minimal env (no inherited
+ * secrets/behavior vars). Only ever called on darwin.
+ */
 function keychainHas(service: string): boolean {
   try {
-    execFileSync('security', ['find-generic-password', '-s', service], {
+    execFileSync('/usr/bin/security', ['find-generic-password', '-s', service], {
       stdio: 'ignore',
       timeout: 3000,
+      cwd: homedir(),
+      env: { HOME: homedir(), PATH: '/usr/bin:/bin' },
     });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Runs a paid-call-free status subcommand; true iff it exits 0. Never a completion. */
-function statusExitZero(binary: string, args: readonly string[]): boolean {
-  try {
-    execFileSync(binary, [...args], { stdio: 'ignore', timeout: 5000 });
     return true;
   } catch {
     return false;
@@ -245,8 +244,9 @@ function statusExitZero(binary: string, args: readonly string[]): boolean {
 
 /**
  * Real probes for the composition root. The only world-touching surface;
- * everything it does is paid-call-free (a PATH walk, env reads, a file/keychain
- * presence check, and at most a `codex login status` exit-code probe).
+ * everything it does is paid-call-free and exec-free except the absolute
+ * `/usr/bin/security` keychain-presence probe (a PATH walk, env reads, and
+ * file-presence checks otherwise).
  */
 export function createDiscoveryProbes(): DiscoveryProbes {
   return {

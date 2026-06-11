@@ -24,10 +24,20 @@
  * Both spawn/import surfaces are injected so tests assert the isolation and
  * the lazy-import/UN2 behavior with NO real process and NO real network.
  */
+import { realpathSync } from 'node:fs';
 import type { ProviderId } from '../entities/adapter.js';
 import { DomainError } from '../entities/errors.js';
 import type { EgressDestination } from '../entities/index.js';
 import type { AssistBackend, AssistProposal, AssistRequest } from './ai-resolver.js';
+
+/** Resolves symlinks/`.` /`..` in a path; returns the input if it cannot be resolved. */
+function realpathOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
 
 /** UN2: a chosen source's backend isn't installed/available → exit 3, not a crash. */
 export class AssistBackendUnavailableError extends DomainError {
@@ -289,11 +299,15 @@ export function createCliBackend(config: CliBackendConfig): AssistBackend {
     destination,
     proposeResolution: async (request: AssistRequest): Promise<AssistProposal> => {
       const scratch = config.makeScratchDir();
-      const normalizedRoot = config.repoRoot.replace(/\/+$/, '');
-      if (scratch === normalizedRoot || scratch.startsWith(`${normalizedRoot}/`)) {
-        // Fail closed: never run the provider CLI inside the repo (Finding 1).
+      // Fail closed: never run the provider CLI inside the repo (Finding 1).
+      // Compare REAL paths so a symlink (e.g. macOS /var -> /private/var) or a
+      // repo that itself lives under the tmp root can't slip a scratch dir that
+      // is really inside the repo past a naive string-prefix check.
+      const realScratch = realpathOrSelf(scratch);
+      const realRoot = realpathOrSelf(config.repoRoot).replace(/\/+$/, '');
+      if (realScratch === realRoot || realScratch.startsWith(`${realRoot}/`)) {
         throw new Error(
-          `refusing to spawn the assist CLI inside the repo (scratch=${scratch}, repo=${normalizedRoot})`,
+          `refusing to spawn the assist CLI inside the repo (scratch=${realScratch}, repo=${realRoot})`,
         );
       }
       const { binary, args } = cliInvocation(config.provider, config.model, scratch);

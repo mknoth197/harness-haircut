@@ -136,6 +136,13 @@ export function buildAiResolver(deps: AiResolverDeps): ContradictionResolver {
 
     // 3. Build the request from the POST-redaction, included bytes only.
     const includedByPath = new Map(plan.files.filter((f) => f.included).map((f) => [f.path, f]));
+    // The index of the first egress-eligible candidate — the representative an
+    // EV1 "equivalent" verdict collapses to. NEVER index 0 blindly: index 0 may
+    // be a candidate C5 WITHHELD (e.g. a binary-tainted file), which the backend
+    // never judged and which must not silently become canonical.
+    const firstIncludedIndex = contradiction.candidates.findIndex((candidate) =>
+      includedByPath.has(candidate.path),
+    );
     const requestCandidates = contradiction.candidates
       .filter((candidate) => includedByPath.has(candidate.path))
       .map((candidate) => ({
@@ -167,8 +174,10 @@ export function buildAiResolver(deps: AiResolverDeps): ContradictionResolver {
     }
 
     // 5. EV1 — semantically equivalent: agree silently, no prompt for the slot.
+    // Collapse to the first INCLUDED candidate (the verdict only ranged over
+    // included candidates), never a withheld index-0.
     if (proposal.kind === 'equivalent') {
-      return { kind: 'choose', index: 0 };
+      return { kind: 'choose', index: firstIncludedIndex };
     }
 
     // 6. EV2 — proposed merge needs explicit human approval; decline → fallback.

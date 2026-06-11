@@ -563,6 +563,8 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- decide the canonical skills ----
   const plannedSkillWrites: { path: string; content: string; origin: string }[] = [];
+  // C4: notes recording sibling-attachment provenance for AI-merged skills.
+  const mergeSiblingNotes: string[] = [];
   for (const [name, discovered] of [...skillsByName].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     const contradiction = skillContradictions.get(name);
     let chosen: DiscoveredSkill | null;
@@ -576,15 +578,36 @@ export async function init(deps: InitDeps): Promise<InitReport> {
           : chosen.providerId;
     } else {
       const resolution = resolutionBySlot.get(`skill:${name}`)!;
-      // C4 merge: write the AI-proposed, human-approved SKILL.md body verbatim
-      // (no sibling attachments — the merge superseded only the body text; all
-      // original candidates are still backed up by F2).
+      // C4 merge: write the AI-proposed, human-approved SKILL.md body verbatim,
+      // and carry the representative candidate's sibling attachments
+      // (scripts/assets) so the merged skill is not left without the files it
+      // needs. The merge only reconciled the BODY text; F2 backs up each
+      // candidate's body, and the siblings of every candidate also remain in
+      // their original provider directories (init never deletes sources), so
+      // nothing is lost — a note records which candidate's siblings were carried.
       if (resolution.kind === 'merge') {
+        const origin = `ai-merged (${discovered.map((s) => s.providerId).join(', ')})`;
         plannedSkillWrites.push({
           path: `.agents/skills/${name}/SKILL.md`,
           content: resolution.text,
-          origin: `ai-merged (${discovered.map((s) => s.providerId).join(', ')})`,
+          origin,
         });
+        const representative = discovered[0]!;
+        for (const sibling of representative.files) {
+          plannedSkillWrites.push({
+            path: `.agents/skills/${name}/${sibling.path}`,
+            content: sibling.content,
+            origin,
+          });
+        }
+        if (discovered.some((s) => s.files.length > 0)) {
+          mergeSiblingNotes.push(
+            `skill "${name}" was AI-merged; carried ${representative.files.length} sibling ` +
+              `attachment(s) from ${representative.providerId} (${representative.path}). Other ` +
+              `candidates' attachments remain in their original provider directories — review if ` +
+              `they differ.`,
+          );
+        }
         continue;
       }
       chosen = resolution.kind === 'choose' ? discovered[resolution.index] ?? null : null;
@@ -665,6 +688,10 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- carried-over hooks note (scoped deviation: not reverse-engineered) ----
   const notes = hookNotes(detected);
+  // C4: surface which candidate's sibling attachments an AI-merged skill carried.
+  for (const note of mergeSiblingNotes) {
+    notes.push(note);
+  }
   // F1: a fragment we could not parse a scope from is never dropped silently —
   // it stays in place and we tell the user to give it canonical backing by hand.
   if (unparseableFragments.length > 0) {

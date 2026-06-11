@@ -342,4 +342,26 @@ describe('buildAiResolver()', () => {
     );
     assert.equal(confirm.calls[0]!.plan.decision, 'send', 'the plan handed to consent is the real EgressPlan');
   });
+
+  it('collapses an EV1 agreement to the first INCLUDED candidate, never a withheld index 0 (C4-review)', async () => {
+    // candidate[0] is a hard-deny class (.claude/settings.json) → C5 WITHHOLDS
+    // it; only candidate[1] (allow-class AGENTS.md) is sent and judged. An
+    // 'equivalent' verdict must collapse to the INCLUDED candidate (index 1),
+    // not blindly index 0 — writing the withheld, unjudged candidate would be a
+    // correctness + consent-integrity bug.
+    const c = contradiction([
+      candidate('claude', '.claude/settings.json', '{"hooks":{"x":"y"}}\n'),
+      candidate('codex', 'AGENTS.md', 'Run the suite with npm test.\n'),
+    ]);
+    const backend = fakeBackend({ proposal: { kind: 'equivalent' } });
+    const { resolver } = deps({ backend });
+    const resolution = await resolver(c);
+    assert.deepEqual(resolution, { kind: 'choose', index: 1 });
+    assert.equal(backend.calls.length, 1);
+    assert.deepEqual(
+      backend.calls[0]!.candidates.map((rc) => rc.path),
+      ['AGENTS.md'],
+      'the withheld settings.json text was never handed to the backend',
+    );
+  });
 });

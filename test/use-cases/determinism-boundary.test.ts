@@ -173,21 +173,28 @@ describe('PRD §17 / C4 determinism boundary', () => {
       );
     });
 
-    it('`doctor` runs under the same stubs (scope note — no-spawn NOT asserted here)', () => {
-      // SCOPE: doctor reuses the AI-assist credential DISCOVERY that
-      // `init --assist` uses. Discovery is paid-call-free but it is allowed to
-      // PATH-probe (a filesystem existsSync walk, NOT an exec) and may run an
-      // allowed status probe such as `codex login status` to detect a logged-in
-      // session. Those are deliberately permitted by U4 / PRD §17 ("paid-call-
-      // free discovery"), so we DO NOT assert no-spawn for doctor — a stub
-      // firing here would be `codex login status`, not a model call. We only
-      // assert doctor runs cleanly with the stubs on PATH.
+    it('`doctor` reuses discovery but spawns NONE of the four provider CLIs (C4-review hardening)', () => {
+      // doctor reuses the AI-assist credential DISCOVERY. Discovery is
+      // paid-call-free AND — after the C4 adversarial-review hardening —
+      // exec-free for provider binaries: it PATH-probes via existsSync (a
+      // filesystem walk, not an exec) and detects sessions by file markers; the
+      // only process it ever spawns is the ABSOLUTE `/usr/bin/security` macOS
+      // keychain-presence probe, which a PATH stub named `codex`/`claude`/etc.
+      // can never intercept. So a stub named after a provider firing here would
+      // be a regression (the old `codex login status` exec — an RCE vector from
+      // a read-only command on a PATH-shadowing repo). Assert none fire.
       const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repoRootTmp], {
         encoding: 'utf8',
         env: stubbedEnv(),
       });
       assert.equal(r.status, 0, `doctor did not exit 0: ${r.stderr}`);
       assert.match(r.stdout, /harness-haircut doctor/);
+      const { fired, contents } = sentinelFired();
+      assert.equal(
+        fired,
+        false,
+        `doctor spawned a PATH-resolved provider CLI (determinism/Finding-1 regression): ${contents}`,
+      );
     });
   });
 

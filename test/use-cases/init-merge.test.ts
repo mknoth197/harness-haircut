@@ -350,3 +350,82 @@ describe('init() — C4 fragment:<name> merge writes verbatim, no re-wrapped sco
     assert.ok(!second.written.includes('.agents/instructions/security.md'));
   });
 });
+
+describe('init() — C4 skill:<name> merge carries the representative candidate\'s sibling attachments (review #3)', () => {
+  // The SAME skill name under two NON-`.agents` provider roots with DIFFERING
+  // bodies → one `skill:foo` contradiction. (`.agents/skills/` would trip the
+  // already-canonical fast-fail, so the conflict is staged under `.claude` and
+  // `.codex`.) The first-sorted candidate (SKILL_SOURCE_ROOTS order: .agents,
+  // then .claude, then .codex → the `.claude` copy is the representative)
+  // carries a SIBLING attachment that must NOT be silently dropped on merge.
+  const claudeSibling = '#!/usr/bin/env bash\necho claude-helper\n';
+  // The AI-proposed, human-approved merged SKILL.md. It is a VALID canonical
+  // SKILL.md (the follow-up apply re-parses the tree and requires a `name:`
+  // frontmatter) with a recognizable body marker so the assertion is exact.
+  const mergedSkill =
+    '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nMERGED SKILL BODY: do A and do B.\n';
+
+  async function driftedSkills(): Promise<TempRepo> {
+    return setup({
+      // A root source so init has canonical root text to project alongside.
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm.\n',
+      // Representative candidate (.claude) WITH a sibling attachment.
+      '.claude/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nClaude variant: do A.\n',
+      '.claude/skills/foo/scripts/run.sh': claudeSibling,
+      // Second candidate (.codex), different body → the conflict.
+      '.codex/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nCodex variant: do B.\n',
+    });
+  }
+
+  it('writes the merged SKILL.md verbatim AND carries the representative\'s sibling, with a provenance note', async () => {
+    const repo = await driftedSkills();
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, {
+      resolverCalls,
+      resolve: { 'skill:foo': { kind: 'merge', text: mergedSkill } },
+    });
+    assert.equal(report.exitCode, 0);
+    assert.ok(resolverCalls.includes('skill:foo'));
+    const skillSlots = report.contradictions.filter((c) => c.slot === 'skill:foo');
+    assert.equal(skillSlots.length, 1);
+
+    // (1) The merged SKILL.md body lands byte-for-byte under the canonical root.
+    const skillPath = join(repo.root, '.agents', 'skills', 'foo', 'SKILL.md');
+    assert.equal(existsSync(skillPath), true);
+    const writtenSkill = await readFile(skillPath, 'utf8');
+    assert.equal(writtenSkill, mergedSkill);
+    // It is neither candidate's original body.
+    assert.doesNotMatch(writtenSkill, /Claude variant: do A\./);
+    assert.doesNotMatch(writtenSkill, /Codex variant: do B\./);
+
+    // (2) The representative candidate's SIBLING attachment was carried (it is
+    // no longer silently dropped on merge) — same relative path, same bytes.
+    const siblingPath = join(repo.root, '.agents', 'skills', 'foo', 'scripts', 'run.sh');
+    assert.equal(existsSync(siblingPath), true);
+    assert.equal(await readFile(siblingPath, 'utf8'), claudeSibling);
+
+    // The planned layout lists both the merged SKILL.md and the carried sibling,
+    // both attributed to the AI merge.
+    const plannedSkill = report.planned.find((f) => f.path === '.agents/skills/foo/SKILL.md');
+    assert.ok(plannedSkill !== undefined);
+    assert.match(plannedSkill.origin, /^ai-merged \(/);
+    const plannedSibling = report.planned.find(
+      (f) => f.path === '.agents/skills/foo/scripts/run.sh',
+    );
+    assert.ok(plannedSibling !== undefined, 'the carried sibling is in the planned layout');
+
+    // (3) A note records that the skill was AI-merged and WHICH provider's
+    // sibling attachments were carried (the representative is the `.claude` copy).
+    assert.ok(
+      report.notes.some(
+        (n) =>
+          /skill "foo" was AI-merged/i.test(n) &&
+          /carried .*sibling/i.test(n) &&
+          /claude/.test(n),
+      ),
+      `expected an AI-merge sibling-provenance note naming claude, got: ${JSON.stringify(report.notes)}`,
+    );
+  });
+});
