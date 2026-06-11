@@ -63,8 +63,19 @@ Discovery is **paid-call-free**: probe the binary on PATH, then an env key, then
 - **No assumed default provider.** Replaced by discovery + propose (U4): `init --assist` detects available sources and the user chooses. A `init.assist.provider` config key may *pre-select* a preferred provider but never silently overrides discovery.
 - **Subscription session is supported** as a first-class credential source (U5), opt-in. Verified feasible for all four CLIs ([matrix](../research/provider-matrix.md#ai-assist-credential-sources--cli-headless-modes--subscription-sessions)); it reintroduces only an *optional* provider-CLI dependency, invoked solely on the assist path. Caveats are surfaced to the user (EV5): Claude `claude -p` is explicitly sanctioned (Agent SDK credit, eff. 2026-06-15); Codex/Gemini work but vendors prefer keys for automation and meter usage; Copilot is subscription-only, text-output, and consumes premium requests.
 
+## Model selection policy (decided)
+
+The merge is a bounded text task that a human reviews before any write (EV2), so maximum capability is unnecessary — favor a fast, balanced tier and never pin a model id that will rot.
+
+- **Subscription-session (CLI) backend:** pass **no `--model`** — use the provider CLI's own configured default. This respects the developer's existing CLI setup and avoids hard-coding ids (provider model names churn fast — see the matrix's Codex/Gemini/Copilot rename history).
+- **Env-API-key (SDK) backend:** default to each provider's **balanced mid-tier** model, held in a single per-provider constant that is trivial to bump as ids change (examples as of 2026-06: Anthropic `claude-sonnet-4-6`, OpenAI a balanced GPT-5.x tier, Google a Gemini Flash/Pro balanced tier). Not the flagship.
+- **Always show the resolved model** (and source) in the egress disclosure (EV3/EV5) before the call.
+- **Override:** `init.assist.model` (config) or `--assist-model <id>` (flag) overrides either backend.
+
+## Credential-choice persistence (decided)
+
+A remembered credential-source choice persists **per-machine, user-local** — NOT in the team-shared `harness-haircut.config.json`. Credentials and CLI sessions are per-developer, so a committed choice would be wrong (or leak intent) for teammates. Store it in a user-local, gitignored location (e.g. `~/.config/harness-haircut/assist.json` or an explicitly gitignored `harness-haircut.local.json`); never write a credential value, only the chosen *source kind + provider*. The team-shared config may carry non-secret policy (`init.assist: true`, `init.assist.onUnavailable`) but never the per-developer selection.
+
 ## Remaining open questions
 
-- Default model per provider in headless mode (CLI's configured default vs. a harness-haircut-pinned model via `--model`).
-- Whether to persist a remembered credential-source choice in `harness-haircut.config.json` (team-shared) vs. a user-local file (per-machine) — leaning user-local, since credentials/sessions are per-developer.
-- Redaction/allowlist of which canonical files may be sent (a privacy refinement) — likely a follow-up story.
+- **Redaction / allowlist of which file contents may be sent** — a privacy/security refinement, being scoped by a dedicated Fable security/pen-test pass (it determines default-deny vs default-allow per canonical file class, secret-scanning before send, and consent-disclosure contents). Lands as a separate story (**C5 — assist egress redaction**) that C4 depends on before the egress path ships.

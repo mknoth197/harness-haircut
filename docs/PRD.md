@@ -392,6 +392,11 @@ Discovery probes the binary on PATH, then an env key, then an authed-session mar
 
 No source found / consent declined / call fails → graceful fallback to the deterministic resolver (or a clear `fail` per config). The feature is always safe to not have. harness-haircut never performs the provider login itself — it detects and reuses an existing session, or points the user at the other discovered sources.
 
+### Model selection & persistence
+
+- **Model:** the merge is human-reviewed, so favor a fast balanced tier and never pin a rotting id. Subscription-session backend → use the **CLI's own configured default** (no `--model`). API-key backend → a **balanced mid-tier** default per provider held in an easy-to-bump constant. The resolved model is shown in the egress disclosure; `init.assist.model` / `--assist-model` overrides.
+- **Persistence:** a remembered credential-source choice is stored **per-machine, user-local** (gitignored), never in team-shared `harness-haircut.config.json`, and records only the *source kind + provider* — never a credential value. Shared config may carry non-secret policy (`init.assist`, `onUnavailable`) but not the per-developer selection.
+
 ### Privacy posture
 
 - `--assist` sends canonical and provider config file **contents to a third-party API**. This is treated as publishing to an external service.
