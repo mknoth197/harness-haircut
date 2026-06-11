@@ -297,24 +297,42 @@ function keywordWindow(content: string, index: number): string {
 }
 
 /**
- * Strips Unicode invisibles that can split a token mid-prefix and evade the
- * shape rules: format/zero-width code points (category `Cf`: ZWSP, ZWNJ, ZWJ,
- * BOM, …), nonspacing combining marks (`Mn`: combining accents, the combining
- * grapheme joiner U+034F, variation selectors U+FE0Fx/U+E01xx), and enclosing
- * marks (`Me`). None of these legitimately appear inside an ASCII credential,
- * and stripping them only ever MERGES chars into a candidate run (fail-closed:
- * it can surface a secret, never hide one). Returns the cleaned string and a
- * map from each cleaned-string index to its index in the ORIGINAL content, so
- * findings are reported (and redacted) against the original bytes.
+ * True for any code point that can be wedged INTO a token to break a shape
+ * rule's contiguous match but means nothing as text: every Unicode mark
+ * (`Mn`/`Me`/`Mc` — combining accents, the combining grapheme joiner U+034F,
+ * variation selectors, spacing marks), every format/zero-width point (`Cf`:
+ * ZWSP/ZWNJ/ZWJ/BOM), and every control / private-use point (`Cc`/`Co` —
+ * TAB, BEL, BS, C1 controls, DEL) EXCEPT the two line separators we rely on
+ * for line structure (`\n`, `\r`). None legitimately appears inside an ASCII
+ * credential; dropping them only ever MERGES chars into a candidate run, so
+ * the worst case is a fail-closed over-match, never a hidden secret.
+ */
+function isStrippable(ch: string): boolean {
+  if (ch === '\n' || ch === '\r') {
+    return false;
+  }
+  const code = ch.codePointAt(0)!;
+  // C0 controls (incl. TAB) + DEL + C1 controls — not caught by the prop set.
+  if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+    return true;
+  }
+  return /[\p{Cf}\p{M}\p{Co}]/u.test(ch);
+}
+
+/**
+ * Strips the invisibles `isStrippable` flags from a working copy of the
+ * content before scanning, so a token split by any of them is rejoined and
+ * still matched. Returns the cleaned string and a map from each cleaned-string
+ * index to its index in the ORIGINAL content, so findings are reported (and
+ * redacted) against the original bytes.
  */
 function stripFormatChars(content: string): { cleaned: string; map: number[] } {
-  const INVISIBLE_OR_MARK = /[\p{Cf}\p{Mn}\p{Me}]/u;
   let cleaned = '';
   const map: number[] = [];
   // Iterate by code point so astral chars are not split.
   let i = 0;
   for (const ch of content) {
-    if (!INVISIBLE_OR_MARK.test(ch)) {
+    if (!isStrippable(ch)) {
       cleaned += ch;
       for (let k = 0; k < ch.length; k++) {
         map.push(i + k);

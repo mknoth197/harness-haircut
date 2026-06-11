@@ -534,9 +534,15 @@ describe('classifyEgress — case-insensitive deny segments (re-verify: case-var
     '.agents/SKILLS/deployer/CLAUDE.md',
     '.github/Hooks/CLAUDE.md',
     'old/.Harness-Haircut-Init-Backup/AGENTS.md',
+    // trailing dot/space on a deny segment (Windows drops them → same dir).
+    '.agents/skills./deployer/AGENTS.md',
+    '.agents/skills /deployer/AGENTS.md',
+    '.github/hooks./CLAUDE.md',
+    'old/.harness-haircut-init-backup./AGENTS.md',
+    '.claude/settings.json ',
   ];
   for (const path of caseVariants) {
-    it(`denies case-variant deny-segment path ${path}`, () => {
+    it(`denies case/space-variant deny-segment path ${JSON.stringify(path)}`, () => {
       assert.equal(classifyEgress({ path, content: '# x\n' }), 'deny');
     });
   }

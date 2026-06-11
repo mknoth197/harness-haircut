@@ -417,6 +417,27 @@ describe('scanForSecrets() — combining marks & variation selectors cannot spli
   }
 });
 
+describe('scanForSecrets() — control chars & spacing marks cannot split a token either', () => {
+  // The strip must cover not just Cf/Mn/Me but ALL marks (incl. Mc) and
+  // control chars (TAB/BEL/DEL/C1) — a TAB wedged into a token is invisible
+  // enough to evade a shape rule but means nothing as text.
+  const splitters: ReadonlyArray<{ label: string; cp: number }> = [
+    { label: 'TAB U+0009', cp: 0x09 },
+    { label: 'BEL U+0007', cp: 0x07 },
+    { label: 'DEL U+007F', cp: 0x7f },
+    { label: 'C1 NEL U+0085', cp: 0x85 },
+    { label: 'spacing mark U+0903', cp: 0x0903 },
+  ];
+  for (const { label, cp } of splitters) {
+    it(`detects an AWS key split by ${label} (no keyword needed)`, () => {
+      const token = 'AKIA' + 'B'.repeat(16);
+      const split = token.slice(0, 8) + String.fromCodePoint(cp) + token.slice(8);
+      const ids = scanForSecrets('AGENTS.md', `notes ${split} end\n`).map((f) => f.ruleId);
+      assert.equal(ids.includes('aws-access-key-id'), true);
+    });
+  }
+});
+
 describe('scanForSecrets() — CRLF with the keyword on the line above', () => {
   it('fires a keyword-gated rule when keyword line and value line are CRLF-separated', () => {
     const hex = '0123456789abcdef'.repeat(4);

@@ -84,7 +84,14 @@ function classifyByPath(path: string): EgressClass {
   // escape the skill/hook/backup deny and win a prose-suffix allow. Lowercasing
   // for classification keeps deny authoritative; over-allowing a case-variant
   // prose file (on a case-sensitive FS) is benign — it is still prose.
-  const lower = path.toLowerCase();
+  // Also strip trailing dots/spaces from each segment: Windows silently drops
+  // them from filenames, so `skills.`/`skills ` resolve to the same on-disk
+  // `skills` dir — a deny segment must not be escaped by appending one.
+  const lower = path
+    .toLowerCase()
+    .split('/')
+    .map((segment) => segment.replace(/[ .]+$/, ''))
+    .join('/');
   const segments = lower.split('/');
   // Exact hard-deny files named by the threat model (settings / hook JSON /
   // tool state). Checked first so they deny even outside a deny segment.
