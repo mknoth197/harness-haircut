@@ -389,3 +389,58 @@ describe('scanForSecrets() — dotted high-entropy value (review)', () => {
     assert.equal(ids.includes('high-entropy-string'), true);
   });
 });
+
+// --- C5 re-verify regressions (second adversarial pass) ---
+
+describe('scanForSecrets() — combining marks & variation selectors cannot split a token', () => {
+  const invisibles: ReadonlyArray<{ label: string; cp: number }> = [
+    { label: 'combining acute U+0301', cp: 0x0301 },
+    { label: 'combining grapheme joiner U+034F', cp: 0x034f },
+    { label: 'variation selector-16 U+FE0F', cp: 0xfe0f },
+    { label: 'combining enclosing circle U+20DD', cp: 0x20dd },
+  ];
+  for (const { label, cp } of invisibles) {
+    it(`detects a github token split by ${label} (no keyword needed)`, () => {
+      const token = 'ghp_' + 'aB9cD8eF7gH6iJ5kL4mN3oP2qR1sT0uV9wX8yZ';
+      const split = token.slice(0, 10) + String.fromCodePoint(cp) + token.slice(10);
+      // Prose with NO credential keyword — the shape rule must fire on its own.
+      const content = `Authentication uses ${split} during sync.\n`;
+      const findings = scanForSecrets('AGENTS.md', content);
+      assert.equal(findings.map((f) => f.ruleId).includes('github-token'), true);
+      const redacted = redactFindings(
+        content,
+        findings.filter((f) => f.ruleId === 'github-token'),
+      );
+      assert.equal(redacted.includes(String.fromCodePoint(cp)), false);
+      assert.match(redacted, /\[REDACTED:github-token\]/);
+    });
+  }
+});
+
+describe('scanForSecrets() — CRLF with the keyword on the line above', () => {
+  it('fires a keyword-gated rule when keyword line and value line are CRLF-separated', () => {
+    const hex = '0123456789abcdef'.repeat(4);
+    const crlf = `CI_DEPLOY_TOKEN\r\n${hex}\r\nmore\r\n`;
+    assert.equal(ruleIdsIn(crlf).includes('hex-secret'), true);
+  });
+});
+
+describe('scanForSecrets() — high-entropy rule no longer false-blocks URLs/paths', () => {
+  it('does not flag a credential-related URL on a keyword line (/ excluded from the class)', () => {
+    assert.deepEqual(
+      ruleIdsIn('see the api key reference at https://api.example.com/v1/credentials/list\n'),
+      [],
+    );
+  });
+
+  it('does not flag a file path on a keyword line', () => {
+    assert.deepEqual(
+      ruleIdsIn('the api key lives in .agents/instructions/software-architecture.md\n'),
+      [],
+    );
+  });
+
+  it('still flags a genuine high-entropy secret on a keyword line', () => {
+    assert.equal(ruleIdsIn(`secret = ${HIGH_ENTROPY}Qx7Zt2\n`).includes('high-entropy-string'), true);
+  });
+});

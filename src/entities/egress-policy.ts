@@ -46,6 +46,16 @@ function moreRestrictive(a: EgressClass, b: EgressClass): EgressClass {
 /** Replacement char — its presence means the source bytes were not valid UTF-8. */
 const NON_UTF8_MARKER = '�';
 
+/**
+ * True when content is not safe text to egress: malformed-UTF-8 (a U+FFFD
+ * replacement char survived decoding) or an embedded NUL. This veto is
+ * ABSOLUTE — unlike a class-based `deny`, it can never be overridden by
+ * `--assist-include`/opt-in: a binary blob is never instruction prose.
+ */
+function hasBinaryContent(content: string): boolean {
+  return content.includes(NON_UTF8_MARKER) || content.includes('\u0000');
+}
+
 /** Path segments that hard-deny a file regardless of its basename. */
 const DENY_SEGMENTS = new Set([
   // Skill folders: only the SKILL.md *body* is opt-in (handled below); every
@@ -68,15 +78,22 @@ const DENY_SEGMENTS = new Set([
  * (a nested backup), and `.agents/hooks/x.md` all deny.
  */
 function classifyByPath(path: string): EgressClass {
-  const segments = path.split('/');
+  // Match case-INSENSITIVELY. On macOS/Windows the filesystem is
+  // case-insensitive, so `.agents/Skills/…` is the SAME on-disk directory as
+  // `.agents/skills/…`; a case-exact deny check would let a capital-S variant
+  // escape the skill/hook/backup deny and win a prose-suffix allow. Lowercasing
+  // for classification keeps deny authoritative; over-allowing a case-variant
+  // prose file (on a case-sensitive FS) is benign — it is still prose.
+  const lower = path.toLowerCase();
+  const segments = lower.split('/');
   // Exact hard-deny files named by the threat model (settings / hook JSON /
   // tool state). Checked first so they deny even outside a deny segment.
   if (
-    path === '.claude/settings.json' ||
-    path === '.codex/hooks.json' ||
-    path === '.codex/config.toml' ||
-    path === '.gemini/settings.json' ||
-    path === '.agents/.harness-state.json'
+    lower === '.claude/settings.json' ||
+    lower === '.codex/hooks.json' ||
+    lower === '.codex/config.toml' ||
+    lower === '.gemini/settings.json' ||
+    lower === '.agents/.harness-state.json'
   ) {
     return 'deny';
   }
@@ -84,8 +101,8 @@ function classifyByPath(path: string): EgressClass {
   // before the `skills` deny-segment rule so the body itself stays opt-in
   // while every sibling under the folder denies.
   for (const root of ['.agents/skills/', '.claude/skills/', '.codex/skills/']) {
-    if (path.startsWith(root) && path.endsWith('/SKILL.md')) {
-      const rest = path.slice(root.length, -'/SKILL.md'.length);
+    if (lower.startsWith(root) && lower.endsWith('/skill.md')) {
+      const rest = lower.slice(root.length, -'/skill.md'.length);
       if (rest !== '' && !rest.includes('/')) {
         return 'opt-in';
       }
@@ -100,19 +117,19 @@ function classifyByPath(path: string): EgressClass {
   // Instruction prose (allow): root shims (exact) + AGENTS.md at any depth
   // (the threat model: "AGENTS.md root+nested"). A nested CLAUDE.md/GEMINI.md
   // is NOT a thing this tool emits, so those allow only at the repo root.
-  if (path === 'AGENTS.md' || path.endsWith('/AGENTS.md')) {
+  if (lower === 'agents.md' || lower.endsWith('/agents.md')) {
     return 'allow';
   }
-  if (path === 'CLAUDE.md' || path === 'GEMINI.md' || path === '.github/copilot-instructions.md') {
+  if (lower === 'claude.md' || lower === 'gemini.md' || lower === '.github/copilot-instructions.md') {
     return 'allow';
   }
   // Scoped instruction fragments (allow) — `.md` only; anything else that
   // strays into these directories falls through to the deny catch-all.
   if (
-    (path.startsWith('.agents/instructions/') ||
-      path.startsWith('.github/instructions/') ||
-      path.startsWith('.claude/rules/')) &&
-    path.endsWith('.md')
+    (lower.startsWith('.agents/instructions/') ||
+      lower.startsWith('.github/instructions/') ||
+      lower.startsWith('.claude/rules/')) &&
+    lower.endsWith('.md')
   ) {
     return 'allow';
   }
@@ -365,7 +382,11 @@ export function planEgress(
     const cls = classifyEgress(input);
     const matchedInclude = flags.include.some((pattern) => matchesGlob(pattern, input.path));
     const optedIn = cls === 'opt-in' && flags.optInPaths.includes(input.path);
-    const included = cls === 'allow' || optedIn || matchedInclude;
+    // The binary/non-UTF-8 veto is ABSOLUTE: `--assist-include` is the escape
+    // hatch for a denied CLASS, but it must never pull in a binary blob (the
+    // veto and a class-`deny` share the 'deny' label, so check content directly).
+    const binary = hasBinaryContent(input.content);
+    const included = !binary && (cls === 'allow' || optedIn || matchedInclude);
     const decision: EgressFileDecision = {
       path: input.path,
       class: cls,

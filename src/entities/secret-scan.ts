@@ -201,9 +201,13 @@ export const BUILTIN_SECRET_RULES: readonly SecretRule[] = [
     description:
       'high-entropy string on a line mentioning token/secret/password/api key/credential',
     severity: 'high',
-    // `.` and `:` are in the class so a dotted/segmented high-entropy value
+    // `.` is in the class so a dotted/segmented high-entropy value
     // (e.g. `aB3.xK9.mQ7.…`) forms one run rather than slipping between dots.
-    pattern: '[A-Za-z0-9+/=_.:-]{20,}',
+    // `/` and `:` are deliberately EXCLUDED: with them, ordinary URLs and file
+    // paths on a credential-keyword line (`https://…/credentials`) reach 20
+    // chars and false-block onboarding prose. A base64 secret still matches on
+    // its alphanumerics/`+`/`=`; the named-shape rules catch the rest.
+    pattern: '[A-Za-z0-9+=_.-]{20,}',
     requiresKeyword: true,
     requiresEntropy: true,
   },
@@ -275,6 +279,16 @@ function keywordWindow(content: string, index: number): string {
   let windowStart = lineStart;
   if (windowStart > 0) {
     windowStart--; // step over the separator before the current line
+    // Collapse a CRLF (or LFCR) pair so both halves count as ONE separator —
+    // otherwise the "previous line" of a CRLF file is just the orphaned `\r`
+    // and the keyword above the value is never seen.
+    if (
+      windowStart > 0 &&
+      ((content[windowStart] === '\n' && content[windowStart - 1] === '\r') ||
+        (content[windowStart] === '\r' && content[windowStart - 1] === '\n'))
+    ) {
+      windowStart--;
+    }
     while (windowStart > 0 && !isEol(content[windowStart - 1])) {
       windowStart--;
     }
@@ -283,20 +297,24 @@ function keywordWindow(content: string, index: number): string {
 }
 
 /**
- * Strips Unicode format/zero-width code points (category `Cf`: ZWSP, ZWNJ,
- * ZWJ, BOM, …) so an invisible char cannot split a token mid-prefix and
- * evade the shape rules. Returns the cleaned string and a map from each
- * cleaned-string index to its index in the ORIGINAL content, so findings can
- * be reported (and redacted) against the original bytes.
+ * Strips Unicode invisibles that can split a token mid-prefix and evade the
+ * shape rules: format/zero-width code points (category `Cf`: ZWSP, ZWNJ, ZWJ,
+ * BOM, …), nonspacing combining marks (`Mn`: combining accents, the combining
+ * grapheme joiner U+034F, variation selectors U+FE0Fx/U+E01xx), and enclosing
+ * marks (`Me`). None of these legitimately appear inside an ASCII credential,
+ * and stripping them only ever MERGES chars into a candidate run (fail-closed:
+ * it can surface a secret, never hide one). Returns the cleaned string and a
+ * map from each cleaned-string index to its index in the ORIGINAL content, so
+ * findings are reported (and redacted) against the original bytes.
  */
 function stripFormatChars(content: string): { cleaned: string; map: number[] } {
-  const FORMAT_CHAR = /\p{Cf}/u;
+  const INVISIBLE_OR_MARK = /[\p{Cf}\p{Mn}\p{Me}]/u;
   let cleaned = '';
   const map: number[] = [];
   // Iterate by code point so astral chars are not split.
   let i = 0;
   for (const ch of content) {
-    if (!FORMAT_CHAR.test(ch)) {
+    if (!INVISIBLE_OR_MARK.test(ch)) {
       cleaned += ch;
       for (let k = 0; k < ch.length; k++) {
         map.push(i + k);

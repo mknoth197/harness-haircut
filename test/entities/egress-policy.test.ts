@@ -524,3 +524,39 @@ describe('matchesGlob — bounded-time on stacked globstars (review: ReDoS, thre
     assert.equal(matchesGlob('**/x.md', 'a/b/c/x.md'), true);
   });
 });
+
+describe('classifyEgress — case-insensitive deny segments (re-verify: case-variant bypass)', () => {
+  // On macOS/Windows `.agents/Skills/…` is the SAME on-disk dir as
+  // `.agents/skills/…`, so a case variant must not escape the skill/hook/backup
+  // deny and win a prose-suffix allow.
+  const caseVariants = [
+    '.agents/Skills/deployer/AGENTS.md',
+    '.agents/SKILLS/deployer/CLAUDE.md',
+    '.github/Hooks/CLAUDE.md',
+    'old/.Harness-Haircut-Init-Backup/AGENTS.md',
+  ];
+  for (const path of caseVariants) {
+    it(`denies case-variant deny-segment path ${path}`, () => {
+      assert.equal(classifyEgress({ path, content: '# x\n' }), 'deny');
+    });
+  }
+
+  it('still classifies a case-variant skill BODY as opt-in (not a regression to deny)', () => {
+    assert.equal(
+      classifyEgress({ path: '.agents/Skills/foo/SKILL.md', content: '# s\n' }),
+      'opt-in',
+    );
+  });
+});
+
+describe('planEgress — binary content veto is not overridable by --assist-include (re-verify)', () => {
+  it('keeps a non-UTF-8 blob withheld even when an --assist-include glob matches it', () => {
+    const blob = 'PNG ' + '�' + ' rawbytes more';
+    const plan = planEgress([{ path: 'image.bin', content: blob }], makeFlags({ include: ['*.bin'] }));
+    const file = fileFor(plan, 'image.bin');
+    assert.equal(file.included, false);
+    assert.equal(file.bytes, 0);
+    assert.equal(file.content, '');
+    assert.equal(plan.totalBytes, 0);
+  });
+});
