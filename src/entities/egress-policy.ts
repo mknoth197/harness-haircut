@@ -35,40 +35,75 @@ import { scanForSecrets, redactFindings } from './secret-scan.js';
 
 export type EgressClass = 'allow' | 'opt-in' | 'deny';
 
+/** Restrictiveness order: deny is the most restrictive, allow the least. */
+const CLASS_RANK: Record<EgressClass, number> = { deny: 0, 'opt-in': 1, allow: 2 };
+
+/** Returns whichever class is the more restrictive (used to combine path+slot). */
+function moreRestrictive(a: EgressClass, b: EgressClass): EgressClass {
+  return CLASS_RANK[a] <= CLASS_RANK[b] ? a : b;
+}
+
 /** Replacement char — its presence means the source bytes were not valid UTF-8. */
 const NON_UTF8_MARKER = '�';
 
-/** Path-class rules; no match → deny (default-deny catch-all). */
+/** Path segments that hard-deny a file regardless of its basename. */
+const DENY_SEGMENTS = new Set([
+  // Skill folders: only the SKILL.md *body* is opt-in (handled below); every
+  // sibling/attachment (scripts, `.env`, assets) is hard-denied — highest
+  // secret density per the threat model. A `skills` segment anywhere triggers.
+  'skills',
+  // Hook script dirs (`.agents/hooks/`, `.github/hooks/`, …): executable,
+  // deploy creds / internal hosts. A `hooks` segment anywhere triggers.
+  'hooks',
+  // init's non-chosen-candidate backups, at any depth (the dir is matched as
+  // an exact SEGMENT so a look-alike like `…-init-backup-not/` does not).
+  '.harness-haircut-init-backup',
+]);
+
+/**
+ * Path-class rules; no match → deny (default-deny catch-all). The deny rules
+ * are SEGMENT-aware and run BEFORE any allow, so a prose basename can never
+ * win inside a deny-class directory: `.agents/skills/foo/CLAUDE.md` (a skill
+ * sibling that happens to be named like a shim), `pkg/.harness-haircut-init-backup/AGENTS.md`
+ * (a nested backup), and `.agents/hooks/x.md` all deny.
+ */
 function classifyByPath(path: string): EgressClass {
-  // Hard denies named by the threat model come FIRST — before any allow —
-  // so a hook/settings/state/backup path can never be mistaken for prose.
-  // (`.harness-haircut-init-backup/CLAUDE.md` is exactly what init writes
-  // when it backs up a root shim; a suffix-matched allow must not see it.)
-  if (path.startsWith('.agents/hooks/')) {
-    return 'deny';
-  }
+  const segments = path.split('/');
+  // Exact hard-deny files named by the threat model (settings / hook JSON /
+  // tool state). Checked first so they deny even outside a deny segment.
   if (
     path === '.claude/settings.json' ||
     path === '.codex/hooks.json' ||
     path === '.codex/config.toml' ||
-    path === '.gemini/settings.json'
+    path === '.gemini/settings.json' ||
+    path === '.agents/.harness-state.json'
   ) {
     return 'deny';
   }
-  if (path === '.agents/.harness-state.json' || path.startsWith('.harness-haircut-init-backup/')) {
-    return 'deny';
+  // Skill BODY (opt-in): exactly `<root>/skills/<name>/SKILL.md`. Checked
+  // before the `skills` deny-segment rule so the body itself stays opt-in
+  // while every sibling under the folder denies.
+  for (const root of ['.agents/skills/', '.claude/skills/', '.codex/skills/']) {
+    if (path.startsWith(root) && path.endsWith('/SKILL.md')) {
+      const rest = path.slice(root.length, -'/SKILL.md'.length);
+      if (rest !== '' && !rest.includes('/')) {
+        return 'opt-in';
+      }
+    }
   }
-  // Instruction prose (allow): root or nested AGENTS.md / provider shims.
+  // Deny any path that travels through a deny-class directory segment.
+  for (const segment of segments) {
+    if (DENY_SEGMENTS.has(segment)) {
+      return 'deny';
+    }
+  }
+  // Instruction prose (allow): root shims (exact) + AGENTS.md at any depth
+  // (the threat model: "AGENTS.md root+nested"). A nested CLAUDE.md/GEMINI.md
+  // is NOT a thing this tool emits, so those allow only at the repo root.
   if (path === 'AGENTS.md' || path.endsWith('/AGENTS.md')) {
     return 'allow';
   }
-  if (path === 'CLAUDE.md' || path.endsWith('/CLAUDE.md')) {
-    return 'allow';
-  }
-  if (path === 'GEMINI.md' || path.endsWith('/GEMINI.md')) {
-    return 'allow';
-  }
-  if (path === '.github/copilot-instructions.md') {
+  if (path === 'CLAUDE.md' || path === 'GEMINI.md' || path === '.github/copilot-instructions.md') {
     return 'allow';
   }
   // Scoped instruction fragments (allow) — `.md` only; anything else that
@@ -80,18 +115,6 @@ function classifyByPath(path: string): EgressClass {
     path.endsWith('.md')
   ) {
     return 'allow';
-  }
-  // Skill bodies (opt-in): exactly `<root>/skills/<name>/SKILL.md` across the
-  // canonical and provider skill roots. Siblings/attachments under a skill
-  // folder (scripts, assets, `.env`) fall through to deny — highest secret
-  // density per the threat model.
-  for (const root of ['.agents/skills/', '.claude/skills/', '.codex/skills/']) {
-    if (path.startsWith(root) && path.endsWith('/SKILL.md')) {
-      const rest = path.slice(root.length, -'/SKILL.md'.length);
-      if (rest !== '' && !rest.includes('/')) {
-        return 'opt-in';
-      }
-    }
   }
   return 'deny';
 }
@@ -113,20 +136,31 @@ export function classifyCandidateSlot(slot: string): EgressClass {
 }
 
 /**
- * Classification for one egress candidate. The slot (when present) decides
- * the class; the path is the fallback for slot-less files. Non-UTF-8 content
- * (replacement chars survive decoding) hard-denies regardless of either —
- * binary blobs are never instruction prose.
+ * Classification for one egress candidate. The result is the MORE RESTRICTIVE
+ * of the path class and (when a slot is present) the slot class — a slot may
+ * only ever NARROW the path policy, never widen it. This closes the
+ * slot-short-circuit the C5 review found: a hard-denied path
+ * (`.claude/settings.json`) carried under a benign `root-instructions` slot
+ * stays denied, because the path veto is authoritative for the deny classes.
+ *
+ * Non-UTF-8 content (replacement chars survived decoding) or an embedded NUL
+ * hard-denies regardless of class — binary blobs are never instruction prose.
+ * (The byte-true guarantee is enforced at the C4 read boundary, which decodes
+ * with replacement so malformed bytes surface as U+FFFD here.)
  */
 export function classifyEgress(input: {
   path: string;
   slot?: string;
   content: string;
 }): EgressClass {
-  if (input.content.includes(NON_UTF8_MARKER)) {
+  if (input.content.includes(NON_UTF8_MARKER) || input.content.includes('\u0000')) {
     return 'deny';
   }
-  return input.slot !== undefined ? classifyCandidateSlot(input.slot) : classifyByPath(input.path);
+  const pathClass = classifyByPath(input.path);
+  if (input.slot === undefined) {
+    return pathClass;
+  }
+  return moreRestrictive(pathClass, classifyCandidateSlot(input.slot));
 }
 
 /** Caps for `--assist-include` patterns (threat-model finding 3: bounded globs). */
@@ -134,10 +168,88 @@ const MAX_GLOB_LENGTH = 256;
 const MAX_GLOB_WILDCARDS = 16;
 
 /**
+ * Matches one path SEGMENT against one pattern segment, where `*` matches any
+ * run of chars within the segment and `?` matches one. This is the classic
+ * LINEAR glob matcher (single greedy star with one backtrack pointer) — no
+ * nested quantifiers, so no catastrophic backtracking. `**` is handled a
+ * level up by `matchSegments`, never here.
+ */
+function matchSegment(pat: string, str: string): boolean {
+  let p = 0;
+  let s = 0;
+  let star = -1;
+  let mark = 0;
+  while (s < str.length) {
+    if (p < pat.length && (pat[p] === str[s] || pat[p] === '?')) {
+      p++;
+      s++;
+    } else if (p < pat.length && pat[p] === '*') {
+      star = p;
+      mark = s;
+      p++;
+    } else if (star !== -1) {
+      p = star + 1;
+      mark++;
+      s = mark;
+    } else {
+      return false;
+    }
+  }
+  while (p < pat.length && pat[p] === '*') {
+    p++;
+  }
+  return p === pat.length;
+}
+
+/**
+ * Segment-wise glob match with memoization. A globstar consumes zero or more
+ * whole path segments; every other pattern segment must match exactly one
+ * path segment via `matchSegment`. The `failed` memo (keyed on the (pi, si)
+ * pair) makes this O(patternSegments × pathSegments) — it CANNOT exhibit the
+ * exponential blow-up the previous adjacent-globstar regex did on stacked
+ * globstar patterns (threat-model finding 3).
+ */
+function matchSegments(pat: readonly string[], path: readonly string[]): boolean {
+  const failed = new Set<number>();
+  const stride = path.length + 1;
+  const go = (pi: number, si: number): boolean => {
+    if (pi === pat.length) {
+      return si === path.length;
+    }
+    const key = pi * stride + si;
+    if (failed.has(key)) {
+      return false;
+    }
+    let result: boolean;
+    if (pat[pi] === '**') {
+      // Try consuming 0..N remaining segments with this `**`.
+      result = false;
+      for (let k = si; k <= path.length; k++) {
+        if (go(pi + 1, k)) {
+          result = true;
+          break;
+        }
+      }
+    } else if (si < path.length && matchSegment(pat[pi]!, path[si]!)) {
+      result = go(pi + 1, si + 1);
+    } else {
+      result = false;
+    }
+    if (!result) {
+      failed.add(key);
+    }
+    return result;
+  };
+  return go(0, 0);
+}
+
+/**
  * Minimal bounded glob for `--assist-include`: `**` crosses segments, `*`
  * and `?` stay within one. Comparison is over repo-relative POSIX paths. A
  * pattern over the length/wildcard caps matches NOTHING (fail-closed: a
- * hostile or runaway pattern cannot widen egress, only fail to).
+ * hostile or runaway pattern cannot widen egress, only fail to). Matching is
+ * linear-time (`matchSegments`), so an adversarial pattern cannot hang the
+ * CLI either — it can only fail to match.
  */
 export function matchesGlob(pattern: string, path: string): boolean {
   if (pattern.length > MAX_GLOB_LENGTH) {
@@ -152,25 +264,16 @@ export function matchesGlob(pattern: string, path: string): boolean {
   if (wildcards > MAX_GLOB_WILDCARDS) {
     return false;
   }
-  let re = '^';
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i]!;
-    if (ch === '*') {
-      if (pattern[i + 1] === '*') {
-        // `**/` (or trailing `**`) — any number of whole segments.
-        re += pattern[i + 2] === '/' ? '(?:[^/]+/)*' : '.*';
-        i += pattern[i + 2] === '/' ? 2 : 1;
-      } else {
-        re += '[^/]*';
-      }
-    } else if (ch === '?') {
-      re += '[^/]';
-    } else {
-      re += /[A-Za-z0-9_]/.test(ch) ? ch : `\\${ch}`;
+  // Collapse runs of adjacent `**` segments (`**/**/…` ≡ `**`) so a stacked
+  // pattern reduces to a single globstar before matching.
+  const patSegments: string[] = [];
+  for (const segment of pattern.split('/')) {
+    if (segment === '**' && patSegments[patSegments.length - 1] === '**') {
+      continue;
     }
+    patSegments.push(segment);
   }
-  re += '$';
-  return new RegExp(re).test(path);
+  return matchSegments(patSegments, path.split('/'));
 }
 
 /** One candidate file/text under egress consideration. */

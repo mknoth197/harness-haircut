@@ -57,12 +57,14 @@ function first<T>(items: readonly T[], what: string): T {
 
 describe('classifyEgress — U1 default-deny matrix (threat-model class table)', () => {
   // ALLOW row: instruction prose is the only thing the merge reasons about.
+  // AGENTS.md is allowed root+nested; CLAUDE.md/GEMINI.md are root shims, so
+  // they allow only at the repo root (a nested CLAUDE.md is not a thing this
+  // tool emits and must not be trusted as prose by path — see denyPaths).
   const allowPaths = [
     'AGENTS.md',
     'pkg/sub/AGENTS.md',
     'CLAUDE.md',
     'GEMINI.md',
-    'docs/CLAUDE.md',
     '.github/copilot-instructions.md',
     '.agents/instructions/testing.md',
     '.github/instructions/x.instructions.md',
@@ -87,7 +89,9 @@ describe('classifyEgress — U1 default-deny matrix (threat-model class table)',
   }
 
   // HARD-DENY rows: hooks, settings/hook JSON, skill siblings, tool state,
-  // and the unknown-path catch-all.
+  // and the unknown-path catch-all. The prose-named entries are C5-review
+  // regressions: a deny-class directory must beat a prose basename, so a
+  // skill sibling / nested backup / nested hook named like a shim still denies.
   const denyPaths = [
     '.agents/hooks/deploy.sh',
     '.claude/settings.json',
@@ -100,12 +104,39 @@ describe('classifyEgress — U1 default-deny matrix (threat-model class table)',
     '.agents/skills/a/b/SKILL.md',
     '.agents/instructions/helper.sh',
     'README.md',
+    // nested CLAUDE.md/GEMINI.md are not root shims → not prose-by-path.
+    'docs/CLAUDE.md',
+    'pkg/GEMINI.md',
+    // prose-named skill SIBLINGS (highest secret density) must still deny.
+    '.agents/skills/deployer/CLAUDE.md',
+    '.claude/skills/deployer/AGENTS.md',
+    '.codex/skills/deployer/GEMINI.md',
+    // hook scripts named like prose, and hook dirs at any provider root.
+    '.agents/hooks/AGENTS.md',
+    '.github/hooks/CLAUDE.md',
+    // backups at nested depth (top-level-only prefix used to miss these).
+    'old/.harness-haircut-init-backup/CLAUDE.md',
+    '.harness-haircut-init-backup/AGENTS.md',
   ];
   for (const path of denyPaths) {
     it(`classifies ${path} as deny by default`, () => {
       assert.equal(classifyEgress({ path, content: 'x\n' }), 'deny');
     });
   }
+
+  it('allows a backup-LOOKALIKE dir only because its CLAUDE.md basename is not root (catch-all deny)', () => {
+    // `…-init-backup-not/` is NOT the exact backup segment, but a nested
+    // CLAUDE.md is denied anyway by the catch-all — proving the lookalike
+    // cannot smuggle prose through the suffix match.
+    assert.equal(
+      classifyEgress({ path: 'evil/.harness-haircut-init-backup-not/CLAUDE.md', content: '# x\n' }),
+      'deny',
+    );
+  });
+
+  it('denies content carrying an embedded NUL byte even at an allowed path', () => {
+    assert.equal(classifyEgress({ path: 'AGENTS.md', content: 'pre\u0000post' }), 'deny');
+  });
 
   it('classifies a backup-dir file with a non-shim name as deny', () => {
     assert.equal(
@@ -152,16 +183,38 @@ describe('classifyCandidateSlot — resolver candidates classify by slot (U1)', 
     assert.equal(classifyCandidateSlot('something-else'), 'deny');
   });
 
-  it('lets a provided slot take precedence over the path in classifyEgress', () => {
-    // Deny-class path, prose slot → the slot decides: allow.
+  it('combines slot and path as the MORE RESTRICTIVE class (a slot may only narrow, never widen)', () => {
+    // C5-review fix: a hard-denied PATH vetoes any benign slot — a denied
+    // settings.json carried under a root-instructions slot stays denied, so
+    // C4 can never widen egress by mispairing a slot with a denied path.
     assert.equal(
       classifyEgress({ path: '.claude/settings.json', slot: 'root-instructions', content: '{}\n' }),
-      'allow',
+      'deny',
     );
-    // Allow-class path, skill slot → the slot decides: opt-in.
+    assert.equal(
+      classifyEgress({ path: '.agents/hooks/deploy.sh', slot: 'fragment:x', content: '#!/bin/sh\n' }),
+      'deny',
+    );
+    // A slot narrows an allow-class path: AGENTS.md under a skill slot → opt-in.
     assert.equal(
       classifyEgress({ path: 'AGENTS.md', slot: 'skill:demo', content: '# x\n' }),
       'opt-in',
+    );
+    // A skill body keeps its opt-in even if mislabeled with a prose slot
+    // (the path is opt-in, the slot allow → strictest is opt-in, never allow).
+    assert.equal(
+      classifyEgress({
+        path: '.agents/skills/foo/SKILL.md',
+        slot: 'root-instructions',
+        content: '# x\n',
+      }),
+      'opt-in',
+    );
+    // The legitimate candidate path: a root shim recovered as root-instructions
+    // stays allow (path allow, slot allow).
+    assert.equal(
+      classifyEgress({ path: 'CLAUDE.md', slot: 'root-instructions', content: '# x\n' }),
+      'allow',
     );
   });
 });
@@ -300,14 +353,14 @@ describe('planEgress — secret scan hard block (U2)', () => {
     const plan = planEgress(
       [
         { path: 'AGENTS.md', content: '# clean prose\n' },
-        { path: 'docs/CLAUDE.md', content: `# notes\n${SYNTHETIC_AWS_KEY}\n` },
+        { path: 'docs/AGENTS.md', content: `# notes\n${SYNTHETIC_AWS_KEY}\n` },
       ],
       makeFlags(),
     );
     assert.equal(plan.decision, 'blocked');
     const blocker = first(plan.blockers, 'blocker');
     assert.equal(blocker.ruleId, 'aws-access-key-id');
-    assert.equal(blocker.path, 'docs/CLAUDE.md');
+    assert.equal(blocker.path, 'docs/AGENTS.md');
     assert.equal(blocker.line, 2);
   });
 
@@ -315,7 +368,7 @@ describe('planEgress — secret scan hard block (U2)', () => {
     const plan = planEgress(
       [
         { path: 'AGENTS.md', content: '# clean prose\n' },
-        { path: 'docs/CLAUDE.md', content: `# notes\n${SYNTHETIC_AWS_KEY}\n` },
+        { path: 'docs/AGENTS.md', content: `# notes\n${SYNTHETIC_AWS_KEY}\n` },
       ],
       makeFlags(),
     );
@@ -450,5 +503,24 @@ describe('checkEndpointPolicy — approved-only endpoint allowlist (OPT1)', () =
     const result = checkEndpointPolicy({ policy: 'approved-only', approved: [] }, 'anthropic');
     assert.equal(result.allowed, false);
     assert.match(result.reason ?? '', /\(none\)/);
+  });
+});
+
+describe('matchesGlob — bounded-time on stacked globstars (review: ReDoS, threat-model finding 3)', () => {
+  it('returns quickly (no catastrophic backtracking) on stacked **/ vs a deep non-matching path', () => {
+    const pattern = '**/'.repeat(8) + 'x.md'; // 28 chars, 16 wildcards — inside both caps
+    const path = 'a/'.repeat(120) + 'b'; // deep, cannot match the trailing x.md
+    const start = process.hrtime.bigint();
+    const result = matchesGlob(pattern, path);
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    assert.equal(result, false);
+    // The old adjacent-`(?:[^/]+/)*` regex took tens of seconds here; the
+    // linear matcher must stay well under a small budget.
+    assert.equal(elapsedMs < 50, true, `matchesGlob took ${elapsedMs.toFixed(1)}ms (expected < 50)`);
+  });
+
+  it('still matches correctly when stacked globstars are semantically a single **', () => {
+    assert.equal(matchesGlob('**/'.repeat(8) + 'x.md', 'a/b/c/x.md'), true);
+    assert.equal(matchesGlob('**/x.md', 'a/b/c/x.md'), true);
   });
 });

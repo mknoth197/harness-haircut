@@ -29,11 +29,6 @@ export interface EgressDestination {
   tosCaveat?: string;
 }
 
-export interface DisclosureOptions {
-  /** EV4 default-ON body preview; `--no-preview` sets this false (UN2). */
-  preview: boolean;
-}
-
 function fileLine(file: EgressFileDecision): string {
   if (file.included) {
     const via = file.viaInclude

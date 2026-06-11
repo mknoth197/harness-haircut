@@ -38,7 +38,10 @@ const GITLAB_PAT = 'glpat-' + 'Aa0Bb1' + 'Cc2Dd3Ee4Ff5Gg';
 const SLACK_XOXB = 'xoxb-' + '0123456789' + 'abcdef';
 const GOOGLE_KEY = 'AIza' + 'Sy' + 'B'.repeat(33); // AIza + exactly 35 chars
 const ANTHROPIC_KEY = 'sk-' + 'ant-' + 'x'.repeat(24);
-const OPENAI_KEY = 'sk-' + 'proj' + '0'.repeat(20);
+// OpenAI's `sk-` rule additionally requires the body to clear the entropy
+// floor (the prefix is too short to anchor on alone), so this fixture is a
+// realistic high-entropy key body, not a repeated char.
+const OPENAI_KEY = 'sk-' + 'T3hK9wL2pR5tZ8vN4qX7bM1cF6yH0jD5sG3aE';
 const NPM_TOKEN = 'npm_' + 'a1B2'.repeat(9); // npm_ + exactly 36 chars
 // 24 distinct [A-Za-z0-9] chars -> Shannon entropy log2(24) ~ 4.58 >= 4.0
 const HIGH_ENTROPY = 'Zq8Xv3' + 'Lw9Tn5' + 'Rd2Yf7' + 'Km4Jh6';
@@ -288,5 +291,101 @@ describe('scanForSecrets() output ordering', () => {
       ['slack-token', 'aws-access-key-id'],
     );
     assert.equal(findings[0]!.start < findings[1]!.start, true);
+  });
+});
+
+// --- C5 adversarial-review regressions (U2 bypass hardening) ---
+
+describe('scanForSecrets() — shape rules fire when glued after a word char (review: critical)', () => {
+  // The old leading \b meant a real token glued immediately after a word char
+  // (e.g. `key=xghp_…`) had no boundary and was MISSED entirely. Each
+  // distinctive-prefix shape must now fire glued after a letter.
+  const glued: ReadonlyArray<{ ruleId: string; sample: string }> = [
+    { ruleId: 'aws-access-key-id', sample: AWS_AKIA },
+    { ruleId: 'jwt', sample: JWT },
+    { ruleId: 'github-token', sample: GITHUB_GHP },
+    { ruleId: 'gitlab-pat', sample: GITLAB_PAT },
+    { ruleId: 'slack-token', sample: SLACK_XOXB },
+    { ruleId: 'google-api-key', sample: GOOGLE_KEY },
+    { ruleId: 'anthropic-api-key', sample: ANTHROPIC_KEY },
+    { ruleId: 'npm-token', sample: NPM_TOKEN },
+  ];
+  for (const { ruleId, sample } of glued) {
+    it(`flags ${ruleId} when glued immediately after a word char`, () => {
+      const ids = scanForSecrets('AGENTS.md', `key=x${sample}\n`).map((f) => f.ruleId);
+      assert.equal(ids.includes(ruleId), true);
+    });
+  }
+
+  it('flags a glued OpenAI key (high entropy) but not an ordinary hyphenated word-chain', () => {
+    assert.equal(
+      scanForSecrets('AGENTS.md', `key=x${OPENAI_KEY}\n`)
+        .map((f) => f.ruleId)
+        .includes('openai-api-key'),
+      true,
+    );
+    // `task-oriented-…` satisfies the sk- shape but is low-entropy prose — the
+    // entropy gate keeps it from a false-positive hard block.
+    const phrase = 'we follow a task-oriented-development-workflow-and-conventions approach\n';
+    assert.equal(
+      scanForSecrets('AGENTS.md', phrase)
+        .map((f) => f.ruleId)
+        .includes('openai-api-key'),
+      false,
+    );
+  });
+});
+
+describe('scanForSecrets() — invisible/format chars cannot split a token (review)', () => {
+  it('detects a token split by a zero-width space and redacts the whole original span', () => {
+    const zwsp = '​';
+    const token = 'ghp_' + 'B'.repeat(36);
+    const split = 'ghp_' + 'B'.repeat(18) + zwsp + 'B'.repeat(18);
+    const content = `value ${split} end\n`;
+    const findings = scanForSecrets('AGENTS.md', content);
+    assert.equal(findings.map((f) => f.ruleId).includes('github-token'), true);
+    const redacted = redactFindings(content, findings.filter((f) => f.ruleId === 'github-token'));
+    // The zero-width char sat inside the secret, so the redaction must remove
+    // the whole run — no fragment of the token (or the splitter) survives.
+    assert.equal(redacted.includes('BBBB'), false);
+    assert.equal(redacted.includes(zwsp), false);
+    assert.match(redacted, /\[REDACTED:github-token\]/);
+    void token;
+  });
+});
+
+describe('scanForSecrets() — keyword adjacency spans the previous line and CRLF files (review)', () => {
+  it('fires when the credential keyword is on the line ABOVE the value', () => {
+    const content = `aws secret access key\n${HIGH_ENTROPY}Qx7\n`;
+    const ids = scanForSecrets('AGENTS.md', content).map((f) => f.ruleId);
+    assert.equal(ids.includes('high-entropy-string'), true);
+  });
+
+  it('fires on a CRLF same-line keyword=value (line endings normalized)', () => {
+    const content = `prefix\r\ntoken=${HIGH_ENTROPY}Qx7\r\nmore\r\n`;
+    const ids = scanForSecrets('AGENTS.md', content).map((f) => f.ruleId);
+    assert.equal(ids.includes('high-entropy-string'), true);
+  });
+});
+
+describe('scanForSecrets() — long-hex secrets (review: 64-hex escapes the 4.0 entropy floor)', () => {
+  it('flags a 64-hex secret on a keyword line via the dedicated hex rule', () => {
+    const hex = 'a3f9c1d2e4b5078690fedcba12345678a3f9c1d2e4b5078690fedcba12345678';
+    const ids = scanForSecrets('AGENTS.md', `deploy_token = ${hex}\n`).map((f) => f.ruleId);
+    assert.equal(ids.includes('hex-secret'), true);
+  });
+
+  it('does not flag a 40-hex git SHA when no credential keyword is near', () => {
+    const sha = '0123456789abcdef0123456789abcdef01234567';
+    const ids = scanForSecrets('AGENTS.md', `commit ${sha} landed the fix\n`).map((f) => f.ruleId);
+    assert.equal(ids.includes('hex-secret'), false);
+  });
+});
+
+describe('scanForSecrets() — dotted high-entropy value (review)', () => {
+  it('flags a dotted high-entropy value on a keyword line as one run', () => {
+    const dotted = 'aB3.xK9.mQ7.wL2.pR5.tZ8.vN4.kH1.jD6';
+    const ids = scanForSecrets('AGENTS.md', `api_key: ${dotted}\n`).map((f) => f.ruleId);
+    assert.equal(ids.includes('high-entropy-string'), true);
   });
 });
