@@ -325,4 +325,40 @@ describe('isIgnored (pure matcher)', () => {
     // A realistic multi-wildcard pattern stays under the cap and works.
     assert.equal(ignored('build/**/*.min.*\n', 'build/a/b/x.min.js'), true);
   });
+
+  // BLOCKER 2 (live bypass): a single segment with many intra-segment '*' runs
+  // compiled to that many concatenated '[^/]*' groups — the catastrophic-
+  // backtracking shape (the old measurement: 18 stars vs a 29-char path ~44s).
+  // The >50 cap did NOT catch this (18 < 50). The fix collapses each '*' run to
+  // a single '[^/]*', so the pattern compiles, matches correctly, and returns
+  // fast — verified here against a crafted non-matching path that maximizes the
+  // old backtracking.
+  it('collapses an intra-segment *-run so it matches fast (no catastrophic backtracking)', () => {
+    // 18 stars in ONE segment, well under the 50-wildcard cap (so NOT dropped).
+    const pattern = `${'*'.repeat(18)}.zzz\n`;
+    const patterns = parseGitignore(pattern);
+    assert.equal(patterns.length, 1, 'the pattern compiled (not dropped by a cap)');
+
+    // A 29-char single segment that fails the literal tail '.zzz' — the worst
+    // case for adjacent unbounded quantifiers under the old compiler.
+    const adversarial = 'a'.repeat(29);
+    const start = Date.now();
+    const verdict = ignored(pattern, adversarial);
+    const elapsed = Date.now() - start;
+    assert.equal(verdict, false, 'a segment without the .zzz tail is not matched');
+    assert.ok(elapsed < 100, `matched in ${elapsed}ms (must be <100ms)`);
+
+    // And a path the collapsed '*'-run SHOULD match (any within-segment run).
+    assert.equal(ignored(pattern, 'anything-here.zzz'), true);
+  });
+
+  it('a collapsed *-run matches any within-segment run but never spans a separator', () => {
+    // '***' collapses to one '*' → matches any run of non-'/' chars.
+    assert.equal(ignored('a***b\n', 'aXYZb'), true);
+    assert.equal(ignored('a***b\n', 'ab'), true);
+    // A mixed multi-star segment still matches within one segment...
+    assert.equal(ignored('a*b*c\n', 'aXbYc'), true);
+    // ...and never spans a '/' (each '*' is [^/]*).
+    assert.equal(ignored('a*b*c\n', 'aX/bYc'), false);
+  });
 });

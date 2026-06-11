@@ -16,6 +16,7 @@ import {
   existsSync,
   statSync,
   lstatSync,
+  realpathSync,
   writeFileSync,
   mkdirSync,
   rmSync,
@@ -29,94 +30,176 @@ function toAbsolute(root: string, relPath: string): string {
 }
 
 /**
- * SECURITY: never read/write *through* a symlink — same rule the provider-file
- * reader and the snapshot walk enforce. A hostile repo could point an owned
- * path (e.g. CLAUDE.md, a co-owned settings.json) at an out-of-repo secret;
- * following the link on read would exfiltrate it, and following it on write
- * would corrupt the external target. `read`/`exists` therefore treat a symlink
- * as absent, and `write` unlinks an existing symlink first so it lays down a
- * real file *inside* the repo instead of following the link out.
+ * SECURITY (realpath containment — the whole symlink chain): same rule the
+ * provider-file reader and the snapshot walk enforce, now resolving the FULL
+ * chain rather than only the leaf. A hostile repo could escape the tree two
+ * ways: a symlinked leaf (CLAUDE.md → an external secret) OR a symlinked
+ * PARENT dir (.github → /tmp/external) with an ordinary leaf behind it. The
+ * old leaf-only `lstat` missed the second: a write to `.github/x.md` would
+ * mkdir/write THROUGH the symlinked parent and clobber `/tmp/external/x.md`,
+ * landing outside the repo (violating U1's adapter-declared-paths invariant).
+ *
+ * `read`/`exists` resolve the whole chain with `realpathSync` and require
+ * containment (and reject a symlinked leaf outright, matching the walk).
+ * `write` realpaths the DEEPEST EXISTING ANCESTOR directory and requires IT to
+ * be contained BEFORE creating any directory — so mkdir can never run through
+ * an escaping symlinked parent — then unlinks a symlinked leaf so the final
+ * write lands as a real file strictly inside the repo.
  */
-function isSymlink(abs: string): boolean {
+function realIfContained(realRoot: string, abs: string): string | null {
   try {
-    return lstatSync(abs).isSymbolicLink();
+    if (lstatSync(abs).isSymbolicLink()) {
+      return null;
+    }
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return false;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return null;
     }
     throw new FileSystemError(abs, err);
+  }
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'EISDIR') {
+      return null;
+    }
+    throw new FileSystemError(abs, err);
+  }
+  if (real !== realRoot && !real.startsWith(realRoot + sep)) {
+    return null;
+  }
+  return real;
+}
+
+/**
+ * SECURITY: resolve the deepest EXISTING ancestor directory of `abs` and
+ * require it to be `realRoot` or strictly beneath it. Returns the real path of
+ * that ancestor so the caller can mkdir the rest from a known-contained base.
+ * Walking up to the first directory that exists lets a not-yet-created target
+ * (the common case for `write`) still be validated: if any existing parent is
+ * a symlink that escapes the repo, realpathSync collapses it and the
+ * containment check fails — so we never mkdir/write through an escaping
+ * symlinked parent. Throws if the nearest existing ancestor escapes the root.
+ */
+function assertParentContained(realRoot: string, abs: string): void {
+  let ancestor = dirname(abs);
+  // dirname() is a fixpoint at the filesystem root ('/'), so this terminates.
+  for (;;) {
+    if (existsSync(ancestor)) {
+      let realAncestor: string;
+      try {
+        realAncestor = realpathSync(ancestor);
+      } catch (err) {
+        throw new FileSystemError(ancestor, err);
+      }
+      if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + sep)) {
+        throw new FileSystemError(
+          abs,
+          new Error(
+            `refusing to write through a path that escapes repo root ${realRoot}: ${abs}`,
+          ),
+        );
+      }
+      return;
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) {
+      // Reached the filesystem root without finding an existing ancestor —
+      // impossible when rooted under realRoot, but bail rather than loop.
+      return;
+    }
+    ancestor = parent;
   }
 }
 
 /**
- * SECURITY: assert the write target stays inside the repo root. Callers pass
- * repo-relative POSIX paths, but a `..` segment or an absolute path would
- * escape the tree (e.g. `init` writing recovered content, or a future caller
- * deriving a path from untrusted input). We resolve against the (resolved)
- * root and require the result to be the root itself or a descendant of it.
- * Throwing here keeps the single mutation surface from ever writing outside
- * the repo it was rooted at.
+ * SECURITY: assert the write target stays inside the repo root by NAME (before
+ * any filesystem access). Callers pass repo-relative POSIX paths, but a `..`
+ * segment or an absolute path would escape the tree (e.g. `init` writing
+ * recovered content, or a future caller deriving a path from untrusted input).
+ * We resolve against `realRoot` and require the result to be the root itself
+ * or a descendant. This is the lexical first line of defense; the realpath
+ * ancestor check (assertParentContained) then closes symlinked-parent escapes.
  */
-function assertContained(root: string, relPath: string): string {
-  const resolvedRoot = resolve(root);
+function assertContained(realRoot: string, relPath: string): string {
   // Resolve the path as-given (not split into segments): an ABSOLUTE relPath
   // then wins over root and resolves outside it (correctly rejected below), and
   // any `..` segment is normalized so an escape is detectable.
-  const abs = resolve(resolvedRoot, relPath);
-  if (abs !== resolvedRoot && !abs.startsWith(resolvedRoot + sep)) {
+  const abs = resolve(realRoot, relPath);
+  if (abs !== realRoot && !abs.startsWith(realRoot + sep)) {
     throw new FileSystemError(
       abs,
-      new Error(`refusing to write outside repo root ${resolvedRoot}: ${relPath}`),
+      new Error(`refusing to write outside repo root ${realRoot}: ${relPath}`),
     );
   }
   // Return the segment-joined absolute path so POSIX relPaths map to the OS
   // separator exactly as `toAbsolute` (the prior behavior) produced them.
-  return toAbsolute(resolvedRoot, relPath);
+  return toAbsolute(realRoot, relPath);
 }
 
 /** Creates a `FileWriter` over the real filesystem rooted at `root`. */
 export function createFileWriter(root: string): FileWriter {
+  // `root` is trusted; resolve it once so containment compares real paths
+  // against a real root (the root may itself sit behind a symlink such as
+  // macOS /var → /private/var, and every target realpath would too).
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch (err) {
+    throw new FileSystemError(root, err);
+  }
   return {
     read(relPath: string): string | null {
-      const abs = toAbsolute(root, relPath);
-      // SECURITY: a symlinked target reads as absent — never follow it.
-      if (isSymlink(abs)) {
+      const abs = toAbsolute(realRoot, relPath);
+      // SECURITY: only read a target whose whole chain stays inside realRoot
+      // and whose leaf is not itself a symlink (see realIfContained).
+      const real = realIfContained(realRoot, abs);
+      if (real === null) {
         return null;
       }
       let content: string;
       try {
-        content = readFileSync(abs, 'utf8');
+        content = readFileSync(real, 'utf8');
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code === 'ENOENT' || code === 'EISDIR') {
           return null;
         }
-        throw new FileSystemError(abs, err);
+        throw new FileSystemError(real, err);
       }
       return content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
     },
     exists(relPath: string): boolean {
-      const abs = toAbsolute(root, relPath);
-      // SECURITY: a symlink is reported absent (consistent with read).
-      if (isSymlink(abs)) {
+      const abs = toAbsolute(realRoot, relPath);
+      // SECURITY: a target that escapes the repo or whose leaf is a symlink is
+      // reported absent (consistent with read).
+      const real = realIfContained(realRoot, abs);
+      if (real === null) {
         return false;
       }
       try {
-        return existsSync(abs) && statSync(abs).isFile();
+        return existsSync(real) && statSync(real).isFile();
       } catch (err) {
-        throw new FileSystemError(abs, err);
+        throw new FileSystemError(real, err);
       }
     },
     write(relPath: string, content: string): void {
-      // SECURITY: reject any relPath that escapes the repo root before we
-      // touch the disk (throws FileSystemError; see assertContained).
-      const abs = assertContained(root, relPath);
+      // SECURITY: lexical containment first — reject `..`/absolute escapes
+      // before any filesystem access (throws FileSystemError).
+      const abs = assertContained(realRoot, relPath);
+      // SECURITY: then realpath the deepest existing ancestor and require it is
+      // inside realRoot BEFORE mkdir, so we never create directories or write
+      // through an escaping symlinked parent (the symlinked-parent-dir bypass).
+      assertParentContained(realRoot, abs);
       try {
         mkdirSync(dirname(abs), { recursive: true });
-        // SECURITY: if a symlink already occupies the target, remove the LINK
-        // (not its target) so we write a real file inside the repo rather than
-        // following the link out to corrupt an external file.
-        if (isSymlink(abs)) {
+        // SECURITY: if a symlink already occupies the target leaf, remove the
+        // LINK (not its target) so we write a real file inside the repo rather
+        // than following the link out to corrupt an external file.
+        if (lstatExistsSymlink(abs)) {
           rmSync(abs);
         }
         writeFileSync(abs, content, 'utf8');
@@ -125,4 +208,16 @@ export function createFileWriter(root: string): FileWriter {
       }
     },
   };
+}
+
+/** True when `abs` exists and is a symlink (false on ENOENT). */
+function lstatExistsSymlink(abs: string): boolean {
+  try {
+    return lstatSync(abs).isSymbolicLink();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw new FileSystemError(abs, err);
+  }
 }

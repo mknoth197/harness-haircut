@@ -98,4 +98,35 @@ describe('createProviderFileReader', () => {
     assert.equal(reader.read('GEMINI.md'), null);
     assert.equal(reader.exists('GEMINI.md'), false);
   });
+
+  // BLOCKER 1 (live bypass): the prior guard only lstat'd the LEAF. A symlinked
+  // PARENT DIR (.github → /tmp/external) with an ordinary, non-symlink real
+  // leaf behind it (copilot-instructions.md holding a secret) sailed past the
+  // leaf lstat and readFileSync followed the chain — exfiltrating the secret.
+  // Realpath-containment now resolves the WHOLE chain and rejects it as absent.
+  it('does not read through a symlinked PARENT directory that escapes the repo', async () => {
+    // External dir with a perfectly ordinary (non-symlink) secret file in it.
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-external-'));
+    await writeFile(join(outside, 'copilot-instructions.md'), 'EXFIL-SECRET\n', 'utf8');
+
+    const repo = await repoWith({ 'AGENTS.md': '# real\n' });
+    // .github is a symlink to the external dir; its leaf is a real file.
+    await symlink(outside, join(repo.root, '.github'));
+
+    const reader = createProviderFileReader(repo.root);
+    // The secret behind the symlinked parent is NOT read (treated as absent).
+    assert.equal(reader.read('.github/copilot-instructions.md'), null);
+    assert.equal(reader.exists('.github/copilot-instructions.md'), false);
+    // A normal in-repo file still reads fine.
+    assert.equal(reader.read('AGENTS.md'), '# real\n');
+
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('still reads a legitimate deep real file (containment allows in-repo paths)', async () => {
+    const repo = await repoWith({ '.agents/skills/x/SKILL.md': 'deep\n' });
+    const reader = createProviderFileReader(repo.root);
+    assert.equal(reader.read('.agents/skills/x/SKILL.md'), 'deep\n');
+    assert.equal(reader.exists('.agents/skills/x/SKILL.md'), true);
+  });
 });

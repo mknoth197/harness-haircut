@@ -119,4 +119,40 @@ describe('createFileWriter()', () => {
 
     await rm(outside, { recursive: true, force: true });
   });
+
+  // BLOCKER 1 (live bypass, write side): the prior guard only lstat'd the LEAF,
+  // so a write to `.github/x.md` where `.github` is a symlink to an external
+  // dir would mkdir/write THROUGH the symlinked parent and clobber the external
+  // file — landing outside the repo (violates U1 adapter-declared-paths). The
+  // realpath-ancestor check now refuses the write before any disk mutation.
+  it('refuses to write through a symlinked PARENT directory (no clobber outside repo)', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-external-'));
+    const externalFile = join(outside, 'copilot-instructions.md');
+    await writeFile(externalFile, 'EXTERNAL-ORIGINAL\n', 'utf8');
+
+    const repo = await freshRepo();
+    // .github inside the repo is a symlink to the external dir.
+    await symlink(outside, join(repo.root, '.github'));
+    const writer = createFileWriter(repo.root);
+
+    // The write must be refused — it would otherwise land at outside/...
+    assert.throws(
+      () => writer.write('.github/copilot-instructions.md', 'PROJECTED\n'),
+      /escapes repo root|outside repo root/,
+    );
+    // The external file was NOT clobbered.
+    assert.equal(await readFile(externalFile, 'utf8'), 'EXTERNAL-ORIGINAL\n');
+
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('still writes a legitimate deep path through real directories', async () => {
+    const repo = await freshRepo();
+    const writer = createFileWriter(repo.root);
+    writer.write('.agents/skills/x/SKILL.md', 'ok\n');
+    assert.equal(
+      await readFile(join(repo.root, '.agents', 'skills', 'x', 'SKILL.md'), 'utf8'),
+      'ok\n',
+    );
+  });
 });

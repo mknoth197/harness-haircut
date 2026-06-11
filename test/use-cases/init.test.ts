@@ -502,6 +502,50 @@ describe('init() — FIX 1 symlinked root-instruction candidate (security)', () 
 
     await rm(outside, { recursive: true, force: true });
   });
+
+  // BLOCKER 1 (live bypass, end-to-end): a symlinked PARENT dir — .github →
+  // /tmp/external — with an ORDINARY real leaf (copilot-instructions.md holding
+  // a secret) defeated the old leaf-only lstat. init read the secret THROUGH
+  // the symlinked parent into canonical AGENTS.md and projected it everywhere.
+  // Realpath-containment now treats the whole escaping chain as absent, and the
+  // writer refuses to project back through the symlinked parent.
+  it('does NOT recover a secret behind a symlinked PARENT directory (.github → external)', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-external-'));
+    await writeFile(
+      join(outside, 'copilot-instructions.md'),
+      'EXFIL_SECRET=topsecret-parent-dir\n',
+      'utf8',
+    );
+
+    const repo = await setup({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+    });
+    // .github is a symlink to the external dir; the leaf behind it is a real file.
+    await symlink(outside, join(repo.root, '.github'));
+
+    // READ side: the secret behind the symlinked parent is never recovered. The
+    // WRITE side then refuses to project back through the symlinked `.github`
+    // parent (it would land outside the repo) — surfacing as a thrown
+    // FileSystemError rather than a silent clobber. Either way the secret is
+    // contained, so we accept the throw and assert the security invariants hold.
+    await assert.rejects(
+      runInit(repo.root),
+      (err: unknown) =>
+        err instanceof Error && /escapes repo root|outside repo root/.test(err.message),
+    );
+
+    // The secret never reached canonical AGENTS.md (read guard held).
+    const canonical = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(canonical, /topsecret-parent-dir/);
+    assert.doesNotMatch(canonical, /EXFIL_SECRET/);
+    // And the external file was never clobbered by a projection write-through.
+    assert.equal(
+      await readFile(join(outside, 'copilot-instructions.md'), 'utf8'),
+      'EXFIL_SECRET=topsecret-parent-dir\n',
+    );
+
+    await rm(outside, { recursive: true, force: true });
+  });
 });
 
 describe('init() — FIX 2(a) unsafe discovered names skipped + noted', () => {
