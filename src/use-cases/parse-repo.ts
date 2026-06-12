@@ -5,7 +5,7 @@
  */
 import type { FileSnapshot, RepoSnapshot } from '../entities/adapter.js';
 import { APPLY_STATE_PATH } from '../entities/apply-state.js';
-import { ParseError } from '../entities/errors.js';
+import { AggregateParseError, ParseError } from '../entities/errors.js';
 import type { Attachment, Hook, IR, Instruction, Skill } from '../entities/ir.js';
 import { HOOK_EVENTS, isHookEvent, SAFE_NAME_RE } from '../entities/ir.js';
 import type { Warning } from '../entities/warnings.js';
@@ -37,9 +37,12 @@ interface Frontmatter {
  *   - `key: [a, b]` inline arrays of unquoted scalars
  *   - `key:` followed by `- item` block-sequence lines
  *   - blank lines and full-line `#` comments
+ *   - ` #` inside a cleanly-quoted scalar (`description: "fix issue #12"`)
+ *     is literal text — YAML cannot start a comment inside quotes (#36)
  * Rejected (exit code 3, F1 UN2) rather than silently mis-parsed:
- *   - values containing ` #` — YAML trailing comments are outside the
- *     supported subset
+ *   - UNQUOTED values containing ` #` — YAML trailing comments are outside
+ *     the supported subset, and providers genuinely mis-parse these (Claude
+ *     Code truncates an unquoted description at the `#`)
  *   - inline array items containing `"` or `'` — quoted items may embed
  *     commas, which the comma-split cannot handle faithfully
  *   - anything else (nested maps, multi-line scalars, anchors, …)
@@ -75,7 +78,9 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
     }
     const key = keyMatch[1] ?? '';
     const rest = (keyMatch[2] ?? '').trim();
-    rejectTrailingComment(rest, key, lineNo, filePath);
+    if (!isCleanlyQuoted(rest)) {
+      rejectTrailingComment(rest, key, lineNo, filePath);
+    }
     if (rest === '') {
       const items: string[] = [];
       while (i < end) {
@@ -84,7 +89,9 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
           break;
         }
         const item = (itemMatch[1] ?? '').trim();
-        rejectTrailingComment(item, key, i + 1, filePath);
+        if (!isCleanlyQuoted(item)) {
+          rejectTrailingComment(item, key, i + 1, filePath);
+        }
         items.push(unquote(item));
         i += 1;
       }
@@ -124,13 +131,33 @@ function emptyData(): Record<string, FrontmatterValue> {
   return Object.create(null) as Record<string, FrontmatterValue>;
 }
 
+/**
+ * True for a value that is ONE cleanly-quoted scalar: it starts and ends with
+ * the same quote character and the interior never repeats it. Inside such a
+ * scalar, ` #` is literal text — YAML cannot open a comment inside quotes —
+ * so the trailing-comment rejection must not apply (#36). Anything murkier
+ * (an interior quote, e.g. `"a" #x"`, where the ` #` may genuinely be a
+ * comment after a closed scalar) stays subject to the strict rejection.
+ */
+function isCleanlyQuoted(value: string): boolean {
+  if (value.length < 2) {
+    return false;
+  }
+  const quote = value[0];
+  if (quote !== '"' && quote !== "'") {
+    return false;
+  }
+  return value.endsWith(quote) && !value.slice(1, -1).includes(quote);
+}
+
 /** The subset has no trailing-comment support; silently keeping the text would mis-parse. */
 function rejectTrailingComment(value: string, key: string, lineNo: number, filePath: string): void {
   if (value.includes(' #')) {
     throw new ParseError(
       filePath,
       `value for frontmatter key "${key}" (line ${lineNo}) contains " #": ` +
-        'YAML comments are outside the supported subset',
+        'YAML comments are outside the supported subset. Double-quote the whole ' +
+        `value to keep a literal " #" (e.g. ${key}: "fixes issue #12"), or reword it`,
     );
   }
 }
@@ -285,6 +312,7 @@ function assembleSkills(
   skillFolders: ReadonlyMap<string, FileSnapshot[]>,
   attachments: Attachment[],
   warnings: Warning[],
+  parseErrors: ParseError[],
 ): Skill[] {
   const skills: Skill[] = [];
   const pathByName = new Map<string, string>();
@@ -298,42 +326,63 @@ function assembleSkills(
       }
       continue;
     }
-    const fm = parseFrontmatter(entry.content, entry.path);
-    const name = fm.data['name'];
-    const description = fm.data['description'];
-    if (!fm.present || typeof name !== 'string' || name === '') {
-      throw new ParseError(entry.path, 'SKILL.md frontmatter requires a "name" string');
+    // #36: a bad SKILL.md is collected, not thrown, so every unparseable file
+    // in the repo is reported in ONE pass (the aggregate throws after the
+    // walk). A skill that failed here contributes nothing to the IR — the
+    // run never proceeds past parse when parseErrors is non-empty.
+    try {
+      assembleSkill(entry, folderFiles, pathByName, skills);
+    } catch (err) {
+      if (err instanceof ParseError) {
+        parseErrors.push(err);
+        continue;
+      }
+      throw err;
     }
-    if (!SKILL_NAME_RE.test(name)) {
-      throw new ParseError(
-        entry.path,
-        `invalid skill name ${JSON.stringify(name)}: names must match ` +
-          '^[a-z0-9]+(-[a-z0-9]+)*$ (lowercase alphanumeric segments separated by ' +
-          'single hyphens, per the Agent Skills standard)',
-      );
-    }
-    if (typeof description !== 'string' || description === '') {
-      throw new ParseError(entry.path, 'SKILL.md frontmatter requires a "description" string');
-    }
-    const existing = pathByName.get(name);
-    if (existing !== undefined) {
-      throw new ParseError(
-        entry.path,
-        `duplicate skill name "${name}" (already defined at ${existing})`,
-      );
-    }
-    pathByName.set(name, entry.path);
-    skills.push({
-      name,
-      description,
-      path: entry.path,
-      body: fm.body,
-      files: folderFiles
-        .filter((file) => file !== entry)
-        .map((file) => ({ path: file.path, content: file.content })),
-    });
   }
   return skills;
+}
+
+function assembleSkill(
+  entry: FileSnapshot,
+  folderFiles: readonly FileSnapshot[],
+  pathByName: Map<string, string>,
+  skills: Skill[],
+): void {
+  const fm = parseFrontmatter(entry.content, entry.path);
+  const name = fm.data['name'];
+  const description = fm.data['description'];
+  if (!fm.present || typeof name !== 'string' || name === '') {
+    throw new ParseError(entry.path, 'SKILL.md frontmatter requires a "name" string');
+  }
+  if (!SKILL_NAME_RE.test(name)) {
+    throw new ParseError(
+      entry.path,
+      `invalid skill name ${JSON.stringify(name)}: names must match ` +
+        '^[a-z0-9]+(-[a-z0-9]+)*$ (lowercase alphanumeric segments separated by ' +
+        'single hyphens, per the Agent Skills standard)',
+    );
+  }
+  if (typeof description !== 'string' || description === '') {
+    throw new ParseError(entry.path, 'SKILL.md frontmatter requires a "description" string');
+  }
+  const existing = pathByName.get(name);
+  if (existing !== undefined) {
+    throw new ParseError(
+      entry.path,
+      `duplicate skill name "${name}" (already defined at ${existing})`,
+    );
+  }
+  pathByName.set(name, entry.path);
+  skills.push({
+    name,
+    description,
+    path: entry.path,
+    body: fm.body,
+    files: folderFiles
+      .filter((file) => file !== entry)
+      .map((file) => ({ path: file.path, content: file.content })),
+  });
 }
 
 export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
@@ -347,6 +396,24 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
   const attachments: Attachment[] = [];
   const warnings: Warning[] = [];
   const skillFolders = new Map<string, FileSnapshot[]>();
+
+  // #36: per-file ParseErrors are collected (not thrown) so ONE run reports
+  // every unparseable file; the aggregate throws after the walk. The run still
+  // fails (exit 3) whenever any error was collected — no partial IR ever
+  // reaches a projection, which would misclassify the unparsed content's
+  // provider files as missing/unmanaged and, at apply time, act on that.
+  const parseErrors: ParseError[] = [];
+  const collecting = <T>(parse: () => T): T | undefined => {
+    try {
+      return parse();
+    } catch (err) {
+      if (err instanceof ParseError) {
+        parseErrors.push(err);
+        return undefined;
+      }
+      throw err;
+    }
+  };
 
   // EV1 (#21): the gateway reports canonical-shaped paths a .gitignore rule
   // excluded as data (it stays I/O, no Warning-minting in layer 3). The use
@@ -385,7 +452,10 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
     }
     const segments = file.path.split('/');
     if (segments[1] === 'instructions' && segments.length === 3 && file.path.endsWith('.md')) {
-      instructions.push(parseInstructionFragment(file));
+      const fragment = collecting(() => parseInstructionFragment(file));
+      if (fragment !== undefined) {
+        instructions.push(fragment);
+      }
     } else if (segments[1] === 'skills' && segments.length >= 4) {
       const folder = segments.slice(0, 3).join('/');
       const folderFiles = skillFolders.get(folder);
@@ -395,13 +465,23 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
         folderFiles.push(file);
       }
     } else if (segments[1] === 'hooks' && segments.length === 3 && isHookShaped(basename)) {
-      hooks.push(parseHook(file));
+      const hook = collecting(() => parseHook(file));
+      if (hook !== undefined) {
+        hooks.push(hook);
+      }
     } else {
       recordUnknownAttachment(file, attachments, warnings);
     }
   }
 
-  const skills = assembleSkills(skillFolders, attachments, warnings);
+  const skills = assembleSkills(skillFolders, attachments, warnings, parseErrors);
+
+  if (parseErrors.length === 1) {
+    throw parseErrors[0];
+  }
+  if (parseErrors.length > 1) {
+    throw new AggregateParseError(parseErrors);
+  }
 
   return { ir: { instructions, skills, hooks, attachments }, warnings };
 }

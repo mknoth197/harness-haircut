@@ -54,6 +54,7 @@ import {
 import type { FileWriter } from '../entities/file-writer.js';
 import type { IR } from '../entities/ir.js';
 import { detectHeaderPlacement, verifyAgainstExpected } from '../entities/signed-source.js';
+import { symlinkAliasWarning } from '../entities/warnings.js';
 import type { Warning } from '../entities/warnings.js';
 
 /** The action `apply` decided for one emitted file. */
@@ -67,9 +68,12 @@ export interface FileApply {
   /**
    * Why the file got its action — drives the human-readable change report.
    * `clean` only ever pairs with `skipped`; `edited` pairs with `written`
-   * (confirmed) or `blocked` (declined / --non-interactive).
+   * (confirmed) or `blocked` (declined / --non-interactive). `aliased` (#35)
+   * pairs with `skipped`: the path resolves through an in-repo symlink onto
+   * another repo path, so writing it would overwrite the symlink's target —
+   * skipped with HH-W013 instead.
    */
-  reason: 'clean' | 'missing' | 'stale' | 'edited' | 'unmanaged' | 'merge-changed';
+  reason: 'clean' | 'missing' | 'stale' | 'edited' | 'unmanaged' | 'merge-changed' | 'aliased';
   /** For merge-key files, the owned key; absent for fully-owned files. */
   mergeKey?: string;
 }
@@ -123,6 +127,13 @@ export interface ApplyDeps {
   readState: () => ApplyState;
   /** Persists the apply state file atomically (only on a real, non-dry run). */
   writeState: (state: ApplyState) => void;
+  /**
+   * #35: resolves a provider path that traverses an in-repo symlinked parent
+   * to its real repo location (or null for a symlink-free path). Wired from
+   * `createSymlinkAliasProbe` at the composition root; defaults to "never
+   * aliased" for in-memory tests.
+   */
+  aliasOf?: (path: string) => string | null;
   flags: ApplyFlags;
 }
 
@@ -376,6 +387,28 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   // merge target) throws here, before any mutation; --dry-run stops after this.
   const plan: PlanEntry[] = [];
 
+  // #35: a target behind an in-repo symlinked parent is excluded BEFORE any
+  // read or write — reading would compare the symlink's target (on real repos
+  // the canonical source) against the projection, and writing would overwrite
+  // it. Each aliased path is skipped with one HH-W013; everything downstream
+  // (plan, writes, state recording) sees only the symlink-free emits. Mirrors
+  // audit's skip so apply→audit stays idempotent.
+  const aliasOf = deps.aliasOf ?? (() => null);
+  const aliasWarned = new Set<string>();
+  const managedEmits: { file: EmittedFile; providerId: ProviderId }[] = [];
+  for (const emit of emits) {
+    const resolved = aliasOf(emit.file.path);
+    if (resolved === null) {
+      managedEmits.push(emit);
+      continue;
+    }
+    plan.push({ kind: 'skip', file: fileApply(emit.file, emit.providerId, 'skipped', 'aliased') });
+    if (!aliasWarned.has(emit.file.path)) {
+      aliasWarned.add(emit.file.path);
+      warnings.push(symlinkAliasWarning(emit.file.path, resolved, emit.providerId));
+    }
+  }
+
   // Merge-key emits are grouped by their (shared) target path: a provider can
   // own SEVERAL keys in one file (Gemini owns both `hooks` and
   // `context.fileName` in `.gemini/settings.json`). All owned keys for a path
@@ -383,7 +416,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   // — planning each key against the original disk and writing sequentially
   // would let the last write clobber the others' keys (and break idempotency).
   const mergeByPath = new Map<string, { file: EmittedFile; providerId: ProviderId }[]>();
-  for (const emit of emits) {
+  for (const emit of managedEmits) {
     if (emit.file.mode === 'merge-key') {
       const group = mergeByPath.get(emit.file.path);
       if (group === undefined) {
@@ -433,7 +466,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
     }
   }
 
-  for (const { file, providerId } of emits) {
+  for (const { file, providerId } of managedEmits) {
     if (file.mode === 'merge-key') {
       continue; // handled above
     }
@@ -528,9 +561,12 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   // very content as a prior emission ('stale') and overwrite it without
   // prompting. So a blocked path is left out, preserving its 'edited' verdict
   // until the user resolves it.
+  // Aliased paths (#35) are absent here too: recording the hash of content
+  // read THROUGH the symlink would seed the state with the alias target's
+  // content as a prior emission.
   const blockedPaths = new Set(blocked);
   const nextEmitted: Record<string, string> = { ...state.emitted };
-  for (const { file } of emits) {
+  for (const { file } of managedEmits) {
     if (file.mode !== 'overwrite' || blockedPaths.has(file.path)) {
       continue;
     }

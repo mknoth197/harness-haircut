@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { ParseError, parseRepo, readRepoSnapshot } from '../../dist/index.js';
+import { AggregateParseError, ParseError, parseRepo, readRepoSnapshot } from '../../dist/index.js';
 import type { ParseRepoResult } from '../../dist/index.js';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
 
@@ -128,6 +128,108 @@ describe('parseRepo — frontmatter subset honesty', () => {
       { path: '.agents/instructions/bom.md', scope: 'src/**', body: 'body\n' },
     ]);
     assert.deepEqual(warnings, []);
+  });
+
+  // #36: inside a cleanly-quoted scalar, ` #` is literal text \u2014 YAML cannot
+  // open a comment inside quotes. Issue/PR references ("work on issue #N")
+  // are ubiquitous in real skill descriptions and had no legal spelling.
+  it('accepts a double-quoted scalar containing " #" as literal text', async () => {
+    const { ir, warnings } = await parseFixture({
+      'AGENTS.md': '# T\n',
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: "work on issue #N from the template"\n---\nBody.\n',
+    });
+    assert.equal(ir.skills[0]?.description, 'work on issue #N from the template');
+    assert.deepEqual(warnings, []);
+  });
+
+  it('accepts a single-quoted scalar containing " #" as literal text', async () => {
+    const { ir } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        "---\nname: demo\ndescription: 'fixes issue #12'\n---\nBody.\n",
+    });
+    assert.equal(ir.skills[0]?.description, 'fixes issue #12');
+  });
+
+  it('accepts a quoted block-sequence item containing " #"', async () => {
+    const { ir } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: d\nnotes:\n- "see issue #3"\n---\nBody.\n',
+    });
+    assert.equal(ir.skills.length, 1);
+  });
+
+  it('still rejects an AMBIGUOUSLY quoted scalar (" #" after an interior quote)', () =>
+    assertParseError(
+      {
+        '.agents/skills/demo/SKILL.md':
+          '---\nname: demo\ndescription: "a" #x"\n---\nBody.\n',
+      },
+      /YAML comments are outside the supported subset/,
+    ));
+
+  it('names the remediation (quote the value) in the unquoted " #" rejection', () =>
+    assertParseError(
+      { '.agents/instructions/c.md': '---\nscope: src/** # comment\n---\nbody\n' },
+      /Double-quote the whole value/,
+    ));
+});
+
+describe('parseRepo \u2014 aggregated parse errors (#36)', () => {
+  it('reports EVERY unparseable file in one pass instead of aborting on the first', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# T\n',
+      '.agents/skills/alpha/SKILL.md': '---\nname: alpha\ndescription: bad #1 here\n---\nB.\n',
+      '.agents/skills/beta/SKILL.md': '---\nname: beta\ndescription: bad #2 here\n---\nB.\n',
+      '.agents/instructions/ok.md': '---\nscope: "src/**"\n---\nfine\n',
+    });
+    try {
+      await assert.rejects(
+        parseRepo({ readRepo: () => readRepoSnapshot(repo.root) }),
+        (err: unknown) => {
+          assert.equal(err instanceof AggregateParseError, true, `got ${String(err)}`);
+          const aggregate = err as AggregateParseError;
+          assert.equal(aggregate.exitCode, 3);
+          assert.equal(aggregate.errors.length, 2);
+          assert.match(aggregate.message, /2 canonical source files failed to parse/);
+          assert.match(aggregate.message, /alpha\/SKILL\.md/);
+          assert.match(aggregate.message, /beta\/SKILL\.md/);
+          return true;
+        },
+      );
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('throws the single ParseError unchanged when only one file fails', () =>
+    assertParseError(
+      {
+        '.agents/skills/alpha/SKILL.md': '---\nname: alpha\ndescription: bad #1 here\n---\nB.\n',
+        '.agents/skills/beta/SKILL.md': '---\nname: beta\ndescription: fine\n---\nB.\n',
+      },
+      /alpha\/SKILL\.md/,
+    ));
+
+  it('aggregates across file kinds (a bad fragment plus a bad hook)', async () => {
+    const repo = await mkTempRepo({
+      '.agents/instructions/frag.md': '---\nnot yaml at all\n---\nbody\n',
+      '.agents/hooks/unknown-event.lint.sh': '#!/bin/sh\n',
+    });
+    try {
+      await assert.rejects(
+        parseRepo({ readRepo: () => readRepoSnapshot(repo.root) }),
+        (err: unknown) => {
+          assert.equal(err instanceof AggregateParseError, true, `got ${String(err)}`);
+          const aggregate = err as AggregateParseError;
+          assert.match(aggregate.message, /frag\.md/);
+          assert.match(aggregate.message, /unknown-event\.lint\.sh/);
+          return true;
+        },
+      );
+    } finally {
+      await repo.cleanup();
+    }
   });
 });
 

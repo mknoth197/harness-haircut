@@ -9,7 +9,7 @@
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, rm, mkdir, readdir } from 'node:fs/promises';
+import { readFile, writeFile, rm, mkdir, readdir, symlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import {
@@ -23,6 +23,7 @@ import {
   parseState,
   serializeState,
   APPLY_STATE_PATH,
+  createSymlinkAliasProbe,
 } from '../../dist/index.js';
 import type { ApplyReport, ApplyState, ProviderId } from '../../dist/index.js';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
@@ -81,6 +82,7 @@ function runApply(root: string, options: RunApplyOptions = {}): Promise<ApplyRep
     confirm: confirmFn,
     readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
     writeState: (state: ApplyState): void => writer.write(APPLY_STATE_PATH, serializeState(state)),
+    aliasOf: createSymlinkAliasProbe(root),
     flags: {
       allowDirty: options.allowDirty ?? false,
       dryRun: options.dryRun ?? false,
@@ -96,6 +98,7 @@ function runAudit(root: string, options: { geminiMode?: 'settings' | 'shim' } = 
     adapters: createAllAdapters(),
     reader,
     contextFor: contextFactory(root, reader, options.geminiMode ?? 'settings'),
+    aliasOf: createSymlinkAliasProbe(root),
   });
 }
 
@@ -562,5 +565,67 @@ describe('apply() — U1 writes only adapter-declared paths', () => {
     await writeRel(repo.root, 'README.md', '# my project\n');
     await runApply(repo.root);
     assert.equal(await readFile(join(repo.root, 'README.md'), 'utf8'), '# my project\n');
+  });
+});
+
+describe('apply() — #35 symlink-aliased targets', () => {
+  /** The cerebro shape: the claude skill dir is a hand-made symlink into .agents/. */
+  async function aliasedRepo(): Promise<TempRepo> {
+    const repo = await setup({
+      ...CANONICAL,
+      // Seeds .claude/skills/ as a REAL directory next to the symlink.
+      '.claude/skills/keep.md': 'unmanaged sibling\n',
+    });
+    await symlink(
+      join('..', '..', '.agents', 'skills', 'foo'),
+      join(repo.root, '.claude', 'skills', 'foo'),
+    );
+    return repo;
+  }
+
+  it('skips the aliased projection with HH-W013 and never touches the canonical source', async () => {
+    const repo = await aliasedRepo();
+    const canonicalBefore = await readFile(
+      join(repo.root, '.agents', 'skills', 'foo', 'SKILL.md'),
+      'utf8',
+    );
+
+    const report = await runApply(repo.root);
+    assert.equal(report.exitCode, 0);
+
+    const aliased = report.files.find((file) => file.path === '.claude/skills/foo/SKILL.md');
+    assert.equal(aliased?.action, 'skipped');
+    assert.equal(aliased?.reason, 'aliased');
+    assert.equal(report.written.includes('.claude/skills/foo/SKILL.md'), false);
+    const warning = report.warnings.find((w) => w.code === 'HH-W013');
+    assert.notEqual(warning, undefined);
+    assert.match(warning?.message ?? '', /\.agents\/skills\/foo\/SKILL\.md/);
+
+    // The canonical source behind the symlink is byte-identical (#35's
+    // original failure overwrote it through the symlinked parent).
+    assert.equal(
+      await readFile(join(repo.root, '.agents', 'skills', 'foo', 'SKILL.md'), 'utf8'),
+      canonicalBefore,
+    );
+  });
+
+  it('keeps apply→audit idempotent: aliased is not drift, exit 2 (warning only)', async () => {
+    const repo = await aliasedRepo();
+    const applied = await runApply(repo.root);
+    assert.equal(applied.exitCode, 0);
+
+    const auditReport = await runAudit(repo.root);
+    assert.equal(auditReport.drift, false);
+    const entry = auditReport.files.find((file) => file.path === '.claude/skills/foo/SKILL.md');
+    assert.equal(entry?.status, 'aliased');
+    assert.equal(auditReport.exitCode, 2);
+  });
+
+  it('excludes the aliased path from the recorded apply state', async () => {
+    const repo = await aliasedRepo();
+    await runApply(repo.root);
+    const reader = createProviderFileReader(repo.root);
+    const state = parseState(reader.read(APPLY_STATE_PATH));
+    assert.equal('.claude/skills/foo/SKILL.md' in state.emitted, false);
   });
 });

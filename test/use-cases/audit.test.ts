@@ -15,6 +15,7 @@ import {
   readRepoSnapshot,
   createAllAdapters,
   createProviderFileReader,
+  createSymlinkAliasProbe,
 } from '../../dist/index.js';
 import type { ProviderId } from '../../dist/index.js';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
@@ -64,6 +65,7 @@ function runAudit(
     adapters,
     reader,
     contextFor: contextFactory(root, reader, options.geminiMode ?? 'settings'),
+    aliasOf: createSymlinkAliasProbe(root),
     strict: options.strict,
   });
 }
@@ -416,3 +418,39 @@ async function snapshotDir(root: string): Promise<Record<string, string>> {
   await walk('');
   return out;
 }
+
+describe('audit() — #35 symlink-aliased targets', () => {
+  it('reports the aliased path as `aliased` (not drift) with HH-W013, exit 2', async () => {
+    const { symlink } = await import('node:fs/promises');
+    // Emit real projections first, then swap the claude skill dir for the
+    // cerebro-style hand-made symlink into the canonical tree.
+    const repo = await setup(CANONICAL);
+    await rm(join(repo.root, '.claude', 'skills', 'foo'), { recursive: true, force: true });
+    await symlink(
+      join('..', '..', '.agents', 'skills', 'foo'),
+      join(repo.root, '.claude', 'skills', 'foo'),
+    );
+
+    const report = await runAudit(repo.root);
+    const entry = report.files.find((file) => file.path === '.claude/skills/foo/SKILL.md');
+    assert.equal(entry?.status, 'aliased');
+    // `aliased` is not drift — the pre-#35 behavior reported drift:stale here
+    // after apply clobbered the canonical source through the symlink.
+    assert.equal(report.drift, false);
+    assert.equal(report.exitCode, 2);
+    const warning = report.warnings.find((w) => w.code === 'HH-W013');
+    assert.match(warning?.message ?? '', /\.agents\/skills\/foo\/SKILL\.md/);
+  });
+
+  it('escalates the HH-W013 warning to exit 1 under --strict', async () => {
+    const { symlink } = await import('node:fs/promises');
+    const repo = await setup(CANONICAL);
+    await rm(join(repo.root, '.claude', 'skills', 'foo'), { recursive: true, force: true });
+    await symlink(
+      join('..', '..', '.agents', 'skills', 'foo'),
+      join(repo.root, '.claude', 'skills', 'foo'),
+    );
+    const report = await runAudit(repo.root, { strict: true });
+    assert.equal(report.exitCode, 1);
+  });
+});

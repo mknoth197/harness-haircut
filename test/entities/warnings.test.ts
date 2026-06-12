@@ -13,6 +13,7 @@ const EXPECTED_CODES = [
   'HH-W010',
   'HH-W011',
   'HH-W012',
+  'HH-W013',
 ];
 
 describe('warning catalogue', () => {
@@ -40,6 +41,10 @@ describe('warning catalogue', () => {
       'frontmatter in AGENTS.md leaks verbatim into provider prompts',
     );
     assert.equal(parsed['HH-W012'], 'canonical source excluded by .gitignore');
+    assert.equal(
+      parsed['HH-W013'],
+      'provider path skipped: a symlink aliases it onto another repo path',
+    );
   });
 
   it('links every code to its docs/warnings page', () => {

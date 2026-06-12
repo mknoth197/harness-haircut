@@ -40,7 +40,7 @@ import {
 import { APPLY_STATE_PATH, parseState, serializeState } from './entities/apply-state.js';
 import type { ApplyState } from './entities/apply-state.js';
 import { createProviderFileReader } from './gateways/provider-files.js';
-import { createFileWriter } from './gateways/fs-writer.js';
+import { createFileWriter, createSymlinkAliasProbe } from './gateways/fs-writer.js';
 import { isWorkingTreeDirty } from './gateways/git.js';
 import { createAllAdapters } from './adapters/index.js';
 import { parseRepo } from './use-cases/parse-repo.js';
@@ -384,6 +384,7 @@ const DRIFT_LABELS: Readonly<Record<FileAudit['status'], string>> = {
   'drift:missing': 'missing',
   'drift:unmanaged': 'unmanaged',
   'drift:differs': 'differs',
+  aliased: 'aliased',
 };
 
 /**
@@ -468,6 +469,7 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       adapters,
       reader,
       contextFor,
+      aliasOf: createSymlinkAliasProbe(cwd),
       strict: strict || config.warningsAsErrors,
     });
   } catch (err) {
@@ -490,17 +492,29 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
 
 function renderAuditReport(report: AuditReport): string {
   const lines: string[] = [];
-  const drifted = report.files.filter((file) => file.status !== 'clean');
+  // `aliased` (#35) is neither clean nor drift — those paths were skipped, so
+  // they are excluded from the clean/drift accounting and listed separately.
+  const aliased = report.files.filter((file) => file.status === 'aliased');
+  const managedCount = report.files.length - aliased.length;
+  const drifted = report.files.filter(
+    (file) => file.status !== 'clean' && file.status !== 'aliased',
+  );
 
   if (report.files.length === 0) {
     lines.push('No provider files expected.');
   } else if (drifted.length === 0) {
-    lines.push(`clean — ${report.files.length} file(s) match canonical sources`);
+    lines.push(`clean — ${managedCount} file(s) match canonical sources`);
   } else {
-    lines.push(`drift — ${drifted.length} of ${report.files.length} file(s) diverge:`);
+    lines.push(`drift — ${drifted.length} of ${managedCount} file(s) diverge:`);
     for (const file of drifted) {
       const keyNote = file.mergeKey !== undefined ? ` (key: ${file.mergeKey})` : '';
       lines.push(`  ${DRIFT_LABELS[file.status]}\t${file.path} [${file.providerId}]${keyNote}`);
+    }
+  }
+  if (aliased.length > 0) {
+    lines.push(`skipped ${aliased.length} symlink-aliased path(s) (HH-W013, not audited):`);
+    for (const file of aliased) {
+      lines.push(`  aliased\t${file.path} [${file.providerId}]`);
     }
   }
 
@@ -518,26 +532,96 @@ function renderAuditReport(report: AuditReport): string {
   return `${lines.join('\n')}`;
 }
 
+/** Reads one trimmed answer line, given a question (see `createStdinPrompt`). */
+type Prompt = (question: string) => Promise<string>;
+
 /**
- * Interactive overwrite prompt for an `edited` file (UN1). Reads a single
- * y/N answer from stdin; anything other than `y`/`yes` (case-insensitive)
- * declines, so a bare Enter is safe. `--non-interactive` bypasses this
- * entirely (the use case auto-declines), so this is only constructed for an
- * interactive run.
+ * The ONE stdin prompt implementation for every interactive command (#39).
+ * A run shares a single lazily-created readline interface whose lines WE
+ * buffer, rather than calling `rl.question`, because `question` has two
+ * lifecycle holes that broke real runs:
+ *
+ *   - lines arriving while no question is pending are dropped (piped
+ *     multi-answer input like `printf '1\nn\n'` dies in the gap between two
+ *     prompts while a disclosure renders);
+ *   - EOF never invokes a pending question callback, so the wrapping promise
+ *     dangles, the event loop drains, and Node exits 0 mid-`await` with the
+ *     report silently dropped — and a LATER `question()` call on the closed
+ *     interface throws ERR_USE_AFTER_CLOSE (surfaced as exit 70).
+ *
+ * Here every input line is queued until a prompt consumes it, and EOF
+ * (`close`) resolves the pending prompt — and every later one — with `''`,
+ * which each caller already maps to its safe default: unresolved
+ * contradiction (refuse, exit 1), declined overwrite, declined egress
+ * consent, deterministic fallback. Exhausted stdin can no longer lie with an
+ * exit 0 or crash with an internal error.
  */
-function readlineConfirm(io: RunIO): (path: string) => Promise<boolean> {
-  return (path: string) =>
-    new Promise<boolean>((resolveAnswer) => {
-      const rl = createInterface({ input: process.stdin, output: io.stdout });
-      rl.question(
-        `harness-haircut: ${path} was edited since it was generated. Overwrite? [y/N] `,
-        (answer) => {
-          rl.close();
-          const normalized = answer.trim().toLowerCase();
-          resolveAnswer(normalized === 'y' || normalized === 'yes');
-        },
-      );
+function createStdinPrompt(
+  input: NodeJS.ReadableStream,
+  output: NodeJS.WritableStream,
+): { prompt: Prompt; close: () => void } {
+  let rl: ReturnType<typeof createInterface> | undefined;
+  let closed = false;
+  const buffered: string[] = [];
+  const waiters: Array<(answer: string) => void> = [];
+  const ensure = (): void => {
+    if (rl !== undefined) {
+      return;
+    }
+    rl = createInterface({ input, output });
+    rl.on('line', (line) => {
+      const waiter = waiters.shift();
+      if (waiter !== undefined) {
+        waiter(line.trim());
+      } else {
+        buffered.push(line);
+      }
     });
+    rl.on('close', () => {
+      closed = true;
+      for (const waiter of waiters.splice(0)) {
+        waiter('');
+      }
+    });
+  };
+  return {
+    prompt: (question: string): Promise<string> => {
+      ensure();
+      const line = buffered.shift();
+      if (line !== undefined) {
+        output.write(question);
+        return Promise.resolve(line.trim());
+      }
+      if (closed) {
+        output.write(question);
+        return Promise.resolve('');
+      }
+      // Render the question through readline (not a bare output.write) so a
+      // real terminal redraws it correctly during line editing.
+      rl!.setPrompt(question);
+      rl!.prompt();
+      return new Promise<string>((resolveAnswer) => {
+        waiters.push(resolveAnswer);
+      });
+    },
+    close: (): void => rl?.close(),
+  };
+}
+
+/**
+ * Interactive overwrite confirmation for an `edited` file (UN1) over the
+ * shared prompt. Anything other than `y`/`yes` (case-insensitive) declines,
+ * so a bare Enter — and EOF, which resolves to `''` — is safe.
+ * `--non-interactive` bypasses this entirely (the use case auto-declines).
+ */
+function confirmOverwrite(prompt: Prompt): (path: string) => Promise<boolean> {
+  return async (path: string): Promise<boolean> => {
+    const answer = await prompt(
+      `harness-haircut: ${path} was edited since it was generated. Overwrite? [y/N] `,
+    );
+    const normalized = answer.toLowerCase();
+    return normalized === 'y' || normalized === 'yes';
+  };
 }
 
 async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
@@ -549,6 +633,10 @@ async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const dryRun = parsed.flags['--dry-run'] === true;
   const allowDirty = parsed.flags['--allow-dirty'] === true;
   const nonInteractive = parsed.flags['--non-interactive'] === true;
+
+  // #39: one EOF-safe stdin prompt for the whole run, created lazily on the
+  // first confirmation. --non-interactive never prompts, so none is built.
+  const stdinPrompt = nonInteractive ? null : createStdinPrompt(process.stdin, io.stdout);
 
   let report: ApplyReport;
   try {
@@ -572,10 +660,11 @@ async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       contextFor,
       isDirty: () => isWorkingTreeDirty(cwd),
       // Under --non-interactive the use case never calls confirm, so a
-      // no-prompt stub is correct; otherwise wire the readline prompt.
-      confirm: nonInteractive ? () => Promise.resolve(false) : readlineConfirm(io),
+      // no-prompt stub is correct; otherwise wire the shared stdin prompt.
+      confirm: stdinPrompt === null ? () => Promise.resolve(false) : confirmOverwrite(stdinPrompt.prompt),
       readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
       writeState: (state: ApplyState): void => writer.write(APPLY_STATE_PATH, serializeState(state)),
+      aliasOf: createSymlinkAliasProbe(cwd),
       flags: { allowDirty, dryRun, nonInteractive },
     });
   } catch (err) {
@@ -584,6 +673,8 @@ async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       return err.exitCode === 3 ? 3 : err.exitCode === 1 ? 1 : 70;
     }
     throw err;
+  } finally {
+    stdinPrompt?.close();
   }
 
   if (json) {
@@ -624,8 +715,16 @@ function renderApplyReport(report: ApplyReport): string {
       }
     }
   }
-  if (report.skipped.length > 0) {
-    lines.push(`skipped ${report.skipped.length} unchanged file(s)`);
+  const aliasedSkips = report.files.filter((file) => file.reason === 'aliased');
+  const unchangedSkips = report.skipped.length - aliasedSkips.length;
+  if (unchangedSkips > 0) {
+    lines.push(`skipped ${unchangedSkips} unchanged file(s)`);
+  }
+  if (aliasedSkips.length > 0) {
+    lines.push(`skipped ${aliasedSkips.length} symlink-aliased path(s) (HH-W013, not written):`);
+    for (const file of aliasedSkips) {
+      lines.push(`  aliased\t${file.path} [${file.providerId}]`);
+    }
   }
   // U1 transparency: a real apply that wrote anything also updates the
   // committed state baseline. Name it so the only non-adapter path apply
@@ -679,17 +778,6 @@ function previewCandidate(text: string): string[] {
   }
   return out.length === 0 ? ['(empty)'] : out;
 }
-
-/**
- * Reads one trimmed line, given a question. A run uses a SINGLE shared
- * implementation backed by one `node:readline` interface (see `runInit`), so
- * the several sequential prompts on the `init --assist` path — source
- * selection, egress consent, merge approval, then the deterministic fallback —
- * never lose buffered input. (Opening a fresh interface per prompt and closing
- * it discards readline's read-ahead buffer, which deadlocks piped stdin after
- * the first prompt.)
- */
-type Prompt = (question: string) => Promise<string>;
 
 /**
  * Interactive contradiction resolver for `init` (C3 EV2/EV3): a numbered-choice
@@ -957,17 +1045,13 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const nonInteractive = parsed.flags['--non-interactive'] === true;
   const assistRequested = parsed.flags['--assist'] === true;
 
-  // A SINGLE readline interface for the whole run, created lazily on the first
-  // prompt and closed once in `finally`. Reusing one interface (rather than
-  // opening/closing one per prompt) keeps the several sequential `init --assist`
-  // prompts from losing readline's buffered read-ahead.
-  let rl: ReturnType<typeof createInterface> | undefined;
-  const prompt: Prompt = (question) => {
-    rl ??= createInterface({ input: process.stdin, output: io.stdout });
-    return new Promise<string>((resolveAnswer) => {
-      rl!.question(question, (answer) => resolveAnswer(answer.trim()));
-    });
-  };
+  // #39: ONE EOF-safe, line-buffered stdin prompt for the whole run (created
+  // lazily on the first prompt, closed once in `finally`), shared by the
+  // several sequential `init --assist` prompts — source selection, egress
+  // consent, merge approval, the deterministic fallback. See createStdinPrompt
+  // for why rl.question could not be used here.
+  const stdinPrompt = createStdinPrompt(process.stdin, io.stdout);
+  const prompt: Prompt = stdinPrompt.prompt;
 
   let report: InitReport;
   try {
@@ -1036,6 +1120,7 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
           readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
           writeState: (state: ApplyState): void =>
             writer.write(APPLY_STATE_PATH, serializeState(state)),
+          aliasOf: createSymlinkAliasProbe(cwd),
           flags: { allowDirty: true, dryRun, nonInteractive: true },
         }),
       flags: { dryRun, nonInteractive },
@@ -1047,7 +1132,7 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
     }
     throw err;
   } finally {
-    rl?.close();
+    stdinPrompt.close();
   }
 
   if (json) {

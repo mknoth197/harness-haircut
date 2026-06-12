@@ -45,16 +45,25 @@ import type {
 import type { IR } from '../entities/ir.js';
 import { detectHeaderPlacement, verifyAgainstExpected } from '../entities/signed-source.js';
 import type { VerifyStatus } from '../entities/signed-source.js';
+import { symlinkAliasWarning } from '../entities/warnings.js';
 import type { Warning } from '../entities/warnings.js';
 
-/** Per-file drift verdict. `clean` means disk matches the expected projection. */
+/**
+ * Per-file drift verdict. `clean` means disk matches the expected projection.
+ * `aliased` (#35) means the path resolves through an in-repo symlink onto
+ * another repo path, so it is not audited at all (and apply will not write
+ * it): comparing through the alias would diff the symlink's TARGET — on real
+ * repos the canonical source — against the projection and report perpetual
+ * bogus drift. `aliased` is not drift; it surfaces as HH-W013 (exit 2).
+ */
 export type DriftStatus =
   | 'clean'
   | 'drift:edited'
   | 'drift:stale'
   | 'drift:missing'
   | 'drift:unmanaged'
-  | 'drift:differs';
+  | 'drift:differs'
+  | 'aliased';
 
 export interface FileAudit {
   /** Repo-relative POSIX path of the emitted target. */
@@ -88,6 +97,13 @@ export interface AuditDeps {
   reader: ProviderFileReader;
   /** Per-provider projection context factory (cwd, providerConfig, reader). */
   contextFor: (id: ProviderId) => ProjectionContext;
+  /**
+   * #35: resolves a provider path that traverses an in-repo symlinked parent
+   * to its real repo location (or null for a symlink-free path). Wired from
+   * `createSymlinkAliasProbe` at the composition root; defaults to "never
+   * aliased" for in-memory tests.
+   */
+  aliasOf?: (path: string) => string | null;
   /** `--strict` or config `warningsAsErrors`: escalate any warn to exit 1. */
   strict?: boolean;
 }
@@ -218,11 +234,26 @@ export async function audit(deps: AuditDeps): Promise<AuditReport> {
 
   const files: FileAudit[] = [];
   const warnings: Warning[] = [...parseWarnings];
+  const aliasOf = deps.aliasOf ?? (() => null);
+  const aliasWarned = new Set<string>();
 
   for (const adapter of deps.adapters) {
     const projection = adapter.project(ir, deps.contextFor(adapter.id));
     warnings.push(...projection.warnings);
     for (const file of projection.files) {
+      // #35: a path behind an in-repo symlinked parent is not audited —
+      // reading through the alias would diff the symlink's target (the
+      // canonical source) against the projection and report bogus drift
+      // forever. Mirror of apply's skip, so apply→audit stays idempotent.
+      const resolved = aliasOf(file.path);
+      if (resolved !== null) {
+        files.push({ path: file.path, providerId: adapter.id, status: 'aliased' });
+        if (!aliasWarned.has(file.path)) {
+          aliasWarned.add(file.path);
+          warnings.push(symlinkAliasWarning(file.path, resolved, adapter.id));
+        }
+        continue;
+      }
       const status =
         file.mode === 'merge-key'
           ? auditMergeKeyFile(file, deps.reader)
@@ -235,7 +266,9 @@ export async function audit(deps: AuditDeps): Promise<AuditReport> {
     }
   }
 
-  const drift = files.some((file) => file.status !== 'clean');
+  // `aliased` is excluded: it is "cannot manage" (warned via HH-W013), not a
+  // divergence between disk and projection.
+  const drift = files.some((file) => file.status !== 'clean' && file.status !== 'aliased');
   const hasWarnings = warnings.length > 0;
   const strictFail = deps.strict === true && hasWarnings;
 
