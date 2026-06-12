@@ -75,14 +75,21 @@ function realIfContained(realRoot: string, abs: string): string | null {
 }
 
 /**
- * SECURITY: resolve the deepest EXISTING ancestor directory of `abs` and
- * require it to be `realRoot` or strictly beneath it. Returns the real path of
- * that ancestor so the caller can mkdir the rest from a known-contained base.
- * Walking up to the first directory that exists lets a not-yet-created target
- * (the common case for `write`) still be validated: if any existing parent is
- * a symlink that escapes the repo, realpathSync collapses it and the
- * containment check fails — so we never mkdir/write through an escaping
- * symlinked parent. Throws if the nearest existing ancestor escapes the root.
+ * SECURITY + #35: resolve the deepest EXISTING ancestor directory of `abs`
+ * and require its real path to be the ancestor path ITSELF — i.e. no symlink
+ * anywhere in the parent chain. Walking up to the first directory that exists
+ * lets a not-yet-created target (the common case for `write`) still be
+ * validated. Two distinct refusals:
+ *
+ *   - the chain ESCAPES the repo (realpath lands outside `realRoot`): the
+ *     original hostile-repo exfiltration case;
+ *   - the chain stays IN-REPO but aliases another path (`.claude/skills/x` →
+ *     `.agents/skills/x`): following it would land the write on the link's
+ *     target — on real repos, the canonical source itself (#35).
+ *
+ * `audit`/`apply` consult `createSymlinkAliasProbe` first and skip + warn
+ * (HH-W013) such targets, so for them this throw is a backstop; any future
+ * caller that forgets the probe fails loudly here instead of clobbering.
  */
 function assertParentContained(realRoot: string, abs: string): void {
   let ancestor = dirname(abs);
@@ -95,15 +102,25 @@ function assertParentContained(realRoot: string, abs: string): void {
       } catch (err) {
         throw new FileSystemError(ancestor, err);
       }
-      if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + sep)) {
+      if (realAncestor === ancestor) {
+        return;
+      }
+      if (realAncestor === realRoot || realAncestor.startsWith(realRoot + sep)) {
         throw new FileSystemError(
           abs,
           new Error(
-            `refusing to write through a path that escapes repo root ${realRoot}: ${abs}`,
+            `refusing to write through an in-repo symlinked parent: ${abs} would land ` +
+              `at ${realAncestor + abs.slice(ancestor.length)} (remove the symlink so the ` +
+              'write can land at its own path)',
           ),
         );
       }
-      return;
+      throw new FileSystemError(
+        abs,
+        new Error(
+          `refusing to write through a path that escapes repo root ${realRoot}: ${abs}`,
+        ),
+      );
     }
     const parent = dirname(ancestor);
     if (parent === ancestor) {
@@ -113,6 +130,64 @@ function assertParentContained(realRoot: string, abs: string): void {
     }
     ancestor = parent;
   }
+}
+
+/**
+ * Builds the #35 alias probe: given a repo-relative POSIX path, returns the
+ * path's REAL location when its parent chain traverses a symlink —
+ * `.claude/skills/x/SKILL.md` behind a symlinked skill dir resolves to
+ * `.agents/skills/x/SKILL.md` — or `null` when the chain is symlink-free.
+ * The returned path is repo-relative POSIX when the target stays inside the
+ * repo, or the absolute OS path when it escapes (callers skip both; the
+ * writer refuses both). The LEAF is deliberately not probed: `write` replaces
+ * a symlinked leaf with a real file in place, which aliases nothing — only a
+ * traversed parent re-roots the write onto the link's target.
+ *
+ * `audit` and `apply` consult this before reading or planning any provider
+ * path, so an aliased target is skipped + warned (HH-W013) instead of read
+ * and written through — which on real repos overwrote the canonical source
+ * and broke apply→audit idempotency (#35).
+ */
+export function createSymlinkAliasProbe(root: string): (relPath: string) => string | null {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch (err) {
+    throw new FileSystemError(root, err);
+  }
+  return (relPath: string): string | null => {
+    const abs = toAbsolute(realRoot, relPath);
+    let ancestor = dirname(abs);
+    // Walk up to the deepest existing ancestor (dirname is a fixpoint at '/').
+    for (;;) {
+      let realAncestor: string | null = null;
+      try {
+        realAncestor = realpathSync(ancestor);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        // ENOENT: this ancestor does not exist yet (target being created) —
+        // keep walking up. ENOTDIR: a file occupies a parent segment; no
+        // symlink chain to alias through (mkdir will fail loudly later).
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+          throw new FileSystemError(ancestor, err);
+        }
+      }
+      if (realAncestor !== null) {
+        if (realAncestor === ancestor) {
+          return null;
+        }
+        const landing = realAncestor + abs.slice(ancestor.length);
+        return landing === realRoot || landing.startsWith(realRoot + sep)
+          ? landing.slice(realRoot.length + 1).split(sep).join('/')
+          : landing;
+      }
+      const parent = dirname(ancestor);
+      if (parent === ancestor) {
+        return null;
+      }
+      ancestor = parent;
+    }
+  };
 }
 
 /**

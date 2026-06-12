@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { WARNING_CATALOGUE, WARNING_CODES, warningDocPath } from '../../dist/index.js';
+import {
+  WARNING_CATALOGUE,
+  WARNING_CODES,
+  symlinkAliasWarning,
+  warningDocPath,
+} from '../../dist/index.js';
 import type { Warning } from '../../dist/index.js';
 
 const EXPECTED_CODES = [
@@ -13,6 +18,7 @@ const EXPECTED_CODES = [
   'HH-W010',
   'HH-W011',
   'HH-W012',
+  'HH-W013',
 ];
 
 describe('warning catalogue', () => {
@@ -40,10 +46,37 @@ describe('warning catalogue', () => {
       'frontmatter in AGENTS.md leaks verbatim into provider prompts',
     );
     assert.equal(parsed['HH-W012'], 'canonical source excluded by .gitignore');
+    assert.equal(
+      parsed['HH-W013'],
+      'provider path skipped: a symlink aliases it onto another repo path',
+    );
   });
 
   it('links every code to its docs/warnings page', () => {
     assert.equal(warningDocPath('HH-W003'), 'docs/warnings/HH-W003.md');
+  });
+});
+
+describe('symlinkAliasWarning (#35)', () => {
+  it('phrases an in-repo target as an in-repo symlink', () => {
+    const warning = symlinkAliasWarning(
+      '.claude/skills/x/SKILL.md',
+      '.agents/skills/x/SKILL.md',
+      'claude',
+    );
+    assert.equal(warning.code, 'HH-W013');
+    assert.match(warning.message, /in-repo symlink to \.agents\/skills\/x\/SKILL\.md/);
+    assert.equal(warning.providerId, 'claude');
+  });
+
+  it('phrases an absolute (escaping) target as outside the repository', () => {
+    const warning = symlinkAliasWarning(
+      '.github/copilot-instructions.md',
+      '/tmp/external/copilot-instructions.md',
+      'copilot',
+    );
+    assert.match(warning.message, /outside the repository/);
+    assert.doesNotMatch(warning.message, /in-repo symlink/);
   });
 });
 

@@ -116,7 +116,7 @@ export { doctor } from './use-cases/doctor.js';
 export type { DoctorReport, DoctorDeps, DoctorAssistSource } from './use-cases/doctor.js';
 
 export { isWorkingTreeDirty } from './gateways/git.js';
-export { createFileWriter } from './gateways/fs-writer.js';
+export { createFileWriter, createSymlinkAliasProbe } from './gateways/fs-writer.js';
 
 export { loadConfig, defaultConfig, defaultAssistConfig, enabledProviders } from './use-cases/load-config.js';
 export type {

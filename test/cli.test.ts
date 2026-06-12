@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync, existsSync } from 'node:fs';
-import { rm, writeFile, mkdtemp } from 'node:fs/promises';
+import { mkdir, rm, symlink, writeFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { parseArgs, run } from '../dist/index.js';
 import { mkTempRepo } from './_helpers/tmp-repo.ts';
@@ -652,23 +652,16 @@ describe('init --assist (C4 CLI)', () => {
 
   /**
    * (e) SHARED-INTERFACE regression (C4-review): the several sequential `init`
-   * prompts run over a SINGLE `node:readline` interface created lazily on the
-   * first prompt (cli.ts `runInit`). The old code opened and CLOSED a fresh
-   * interface per prompt, which discarded readline's buffered read-ahead and
-   * dropped piped input after the first prompt. This pipes a contradiction
-   * answer (`1\n`) over the shared interface and asserts it resolves end-to-end.
+   * prompts run over a SINGLE shared prompt created lazily on the first use
+   * (cli.ts `createStdinPrompt`). The old code opened and CLOSED a fresh
+   * readline interface per prompt, which discarded readline's buffered
+   * read-ahead and dropped piped input after the first prompt. This pipes a
+   * contradiction answer (`1\n`) and asserts it resolves end-to-end.
    *
-   * NOTE — two-contradiction caveat: the strongest form of this regression
-   * (TWO contradictions resolved from `'1\n1\n'`) is NOT exercised here because
-   * spawnSync delivers `input` as one buffer that hits EOF immediately;
-   * node:readline reaches EOF and CLOSES right after the first `question`
-   * consumes line 1, discarding the buffered second line before the second
-   * `question` registers — so the second resolution is lost regardless of the
-   * shared interface (verified: AGENTS.md is left unwritten and the run exits 0
-   * silently). With paced (non-EOF) stdin the same two-prompt path completes,
-   * so the shared interface itself is correct; the EOF-close race is a separate
-   * limitation of the spawnSync({ input }) harness. A single piped contradiction
-   * is the deterministic green assertion of the shared-interface path here.
+   * The historical two-contradiction caveat (EOF closing readline between
+   * prompts discarded the buffered second answer) was #39 and is fixed by the
+   * line-buffered prompt; the `'1\n1\n'` form is exercised in the
+   * "prompt lifecycle E2E (#39)" suite below.
    */
   it('(e) resolves a piped contradiction answer over the shared readline interface (exit 0)', async () => {
     // Two DIFFERENT root files → one `root-instructions` contradiction.
@@ -694,5 +687,185 @@ describe('init --assist (C4 CLI)', () => {
     });
     assert.equal(auditRun.status, 0);
     assert.match(auditRun.stdout, /clean/);
+  });
+});
+
+/**
+ * #39 — prompt lifecycle. Two confirmed failure modes of the old prompt:
+ * (a) EOF while a prompt awaited: rl.question never called back, the promise
+ *     dangled, the event loop drained, and Node exited 0 mid-await with the
+ *     ENTIRE report dropped — success, to a script, for an aborted run.
+ * (b) EOF between prompts (piped multi-answer input): readline closed and
+ *     discarded its buffer; the next question threw ERR_USE_AFTER_CLOSE,
+ *     surfaced as `harness-haircut: readline was closed`, exit 70.
+ * The line-buffered shared prompt resolves EOF'd prompts with '' (mapped to
+ * each caller's safe default) and queues lines until a prompt consumes them.
+ */
+describe('prompt lifecycle E2E (#39, spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  /** Two differing root files → one `root-instructions` contradiction. */
+  async function contradictionRepo(): Promise<TempRepo> {
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      '.github/copilot-instructions.md': '# Project\nUse pnpm test.\n',
+    });
+    repos.push(repo);
+    return repo;
+  }
+
+  it('(a) EOF during a prompt exits 1 WITH the refusal report (was: silent exit 0)', async () => {
+    const repo = await contradictionRepo();
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '', // stdin exhausted before the contradiction prompt.
+    });
+    // The documented EOF → unresolved → exit-1 path is now reachable.
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /refused — 1 unresolved contradiction/);
+    // Nothing was written for the aborted onboarding.
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), false);
+  });
+
+  it('(b) piped multi-answer input survives the gap between prompts (two contradictions)', async () => {
+    // root-instructions (differing root files) + skill:foo (same skill under
+    // two provider roots with differing bodies) → exactly two prompts.
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      '.github/copilot-instructions.md': '# Project\nUse pnpm test.\n',
+      '.claude/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nClaude variant.\n',
+      '.codex/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nCodex variant.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '1\n1\n', // both answers arrive in one buffer; EOF follows immediately.
+    });
+    assert.equal(r.status, 0);
+    assert.doesNotMatch(r.stderr, /readline was closed/);
+    assert.match(r.stdout, /resolved 2 contradiction\(s\)/);
+    // BOTH resolutions landed: canonical root + canonical skill exist.
+    assert.match(readFileSync(join(repo.root, 'AGENTS.md'), 'utf8'), /Use npm test\./);
+    assert.match(
+      readFileSync(join(repo.root, '.agents', 'skills', 'foo', 'SKILL.md'), 'utf8'),
+      /Claude variant\./,
+    );
+  });
+
+  it('(a+b) apply: EOF mid-confirmations blocks the unanswered file and still prints the report', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+    });
+    repos.push(repo);
+    // Emit, then hand-edit TWO generated header-bearing files → two prompts.
+    spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
+      encoding: 'utf8',
+    });
+    for (const rel of ['.claude/skills/foo/SKILL.md', '.github/copilot-instructions.md']) {
+      const abs = join(repo.root, ...rel.split('/'));
+      await writeFile(abs, `${readFileSync(abs, 'utf8')}\nHAND EDIT\n`, 'utf8');
+    }
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
+      { encoding: 'utf8', input: 'y\n' }, // one answer, then EOF before prompt 2.
+    );
+    // Old (a): fresh-interface-per-question dangled on the exhausted stdin and
+    // Node exited 0 BEFORE planning finished — no writes, no report. Now: the
+    // confirmed file is overwritten, the EOF'd one declines (blocked), and the
+    // full report prints.
+    assert.equal(r.status, 0);
+    assert.doesNotMatch(r.stderr, /readline was closed/);
+    assert.match(r.stdout, /wrote 1 file\(s\)/);
+    assert.match(r.stdout, /blocked 1 edited file\(s\)/);
+  });
+});
+
+/**
+ * #35 — symlink-aliased provider targets (the cerebro shape):
+ * `.claude/skills/<name>` is a hand-made symlink into `.agents/skills/<name>`.
+ * The old writer followed the in-repo symlinked parent and clobbered the
+ * canonical SKILL.md (dropping `allowed-tools:`), and the next audit reported
+ * drift:stale — apply→audit broke its own idempotency contract.
+ */
+describe('symlink-aliased targets E2E (#35, spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  const CANONICAL_SKILL =
+    '---\nname: foo\ndescription: Use when fooing\nallowed-tools: "Read"\n---\n# Foo\n\nDo it.\n';
+
+  async function aliasedRepo(): Promise<TempRepo> {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/skills/foo/SKILL.md': CANONICAL_SKILL,
+    });
+    repos.push(repo);
+    await mkdir(join(repo.root, '.claude', 'skills'), { recursive: true });
+    await symlink(
+      join('..', '..', '.agents', 'skills', 'foo'),
+      join(repo.root, '.claude', 'skills', 'foo'),
+    );
+    return repo;
+  }
+
+  it('apply skips the aliased path with HH-W013 and leaves the canonical source byte-identical', async () => {
+    const repo = await aliasedRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /symlink-aliased path\(s\) \(HH-W013/);
+    assert.match(r.stdout, /aliased\t\.claude\/skills\/foo\/SKILL\.md/);
+    // The canonical source was NOT written through the symlink: keys intact,
+    // no @generated header injected.
+    assert.equal(
+      readFileSync(join(repo.root, '.agents', 'skills', 'foo', 'SKILL.md'), 'utf8'),
+      CANONICAL_SKILL,
+    );
+  });
+
+  it('audit after apply reports aliased (exit 2), not drift:stale (exit 1)', async () => {
+    const repo = await aliasedRepo();
+    spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
+      encoding: 'utf8',
+    });
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 2);
+    assert.doesNotMatch(r.stdout, /stale/);
+    assert.match(r.stdout, /skipped 1 symlink-aliased path\(s\) \(HH-W013, not audited\)/);
+    assert.match(r.stdout, /HH-W013/);
+  });
+
+  // Review M1: `.agents` itself as a symlink must refuse init up front (the
+  // old behavior crashed exit 70 mid-onboarding on the first canonical write).
+  it('init refuses a symlinked .agents before any write (exit 1, no backups)', async () => {
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      'cfg-agents/.keep': '',
+    });
+    repos.push(repo);
+    await symlink('cfg-agents', join(repo.root, '.agents'));
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '',
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /refused — \.agents is a symlink/);
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), false);
+    assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
   });
 });

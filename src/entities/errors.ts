@@ -27,6 +27,25 @@ export class ParseError extends DomainError {
 }
 
 /**
+ * Several canonical source files failed to parse in one pass (#36; exit
+ * code 3, same contract as a single `ParseError`). `parseRepo` collects every
+ * per-file `ParseError` before failing so a repo with multiple bad files is
+ * fixed in one round instead of one error per run; the message lists them all.
+ */
+export class AggregateParseError extends DomainError {
+  readonly errors: readonly ParseError[];
+
+  constructor(errors: readonly ParseError[]) {
+    super(
+      `${errors.length} canonical source files failed to parse:\n` +
+        errors.map((error) => `  ${error.message}`).join('\n'),
+      3,
+    );
+    this.errors = errors;
+  }
+}
+
+/**
  * A SignedSource manifest entry path contains a newline (F2). Manifest lines
  * are `\n`-joined, so such a path would make the manifest ambiguous; callers
  * construct entries from walked repo paths, making this an internal bug.

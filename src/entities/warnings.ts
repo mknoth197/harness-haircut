@@ -13,7 +13,8 @@ export type WarningCode =
   | 'HH-W007'
   | 'HH-W010'
   | 'HH-W011'
-  | 'HH-W012';
+  | 'HH-W012'
+  | 'HH-W013';
 
 export type WarningSeverity = 'warn' | 'error';
 
@@ -38,7 +39,40 @@ export const WARNING_CATALOGUE: Readonly<Record<WarningCode, string>> = {
   'HH-W010': 'unknown attachment under .agents/',
   'HH-W011': 'frontmatter in AGENTS.md leaks verbatim into provider prompts',
   'HH-W012': 'canonical source excluded by .gitignore',
+  'HH-W013': 'provider path skipped: a symlink aliases it onto another repo path',
 };
+
+/**
+ * HH-W013 (#35): a provider projection path resolves through an in-repo
+ * symlinked parent directory onto ANOTHER repo path — typically a canonical
+ * source (`.claude/skills/x` → `.agents/skills/x` is a common hand-rolled
+ * consolidation pattern). Writing the projection there would overwrite the
+ * symlink's target, so `audit` and `apply` both refuse to manage the path and
+ * mint this warning instead. Shared so the two use cases stay word-for-word
+ * consistent.
+ */
+export function symlinkAliasWarning(
+  path: string,
+  resolvedPath: string,
+  providerId: string,
+): Warning {
+  // The probe reports an in-repo target as a repo-relative POSIX path and an
+  // ESCAPING target as an absolute OS path — phrase each honestly.
+  const escapes = resolvedPath.startsWith('/') || /^[A-Za-z]:[/\\]/.test(resolvedPath);
+  const where = escapes
+    ? `a symlinked parent to ${resolvedPath}, outside the repository`
+    : `an in-repo symlink to ${resolvedPath}`;
+  return {
+    code: 'HH-W013',
+    severity: 'warn',
+    message:
+      `${path} resolves through ${where}, so writing the projection would ` +
+      'overwrite that file instead. The path is skipped (not audited, never ' +
+      `written). Remove the symlink to let apply own ${path} as a real file, ` +
+      'or disable the provider.',
+    providerId,
+  };
+}
 
 export const WARNING_CODES: readonly WarningCode[] = Object.keys(
   WARNING_CATALOGUE,

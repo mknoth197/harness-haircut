@@ -9,7 +9,7 @@ import { existsSync, lstatSync } from 'node:fs';
 import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createFileWriter } from '../../dist/index.js';
+import { createFileWriter, createSymlinkAliasProbe } from '../../dist/index.js';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
 import type { TempRepo } from '../_helpers/tmp-repo.ts';
 
@@ -154,5 +154,71 @@ describe('createFileWriter()', () => {
       await readFile(join(repo.root, '.agents', 'skills', 'x', 'SKILL.md'), 'utf8'),
       'ok\n',
     );
+  });
+
+  // #35: an IN-REPO symlinked parent is just as dangerous as an escaping one —
+  // the write lands on the link's target (on real repos, the canonical source).
+  // The cerebro shape: .claude/skills/demo -> ../../.agents/skills/demo.
+  it('refuses to write through an in-repo symlinked parent (canonical source untouched)', async () => {
+    const canonical = '---\nname: demo\ndescription: d\nallowed-tools: "Read"\n---\nBody.\n';
+    const repo = await freshRepo({
+      '.agents/skills/demo/SKILL.md': canonical,
+      // Seeds .claude/skills/ as a real directory (and a real-dir control).
+      '.claude/skills/keep/SKILL.md': 'real\n',
+    });
+    await symlink(
+      join('..', '..', '.agents', 'skills', 'demo'),
+      join(repo.root, '.claude', 'skills', 'demo'),
+    );
+    const writer = createFileWriter(repo.root);
+    writer.write('.claude/skills/keep/SKILL.md', 'real dir works\n'); // control: real dirs fine
+
+    assert.throws(
+      () => writer.write('.claude/skills/demo/SKILL.md', 'PROJECTION\n'),
+      /in-repo symlinked parent/,
+    );
+    // The canonical source behind the symlink was NOT clobbered.
+    assert.equal(
+      await readFile(join(repo.root, '.agents', 'skills', 'demo', 'SKILL.md'), 'utf8'),
+      canonical,
+    );
+  });
+});
+
+describe('createSymlinkAliasProbe()', () => {
+  it('resolves a path behind an in-repo symlinked parent to its real repo path', async () => {
+    const repo = await freshRepo({
+      '.agents/skills/demo/SKILL.md': 'canonical\n',
+      '.claude/skills/keep/SKILL.md': 'real\n',
+    });
+    await symlink(
+      join('..', '..', '.agents', 'skills', 'demo'),
+      join(repo.root, '.claude', 'skills', 'demo'),
+    );
+    const aliasOf = createSymlinkAliasProbe(repo.root);
+    assert.equal(aliasOf('.claude/skills/demo/SKILL.md'), '.agents/skills/demo/SKILL.md');
+    // A sibling through REAL directories is not aliased.
+    assert.equal(aliasOf('.claude/skills/keep/SKILL.md'), null);
+  });
+
+  it('returns null for symlink-free paths, missing parents, and a symlinked LEAF', async () => {
+    const repo = await freshRepo({ 'AGENTS.md': '# T\n', '.agents/skills/x/SKILL.md': 'c\n' });
+    await symlink(join('.agents', 'skills', 'x', 'SKILL.md'), join(repo.root, 'LINK.md'));
+    const aliasOf = createSymlinkAliasProbe(repo.root);
+    assert.equal(aliasOf('AGENTS.md'), null);
+    assert.equal(aliasOf('.claude/skills/new/SKILL.md'), null); // parents do not exist yet
+    // The leaf being a symlink is write-safe (the link is replaced in place).
+    assert.equal(aliasOf('LINK.md'), null);
+  });
+
+  it('reports an ESCAPING symlinked parent as aliased too (absolute target)', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-ext-'));
+    const repo = await freshRepo();
+    await symlink(outside, join(repo.root, '.github'));
+    const aliasOf = createSymlinkAliasProbe(repo.root);
+    const resolved = aliasOf('.github/copilot-instructions.md');
+    assert.notEqual(resolved, null);
+    assert.equal(resolved !== null && resolved.startsWith('/'), true);
+    await rm(outside, { recursive: true, force: true });
   });
 });
