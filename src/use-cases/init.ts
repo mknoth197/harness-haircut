@@ -50,6 +50,7 @@ import type {
 } from '../entities/adapter.js';
 import type { Attachment } from '../entities/ir.js';
 import { isSafeName } from '../entities/ir.js';
+import { APPLY_STATE_PATH } from '../entities/apply-state.js';
 import type { ApplyReport } from './apply.js';
 import type {
   CandidateText,
@@ -101,7 +102,7 @@ export interface InitReport {
   /** PRD §7: 0 success · 1 refused (already-canonical / unresolved). */
   exitCode: 0 | 1;
   /** Set when the run refused before doing any work. */
-  refused?: 'already-canonical' | 'unresolved-contradictions';
+  refused?: 'already-canonical' | 'unresolved-contradictions' | 'symlinked-canonical-home';
   /** True when this was a `--dry-run` (no writes, apply not called). */
   dryRun: boolean;
   /** Existing provider configs detected, in adapter order. */
@@ -143,6 +144,15 @@ export interface InitDeps {
   resolveContradiction: ContradictionResolver;
   /** C3 reuses C2: the fully-wired `apply` the composition root supplies. */
   apply: () => Promise<ApplyReport>;
+  /**
+   * #35: resolves a path that traverses an in-repo symlinked parent to its
+   * real location (or null). Used to refuse a SYMLINKED `.agents/` before any
+   * write: the walk skips symlinks (canonical content there would be
+   * invisible to every later parse) and the writer refuses symlinked-parent
+   * traversal — without this check init would crash mid-onboarding (exit 70)
+   * on its first canonical write, after backups were already written.
+   */
+  aliasOf?: (path: string) => string | null;
   flags: InitFlags;
 }
 
@@ -441,6 +451,30 @@ export async function init(deps: InitDeps): Promise<InitReport> {
         'this repo already has canonical artifacts (a .agents/ directory or a ' +
           'generated root AGENTS.md). init onboards a non-canonical repo — run ' +
           '`harness-haircut apply` to refresh projections instead.',
+      ],
+      backups: [],
+    };
+  }
+
+  // ---- step 2b (#35): refuse a SYMLINKED canonical home before any write ----
+  // A symlinked `.agents/` slips past UN1 (the snapshot walk skips symlinks,
+  // so it contributes no files) but cannot host the canonical tree: the walk
+  // would never read content back out of it, and the writer refuses
+  // symlinked-parent traversal — init would otherwise crash mid-onboarding
+  // (exit 70) on its first canonical write, after backups were written.
+  const canonicalHomeAlias = (deps.aliasOf ?? (() => null))(APPLY_STATE_PATH);
+  if (canonicalHomeAlias !== null) {
+    return {
+      exitCode: 1,
+      refused: 'symlinked-canonical-home',
+      dryRun: flags.dryRun,
+      detected,
+      contradictions: [],
+      planned: [],
+      notes: [
+        `.agents resolves through a symlink (.agents/* lands at ${canonicalHomeAlias.replace(/\/[^/]*$/, '')}/*). ` +
+          'harness-haircut must own .agents/ as a real directory: replace the ' +
+          'symlink with the directory it points to, then re-run init.',
       ],
       backups: [],
     };

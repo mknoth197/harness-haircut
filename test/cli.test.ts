@@ -849,4 +849,23 @@ describe('symlink-aliased targets E2E (#35, spawn dist/bin.js)', () => {
     assert.match(r.stdout, /skipped 1 symlink-aliased path\(s\) \(HH-W013, not audited\)/);
     assert.match(r.stdout, /HH-W013/);
   });
+
+  // Review M1: `.agents` itself as a symlink must refuse init up front (the
+  // old behavior crashed exit 70 mid-onboarding on the first canonical write).
+  it('init refuses a symlinked .agents before any write (exit 1, no backups)', async () => {
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      'cfg-agents/.keep': '',
+    });
+    repos.push(repo);
+    await symlink('cfg-agents', join(repo.root, '.agents'));
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '',
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /refused — \.agents is a symlink/);
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), false);
+    assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
+  });
 });

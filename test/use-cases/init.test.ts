@@ -35,6 +35,7 @@ import {
   parseState,
   serializeState,
   APPLY_STATE_PATH,
+  createSymlinkAliasProbe,
 } from '../../dist/index.js';
 import type {
   ApplyState,
@@ -94,8 +95,10 @@ function runInit(root: string, options: RunInitOptions = {}): Promise<InitReport
         readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
         writeState: (state: ApplyState): void =>
           writer.write(APPLY_STATE_PATH, serializeState(state)),
+        aliasOf: createSymlinkAliasProbe(root),
         flags: { allowDirty: true, dryRun: options.dryRun ?? false, nonInteractive: true },
       }),
+    aliasOf: createSymlinkAliasProbe(root),
     flags: { dryRun: options.dryRun ?? false, nonInteractive: options.nonInteractive ?? false },
   });
 }
@@ -507,8 +510,9 @@ describe('init() — FIX 1 symlinked root-instruction candidate (security)', () 
   // /tmp/external — with an ORDINARY real leaf (copilot-instructions.md holding
   // a secret) defeated the old leaf-only lstat. init read the secret THROUGH
   // the symlinked parent into canonical AGENTS.md and projected it everywhere.
-  // Realpath-containment now treats the whole escaping chain as absent, and the
-  // writer refuses to project back through the symlinked parent.
+  // Realpath-containment now treats the whole escaping chain as absent, and
+  // since #35 the alias probe skips the projection up front (HH-W013) instead
+  // of crashing at the writer's refusal.
   it('does NOT recover a secret behind a symlinked PARENT directory (.github → external)', async () => {
     const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-external-'));
     await writeFile(
@@ -523,16 +527,19 @@ describe('init() — FIX 1 symlinked root-instruction candidate (security)', () 
     // .github is a symlink to the external dir; the leaf behind it is a real file.
     await symlink(outside, join(repo.root, '.github'));
 
-    // READ side: the secret behind the symlinked parent is never recovered. The
-    // WRITE side then refuses to project back through the symlinked `.github`
-    // parent (it would land outside the repo) — surfacing as a thrown
-    // FileSystemError rather than a silent clobber. Either way the secret is
-    // contained, so we accept the throw and assert the security invariants hold.
-    await assert.rejects(
-      runInit(repo.root),
-      (err: unknown) =>
-        err instanceof Error && /escapes repo root|outside repo root/.test(err.message),
+    // READ side: the secret behind the symlinked parent is never recovered.
+    // WRITE side (#35): the alias probe now flags the escaping `.github`
+    // chain BEFORE the write is attempted, so the chained apply SKIPS the
+    // projection with HH-W013 and the run completes — strictly better than
+    // the previous mid-run FileSystemError (exit 70), with the same
+    // containment: nothing is read or written through the chain.
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    const aliasWarning = report.apply?.warnings.find(
+      (w) => w.code === 'HH-W013' && w.message.includes('.github/copilot-instructions.md'),
     );
+    assert.notEqual(aliasWarning, undefined);
+    assert.match(aliasWarning?.message ?? '', /outside the repository/);
 
     // The secret never reached canonical AGENTS.md (read guard held).
     const canonical = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
@@ -581,5 +588,24 @@ describe('init() — FIX 2(a) unsafe discovered names skipped + noted', () => {
     assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'Bad.Name.md')), false);
     assert.ok(report.notes.some((n) => /unsafe/i.test(n) && /Bad\.Name\.md/.test(n)));
     assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'good.md')), true);
+  });
+});
+
+describe('init() — #35 symlinked canonical home', () => {
+  it('refuses (exit 1) when .agents is an in-repo symlink, before writing anything', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      'cfg-agents/.keep': '',
+    });
+    await symlink('cfg-agents', join(repo.root, '.agents'));
+
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 1);
+    assert.equal(report.refused, 'symlinked-canonical-home');
+    assert.match(report.notes.join('\n'), /\.agents resolves through a symlink/);
+    // Refused BEFORE any write: no canonical root, no backups, no projections.
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), false);
+    assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
+    assert.equal(existsSync(join(repo.root, 'cfg-agents', '.harness-state.json')), false);
   });
 });

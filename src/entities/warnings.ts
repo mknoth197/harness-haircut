@@ -56,14 +56,20 @@ export function symlinkAliasWarning(
   resolvedPath: string,
   providerId: string,
 ): Warning {
+  // The probe reports an in-repo target as a repo-relative POSIX path and an
+  // ESCAPING target as an absolute OS path — phrase each honestly.
+  const escapes = resolvedPath.startsWith('/') || /^[A-Za-z]:[/\\]/.test(resolvedPath);
+  const where = escapes
+    ? `a symlinked parent to ${resolvedPath}, outside the repository`
+    : `an in-repo symlink to ${resolvedPath}`;
   return {
     code: 'HH-W013',
     severity: 'warn',
     message:
-      `${path} resolves through an in-repo symlink to ${resolvedPath}, so writing ` +
-      'the projection would overwrite that file instead. The path is skipped ' +
-      `(not audited, never written). Remove the symlink to let apply own ${path} ` +
-      'as a real file, or disable the provider.',
+      `${path} resolves through ${where}, so writing the projection would ` +
+      'overwrite that file instead. The path is skipped (not audited, never ' +
+      `written). Remove the symlink to let apply own ${path} as a real file, ` +
+      'or disable the provider.',
     providerId,
   };
 }

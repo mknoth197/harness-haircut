@@ -111,7 +111,7 @@ function assertParentContained(realRoot: string, abs: string): void {
           new Error(
             `refusing to write through an in-repo symlinked parent: ${abs} would land ` +
               `at ${realAncestor + abs.slice(ancestor.length)} (remove the symlink so the ` +
-              'projection can be a real file)',
+              'write can land at its own path)',
           ),
         );
       }

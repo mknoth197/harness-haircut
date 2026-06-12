@@ -628,4 +628,26 @@ describe('apply() — #35 symlink-aliased targets', () => {
     const state = parseState(reader.read(APPLY_STATE_PATH));
     assert.equal('.claude/skills/foo/SKILL.md' in state.emitted, false);
   });
+
+  // Review M1: `.agents` ITSELF as an in-repo symlink (stow/chezmoi shape).
+  // The state file lives under `.agents/`, so an unguarded writeState crashed
+  // exit 70 mid-run AFTER the provider files landed.
+  it('completes when .agents itself is a symlink: provider files written, state write skipped + warned', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      'cfg-agents/.keep': '',
+    });
+    await symlink('cfg-agents', join(repo.root, '.agents'));
+
+    const report = await runApply(repo.root);
+    assert.equal(report.exitCode, 0);
+    assert.ok(report.written.includes('.github/copilot-instructions.md'));
+    // The state baseline was skipped (not crashed into), with an HH-W013
+    // naming the state path; nothing landed at the symlink's target.
+    const warning = report.warnings.find(
+      (w) => w.code === 'HH-W013' && w.message.includes(APPLY_STATE_PATH),
+    );
+    assert.notEqual(warning, undefined);
+    assert.equal(existsSync(join(repo.root, 'cfg-agents', '.harness-state.json')), false);
+  });
 });

@@ -82,7 +82,7 @@ export interface AuditReport {
   files: FileAudit[];
   /** Parse warnings + every adapter's projection warnings, concatenated. */
   warnings: Warning[];
-  /** True when any file's status is not `clean`. */
+  /** True when any file's status is not `clean` (`aliased` excepted — #35). */
   drift: boolean;
   /** PRD §7: 0 clean · 1 drift · 2 lossy-warning · 3 invalid config. */
   exitCode: 0 | 1 | 2 | 3;

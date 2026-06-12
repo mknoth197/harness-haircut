@@ -1102,6 +1102,7 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       writer,
       adapters,
       resolveContradiction,
+      aliasOf: createSymlinkAliasProbe(cwd),
       // C3 reuses C2. init has just written canonical files, so the tree is
       // expected dirty during onboarding — apply runs with allowDirty so the
       // freshly-written canonical layout is projected. The init-level prompt
@@ -1148,6 +1149,15 @@ function renderInitReport(report: InitReport): string {
 
   if (report.refused === 'already-canonical') {
     lines.push('refused — this repo is already canonical (run `harness-haircut apply` instead).');
+    for (const note of report.notes) {
+      lines.push(`  ${note}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  if (report.refused === 'symlinked-canonical-home') {
+    lines.push('refused — .agents is a symlink, and init must own it as a real directory.');
     for (const note of report.notes) {
       lines.push(`  ${note}`);
     }
