@@ -22,9 +22,13 @@
  * Skill sibling attachments are copied verbatim with NO header: a header
  * would corrupt shebang lines, JSON, and binary-ish assets. Drift detection
  * for them is full-content comparison against canonical (they are fully
- * owned). Provider-specific skill frontmatter extras never reach this
- * adapter — F1 parsing keeps only the Agent Skills common core
- * (name/description), so emitted frontmatter is exactly that core.
+ * owned). The SKILL.md frontmatter is reproduced VERBATIM from canonical
+ * (`Skill.frontmatter`), so provider-specific keys (`allowed-tools`,
+ * `argument-hint`, `trigger`, …) survive the projection. An earlier version
+ * rebuilt the frontmatter from just name+description, silently dropping the
+ * rest — and dropping `allowed-tools` *loosened* the skill's tool
+ * restrictions, which Claude enforces (#38). Codex/Gemini/Copilot read
+ * canonical `.agents/skills/` natively, so Claude is the only projected target.
  */
 import type {
   EmittedFile,
@@ -125,7 +129,12 @@ function ruleFile(instruction: Instruction, glob: string, downgraded: boolean): 
 }
 
 function skillFiles(skill: Skill): EmittedFile[] {
-  const frontmatter = `---\nname: ${skill.name}\ndescription: ${JSON.stringify(skill.description)}\n---\n`;
+  // #38: reproduce the canonical frontmatter VERBATIM (name/description plus any
+  // provider-specific keys) instead of rebuilding it from name+description — the
+  // latter silently dropped `allowed-tools`/`argument-hint`/`trigger`. The
+  // SignedSource header still lands on the first line after this block via
+  // embedHeaderAfterFrontmatter, so Claude parses `name:` on line 1 as required.
+  const frontmatter = `---\n${skill.frontmatter}\n---\n`;
   const files: EmittedFile[] = [
     {
       path: `.claude/skills/${skill.name}/SKILL.md`,

@@ -38,10 +38,20 @@ export function hook(
   return { event, name, path: `.agents/hooks/${event}.${name}.${ext}`, script };
 }
 
-export function skill(name: string, files: Attachment[] = [], body = ''): Skill {
+export function skill(
+  name: string,
+  files: Attachment[] = [],
+  body = '',
+  frontmatterExtras: string[] = [],
+): Skill {
+  const description = `Use when working with ${name}`;
+  // Mirrors the canonical-frontmatter shape parseRepo produces (name +
+  // JSON-quoted description), plus any provider-specific extra keys (#38).
+  const frontmatter = [`name: ${name}`, `description: ${JSON.stringify(description)}`, ...frontmatterExtras].join('\n');
   return {
     name,
-    description: `Use when working with ${name}`,
+    description,
+    frontmatter,
     path: `.agents/skills/${name}/SKILL.md`,
     body: body === '' ? `# ${name}\n\nDo the thing.\n` : body,
     files,

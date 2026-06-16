@@ -183,6 +183,66 @@ describe('createFileWriter()', () => {
       canonical,
     );
   });
+
+  // #37: `remove` displaces a recovered fragment original. Same containment as
+  // `write`: delete the named file, no-op when absent, remove a symlinked LEAF
+  // (not its target), and refuse to delete THROUGH a symlinked/escaping parent.
+  it('removes a file and reports it absent afterward', async () => {
+    const repo = await freshRepo({ '.github/instructions/security.instructions.md': 'x\n' });
+    const writer = createFileWriter(repo.root);
+    writer.remove('.github/instructions/security.instructions.md');
+    assert.equal(writer.exists('.github/instructions/security.instructions.md'), false);
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'security.instructions.md')),
+      false,
+    );
+  });
+
+  it('remove is a no-op for a missing file (idempotent, no throw)', async () => {
+    const repo = await freshRepo();
+    const writer = createFileWriter(repo.root);
+    assert.doesNotThrow(() => writer.remove('never-existed.md'));
+  });
+
+  it('rejects a remove relPath that escapes the repo root (.. or absolute), target untouched', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-rm-'));
+    const victim = join(outside, 'victim.txt');
+    await writeFile(victim, 'KEEP\n', 'utf8');
+    const repo = await freshRepo();
+    const writer = createFileWriter(repo.root);
+    assert.throws(() => writer.remove('a/../../escape.txt'), /outside repo root/);
+    assert.throws(() => writer.remove(victim), /outside repo root/);
+    assert.equal(await readFile(victim, 'utf8'), 'KEEP\n');
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('removes a symlinked LEAF itself, never its target', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-rmleaf-'));
+    const target = join(outside, 'keep.txt');
+    await writeFile(target, 'KEEP\n', 'utf8');
+    const repo = await freshRepo();
+    await symlink(target, join(repo.root, 'link.md'));
+    const writer = createFileWriter(repo.root);
+    writer.remove('link.md');
+    assert.equal(existsSync(join(repo.root, 'link.md')), false); // the link is gone
+    assert.equal(await readFile(target, 'utf8'), 'KEEP\n'); // its target is intact
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('refuses to remove through a symlinked PARENT directory (no external delete)', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'harness-haircut-rmparent-'));
+    const externalFile = join(outside, 'instructions.md');
+    await writeFile(externalFile, 'EXTERNAL\n', 'utf8');
+    const repo = await freshRepo();
+    await symlink(outside, join(repo.root, '.github'));
+    const writer = createFileWriter(repo.root);
+    assert.throws(
+      () => writer.remove('.github/instructions.md'),
+      /escapes repo root|outside repo root|symlinked parent/,
+    );
+    assert.equal(await readFile(externalFile, 'utf8'), 'EXTERNAL\n');
+    await rm(outside, { recursive: true, force: true });
+  });
 });
 
 describe('createSymlinkAliasProbe()', () => {

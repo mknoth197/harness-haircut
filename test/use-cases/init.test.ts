@@ -339,6 +339,78 @@ describe('init() — F1 scoped fragment recovery', () => {
     assert.match(written, /Never log secrets\./);
     // it is consolidated, no per-fragment "left in place" note for recovered ones.
     assert.ok(!report.notes.some((n) => /could not recover/i.test(n)));
+
+    // #37: the original is displaced — removed so the projected hh.* twin does
+    // not double-load, with its verbatim content preserved in the backup dir.
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'security.instructions.md')),
+      false,
+    );
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'hh.security.instructions.md')),
+      true,
+    );
+    const backupRel = '.harness-haircut-init-backup/.github__instructions__security.instructions.md';
+    assert.ok(report.backups.includes(backupRel));
+    const backedUp = await readFile(join(repo.root, backupRel), 'utf8');
+    assert.equal(backedUp, '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n');
+    assert.ok(report.notes.some((n) => /consolidation recovers/i.test(n)));
+  });
+
+  it('#37: displaces a Claude .claude/rules/<name>.md original too, leaving only the hh.* twin', async () => {
+    // The double-load generalizes beyond Copilot: the Claude rules projection is
+    // also hh.*-prefixed, so a recovered non-hh rule must be removed + backed up.
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.claude/rules/testing.md': '---\npaths: ["test/**"]\n---\n# Testing\n\nUse node:test.\n',
+    });
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'testing.md')), true);
+    assert.equal(existsSync(join(repo.root, '.claude', 'rules', 'testing.md')), false);
+    assert.equal(existsSync(join(repo.root, '.claude', 'rules', 'hh.testing.md')), true);
+    assert.ok(report.backups.includes('.harness-haircut-init-backup/.claude__rules__testing.md'));
+    // No double-load: a follow-up audit is clean (gemini excluded — it cannot
+    // path-scope fragments, HH-W007 → exit 2, orthogonal to this fix).
+    const auditReport = await runAudit(repo.root, ['gemini']);
+    assert.equal(auditReport.exitCode, 0);
+  });
+
+  it('does NOT displace an original already at the tool-owned hh.* path (apply overwrites it in place)', async () => {
+    // An hh.*-prefixed source IS the projection target, so it is overwritten in
+    // place — never removed, and not backed up (it carries no user-authored
+    // original distinct from the projection).
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.github/instructions/hh.security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'hh.security.instructions.md')),
+      true,
+    );
+    assert.deepEqual(report.backups, []);
+    assert.ok(!report.notes.some((n) => /consolidation recovers/i.test(n)));
+  });
+
+  it('#37 dry-run: previews fragment consolidation but removes/backs up nothing', async () => {
+    const repo = await setup({
+      'CLAUDE.md': '@AGENTS.md\n\n# A\nUse npm.\n',
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    const report = await runInit(repo.root, { dryRun: true });
+    assert.equal(report.exitCode, 0);
+    assert.deepEqual(report.backups, []);
+    // The original is untouched; nothing canonical or backup was written.
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'security.instructions.md')),
+      true,
+    );
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'security.md')), false);
+    assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
   });
 
   it('after recovery, audit() exits 0 and a follow-up apply does NOT clobber the orphan as unmanaged', async () => {

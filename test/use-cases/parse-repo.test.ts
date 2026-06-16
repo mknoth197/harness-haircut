@@ -261,6 +261,7 @@ describe('parseRepo — skills', () => {
     const skill = ir.skills[0];
     assert.equal(skill?.name, 'deploy');
     assert.equal(skill?.description, 'Ship the thing safely');
+    assert.equal(skill?.frontmatter, 'name: deploy\ndescription: Ship the thing safely');
     assert.equal(skill?.path, '.agents/skills/deploy/SKILL.md');
     assert.equal(skill?.body, '# Deploy\n\nSteps.\n');
     assert.deepEqual(
@@ -268,6 +269,22 @@ describe('parseRepo — skills', () => {
       ['.agents/skills/deploy/references/notes.md', '.agents/skills/deploy/scripts/run.sh'],
     );
     assert.deepEqual(warnings, []);
+  });
+
+  it('captures provider-specific frontmatter keys verbatim (#38: allowed-tools, argument-hint)', async () => {
+    // name/description are still surfaced as fields, but the whole block is kept
+    // verbatim so the Claude projection can reproduce every key (the canonical
+    // .agents/skills/ copy is read natively by the other providers).
+    const { ir } = await parseFixture({
+      '.agents/skills/graphify/SKILL.md':
+        '---\nname: graphify\ndescription: d\nallowed-tools: "read_file, edit_file"\nargument-hint: "<path>"\ntrigger: /graphify\n---\nBody.\n',
+    });
+    const skill = ir.skills[0];
+    assert.equal(skill?.name, 'graphify');
+    assert.equal(
+      skill?.frontmatter,
+      'name: graphify\ndescription: d\nallowed-tools: "read_file, edit_file"\nargument-hint: "<path>"\ntrigger: /graphify',
+    );
   });
 
   it('fails with exit code 3 naming both paths when two skills share a name', () =>

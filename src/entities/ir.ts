@@ -85,6 +85,16 @@ export interface Skill {
   name: string;
   /** From SKILL.md frontmatter (Agent Skills common core). */
   description: string;
+  /**
+   * Verbatim YAML frontmatter interior — the lines BETWEEN the `---` fences,
+   * exactly as authored. Carries the common core (name/description) AND every
+   * provider-specific key (`allowed-tools`, `argument-hint`, `trigger`, …).
+   * The Claude skill projection reproduces this verbatim so it never drops a
+   * key: dropping `allowed-tools` silently *loosened* a skill's tool
+   * restrictions (#38). Codex/Gemini/Copilot read canonical `.agents/skills/`
+   * natively, so Claude's projection is the only consumer.
+   */
+  frontmatter: string;
   /** Repo-relative POSIX path of the SKILL.md entrypoint. */
   path: string;
   /** Post-frontmatter markdown of SKILL.md. */

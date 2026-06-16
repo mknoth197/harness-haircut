@@ -20,6 +20,15 @@ export interface FileWriter {
    * write fully replaces any existing file at the path (no append).
    */
   write(path: string, content: string): void;
+  /**
+   * Removes the file at `path`; a no-op when it does not exist (callers need
+   * not pre-check). `init` uses this to displace a recovered provider file
+   * once its content lives canonically and is re-projected under the
+   * tool-owned `hh.*` name — leaving the original would double-load it (#37).
+   * Like `write`, it must never follow a symlinked parent out of the repo and
+   * removes a symlinked leaf itself (its target is untouched).
+   */
+  remove(path: string): void;
 }
 
 /**
@@ -36,6 +45,9 @@ export function createMemoryWriter(initial: Record<string, string> = {}): FileWr
     exists: (path) => byPath.has(path),
     write: (path, content) => {
       byPath.set(path, content);
+    },
+    remove: (path) => {
+      byPath.delete(path);
     },
     snapshot: () => Object.fromEntries(byPath),
   };

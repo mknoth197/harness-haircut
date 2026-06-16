@@ -214,6 +214,8 @@ interface DiscoveredFragment {
   providerId: ProviderId;
   /** Repo-relative path of the source provider file. */
   sourcePath: string;
+  /** Verbatim original file content, backed up before the source is displaced (#37). */
+  sourceContent: string;
   scope: string;
   body: string;
 }
@@ -224,6 +226,17 @@ function byPath(a: { path: string }, b: { path: string }): number {
 
 function byProvider(a: CandidateText, b: CandidateText): number {
   return a.providerId < b.providerId ? -1 : a.providerId > b.providerId ? 1 : 0;
+}
+
+/**
+ * #37: true when a provider file already lives at the tool-owned `hh.`-prefixed
+ * path the projection writes to (every fragment projection is `hh.<name>.…`).
+ * Such a source is overwritten in place by the chained apply, so it is NOT
+ * displaced; only non-`hh.` originals (the hand-authored files a user actually
+ * keeps) are backed up and removed to stop the projected twin double-loading.
+ */
+function isHarnessOwnedFragmentPath(sourcePath: string): boolean {
+  return sourcePath.slice(sourcePath.lastIndexOf('/') + 1).startsWith('hh.');
 }
 
 /**
@@ -369,6 +382,7 @@ function discoverFragments(snapshot: RepoSnapshot): {
         name,
         providerId: root.providerId,
         sourcePath: file.path,
+        sourceContent: file.content,
         scope: recovered.scope,
         body: recovered.body,
       };
@@ -666,6 +680,10 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- decide the canonical scoped fragments (F1) ----
   const plannedFragmentWrites: { path: string; content: string; origin: string }[] = [];
+  // #37: every source of a fragment that becomes canonical. Each is re-projected
+  // under the tool-owned `hh.*` name, so its ORIGINAL provider file is displaced
+  // (backed up + removed) below to avoid double-loading against the projection.
+  const displacedFragmentSourcesRaw: DiscoveredFragment[] = [];
   for (const [name, discoveredRaw] of [...fragmentsByName].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     // Sort identically to the contradiction's candidate order so a `choose`
     // index resolves to the same fragment the resolver was shown.
@@ -693,6 +711,7 @@ export async function init(deps: InitDeps): Promise<InitReport> {
           content: resolution.text,
           origin: `ai-merged (${discovered.map((f) => f.providerId).join(', ')})`,
         });
+        displacedFragmentSourcesRaw.push(...discovered);
         continue;
       }
       chosen = resolution.kind === 'choose' ? discovered[resolution.index] ?? null : null;
@@ -706,6 +725,7 @@ export async function init(deps: InitDeps): Promise<InitReport> {
       content: fragmentCanonicalText(chosen),
       origin,
     });
+    displacedFragmentSourcesRaw.push(...discovered);
   }
 
   // ---- assemble the planned layout ----
@@ -755,11 +775,44 @@ export async function init(deps: InitDeps): Promise<InitReport> {
     );
   }
 
-  // ---- F2: compute the per-contradiction backup plan (non-chosen candidates) ----
-  const backupPlan = planBackups(contradictions, resolutionBySlot);
-  const backups = backupPlan.map((b) => b.path);
-  for (const note of backupNotes(contradictions, resolutionBySlot)) {
+  // ---- F2 + #37: compute the backup plan ----
+  // Root/skill contradictions: back up each non-chosen candidate's recovered
+  // text. FRAGMENTS are handled separately below — a recovered fragment's
+  // ORIGINAL provider file is displaced wholesale (it would otherwise
+  // double-load against the projected hh.* twin), so it is backed up VERBATIM
+  // regardless of which candidate won; `planBackups` would instead store only
+  // the non-chosen side in its converted `scope:` form. So fragment slots are
+  // excluded from the generic plan and re-added here from the verbatim source.
+  const aliasOf = deps.aliasOf ?? (() => null);
+  // A source already at the tool-owned hh.* path is overwritten in place by the
+  // projection (no separate twin), so it is left for apply to own. #35: a source
+  // reached through an in-repo symlink alias is left untouched (skip, not crash).
+  // Each provider file yields at most one fragment, so these are unique.
+  const displacedFragmentSources = displacedFragmentSourcesRaw.filter(
+    (f) => !isHarnessOwnedFragmentPath(f.sourcePath) && aliasOf(f.sourcePath) === null,
+  );
+  const nonFragmentContradictions = contradictions.filter((c) => !c.slot.startsWith('fragment:'));
+  const backupPlan = planBackups(nonFragmentContradictions, resolutionBySlot);
+  for (const note of backupNotes(nonFragmentContradictions, resolutionBySlot)) {
     notes.push(note);
+  }
+  for (const source of displacedFragmentSources) {
+    backupPlan.push({
+      path: `${INIT_BACKUP_DIR}/${sanitizeBackupName(source.sourcePath)}`,
+      content: source.sourceContent,
+    });
+  }
+  const backups = backupPlan.map((b) => b.path);
+  if (displacedFragmentSources.length > 0) {
+    const moves = displacedFragmentSources
+      .map((s) => `${s.sourcePath} -> ${INIT_BACKUP_DIR}/${sanitizeBackupName(s.sourcePath)}`)
+      .sort()
+      .join(', ');
+    notes.push(
+      `consolidation recovers ${displacedFragmentSources.length} provider instruction file(s) into ` +
+        'canonical .agents/instructions/ and moves each original to the init backup dir, so the ' +
+        `projected hh.* twin does not double-load (${moves}).`,
+    );
   }
 
   // ---- step 6: OPT2 dry-run stops here (no backups written either) ----
@@ -789,6 +842,13 @@ export async function init(deps: InitDeps): Promise<InitReport> {
   }
   for (const write of plannedSkillWrites) {
     deps.writer.write(write.path, write.content);
+  }
+  // #37: remove each displaced fragment original (its content was backed up just
+  // above and now lives canonically). Done BEFORE the chained apply so the hh.*
+  // twin becomes the only copy of that fragment in the provider directory —
+  // otherwise the original and the projection both load (token bloat + drift).
+  for (const source of displacedFragmentSources) {
+    deps.writer.remove(source.sourcePath);
   }
 
   const applyReport = await deps.apply();
