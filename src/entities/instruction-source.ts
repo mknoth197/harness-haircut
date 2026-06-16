@@ -164,45 +164,55 @@ export function recoverFragmentFromClaudeRule(content: string): RecoveredFragmen
   return { scope, body: stripFragmentHeader(body) };
 }
 
-/** Reads a single-line `applyTo: "<glob>,<glob>"` (or unquoted) into a comma-joined scope. */
-function parseApplyTo(fmLines: string[]): string | null {
-  for (const raw of fmLines) {
-    const match = /^applyTo:\s*(.*)$/.exec(raw.trim());
-    if (match === null) {
-      continue;
-    }
-    const value = unquoteScalar((match[1] ?? '').trim());
-    const globs = value
-      .split(',')
-      .map((g) => g.trim())
-      .filter((g) => g !== '');
-    return globs.length === 0 ? null : globs.join(',');
+/**
+ * C6 (#44) — recovers a scoped fragment from an EXISTING canonical
+ * `.agents/instructions/<name>.md` file: parses its own `scope:` frontmatter
+ * (the shape `init`/`apply` write — `fragmentCanonicalText`). Used only under
+ * `--adopt`, where a hand-built canonical fragment is the highest-precedence
+ * candidate for its slot, so a same-named provider fragment becomes a proper
+ * contradiction (EV2/EV3) instead of silently overwriting it. Returns `null`
+ * when there is no `scope:` frontmatter (surfaced as a note, never dropped).
+ */
+export function recoverFragmentFromCanonical(content: string): RecoveredFragment | null {
+  const { fmLines, body } = splitLeadingFrontmatter(content);
+  if (fmLines === null) {
+    return null;
   }
-  return null;
+  const scope = parseScope(fmLines);
+  if (scope === null) {
+    return null;
+  }
+  return { scope, body: stripFragmentHeader(body) };
 }
 
 /**
- * Reads `paths:` from Claude-rule frontmatter — either an inline
- * `paths: ["a", "b"]` array or a block sequence of `- a` lines — into a
- * comma-joined scope. Returns `null` when no `paths:` key is present.
+ * Parses a frontmatter glob-list value for `key` into a comma-joined scope,
+ * accepting all three YAML shapes a hand-author might use: a scalar
+ * (`key: "<glob>"` quoted, or `key: <glob>,<glob>` comma-joined), an inline
+ * array (`key: ["a", "b"]`), or a block sequence (`key:` then `- a` lines).
+ * Returns `null` when `key` is absent or carries no globs. Shared by the
+ * canonical `scope:` and Claude-rule `paths:` readers so a hand-written array
+ * scope is normalized rather than captured as a literal string (which would
+ * broaden the rule to match every file).
  */
-function parsePaths(fmLines: string[]): string | null {
+function parseGlobList(fmLines: string[], key: string): string | null {
+  const prefix = `${key}:`;
   for (let i = 0; i < fmLines.length; i++) {
     const raw = (fmLines[i] ?? '').trim();
-    const match = /^paths:\s*(.*)$/.exec(raw);
-    if (match === null) {
+    if (!raw.startsWith(prefix)) {
       continue;
     }
-    const rest = (match[1] ?? '').trim();
+    const rest = raw.slice(prefix.length).trim();
     if (rest.startsWith('[') && rest.endsWith(']')) {
       const inner = rest.slice(1, -1).trim();
-      const globs = inner === ''
-        ? []
-        : inner.split(',').map((g) => unquoteScalar(g.trim())).filter((g) => g !== '');
+      const globs =
+        inner === ''
+          ? []
+          : inner.split(',').map((g) => unquoteScalar(g.trim())).filter((g) => g !== '');
       return globs.length === 0 ? null : globs.join(',');
     }
     if (rest !== '') {
-      // `paths: <glob>` scalar form.
+      // `key: <glob>` scalar form (already comma-joined for a multi-glob scope).
       const scalar = unquoteScalar(rest);
       return scalar === '' ? null : scalar;
     }
@@ -221,6 +231,37 @@ function parsePaths(fmLines: string[]): string | null {
     return globs.length === 0 ? null : globs.join(',');
   }
   return null;
+}
+
+/** Reads the canonical `scope:` frontmatter (scalar / inline-array / block-sequence). */
+function parseScope(fmLines: string[]): string | null {
+  return parseGlobList(fmLines, 'scope');
+}
+
+/** Reads a single-line `applyTo: "<glob>,<glob>"` (or unquoted) into a comma-joined scope. */
+function parseApplyTo(fmLines: string[]): string | null {
+  for (const raw of fmLines) {
+    const match = /^applyTo:\s*(.*)$/.exec(raw.trim());
+    if (match === null) {
+      continue;
+    }
+    const value = unquoteScalar((match[1] ?? '').trim());
+    const globs = value
+      .split(',')
+      .map((g) => g.trim())
+      .filter((g) => g !== '');
+    return globs.length === 0 ? null : globs.join(',');
+  }
+  return null;
+}
+
+/**
+ * Reads `paths:` from Claude-rule frontmatter — a scalar, an inline
+ * `paths: ["a", "b"]` array, or a block sequence of `- a` lines — into a
+ * comma-joined scope. Returns `null` when no `paths:` key is present.
+ */
+function parsePaths(fmLines: string[]): string | null {
+  return parseGlobList(fmLines, 'paths');
 }
 
 /** Strips matching single/double quotes from a scalar (no escape processing). */

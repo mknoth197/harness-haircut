@@ -9,9 +9,12 @@
  *
  * Pipeline (U1):
  *   1. detect existing provider files (every adapter's `detectExisting`)
- *   2. UN1: if the repo is already canonical (`.agents/` exists, or root
- *      `AGENTS.md` is itself a generated/projected file), fail (exit 1) and
- *      recommend `apply` — init is for onboarding a NON-canonical repo.
+ *   2. UN1 (revised by C6 #44): if the repo is TOOL-canonical (a
+ *      `.agents/.harness-state.json` state file, or a generated/projected root
+ *      `AGENTS.md`), fail (exit 1) and recommend `apply`. If it has a HAND-BUILT
+ *      `.agents/` tree (canonical-shaped but no tool markers) and `--adopt` is
+ *      not set, fail (exit 1) and recommend `init --adopt`. Under `--adopt` the
+ *      hand-built tree is adopted as the highest-precedence canonical content.
  *   3. build a *candidate* canonical IR by union: recover root-instruction
  *      text from each existing file (EV1 agree → no prompt), recover per-file
  *      SCOPED instruction fragments (`.github/instructions/*.instructions.md`
@@ -38,7 +41,8 @@
  *
  * Exit codes (PRD §7; choices documented inline):
  *   0  success — canonical layout written and projected (or dry-run preview)
- *   1  refused: already-canonical (UN1), or an unresolved contradiction under
+ *   1  refused: tool-canonical (UN1, → apply), hand-built canonical without
+ *      `--adopt` (C6, → init --adopt), or an unresolved contradiction under
  *      `--non-interactive` (OPT1)
  *   (apply's own exit code is surfaced when it is non-zero)
  */
@@ -62,6 +66,7 @@ import type { FileWriter } from '../entities/file-writer.js';
 import {
   fragmentNameFromSource,
   normalizeForCompare,
+  recoverFragmentFromCanonical,
   recoverFragmentFromClaudeRule,
   recoverFragmentFromCopilot,
   recoverFromAgentsMd,
@@ -76,6 +81,15 @@ export interface InitFlags {
   dryRun: boolean;
   /** OPT1: never prompt — any contradiction fails the run (exit 1). */
   nonInteractive: boolean;
+  /**
+   * AD3 (#44, C6): adopt a HAND-BUILT canonical repo. Bypasses the
+   * already-canonical refusal ONLY for a repo whose `.agents/` tree was created
+   * by hand (no harness-haircut state file, no SignedSource'd root `AGENTS.md`),
+   * treating that tree as the highest-precedence canonical content. Has no
+   * effect on a tool-canonical repo (AD1 still refuses → `apply`) or a
+   * non-canonical repo (AD8 — behaves as plain `init`).
+   */
+  adopt: boolean;
 }
 
 /** A skill recovered from an existing provider skills directory. */
@@ -101,8 +115,16 @@ export interface PlannedFile {
 export interface InitReport {
   /** PRD §7: 0 success · 1 refused (already-canonical / unresolved). */
   exitCode: 0 | 1;
-  /** Set when the run refused before doing any work. */
-  refused?: 'already-canonical' | 'unresolved-contradictions' | 'symlinked-canonical-home';
+  /**
+   * Set when the run refused before doing any work. `hand-canonical-needs-adopt`
+   * (C6 #44) is the hand-built `.agents/` case: distinct from `already-canonical`
+   * because the recommended remedy is `init --adopt`, not `apply`.
+   */
+  refused?:
+    | 'already-canonical'
+    | 'hand-canonical-needs-adopt'
+    | 'unresolved-contradictions'
+    | 'symlinked-canonical-home';
   /** True when this was a `--dry-run` (no writes, apply not called). */
   dryRun: boolean;
   /** Existing provider configs detected, in adapter order. */
@@ -176,11 +198,22 @@ const SKILL_SOURCE_ROOTS: { prefix: string; providerId: ProviderId }[] = [
 ];
 
 /**
- * F1 — scoped instruction fragment source roots. Each provider stores per-file
- * scoped instructions in its own directory and frontmatter dialect; `recover`
- * parses that dialect (Copilot `applyTo:`, Claude `paths:`) into a canonical
- * `{ scope, body }`, or returns `null` when the file carries no scope to derive
- * (surfaced as a note, never dropped).
+ * F1 — scoped instruction fragment source roots, HIGHEST precedence first.
+ * Each provider stores per-file scoped instructions in its own directory and
+ * frontmatter dialect; `recover` parses that dialect (canonical `scope:`,
+ * Copilot `applyTo:`, Claude `paths:`) into a canonical `{ scope, body }`, or
+ * returns `null` when the file carries no scope to derive (surfaced as a note,
+ * never dropped).
+ *
+ * C6 (#44): `.agents/instructions/` (the canonical home itself) leads the list
+ * so that under `--adopt` a hand-built canonical fragment is the top-precedence
+ * candidate for its slot — a same-named provider fragment then becomes a proper
+ * `fragment:<name>` contradiction (AD4) rather than silently overwriting it.
+ * Its `providerId` is labelled `codex` to match the existing
+ * `SKILL_SOURCE_ROOTS` convention for the canonical `.agents/` tree (Codex's
+ * native format IS the canonical shape; there is no distinct `canonical`
+ * `ProviderId` in v1). In a NON-adopt onboarding run `.agents/` does not exist,
+ * so this root contributes nothing and the F1 behaviour is unchanged.
  */
 const FRAGMENT_SOURCE_ROOTS: {
   prefix: string;
@@ -188,6 +221,17 @@ const FRAGMENT_SOURCE_ROOTS: {
   matches: (path: string) => boolean;
   recover: (content: string) => RecoveredFragment | null;
 }[] = [
+  {
+    prefix: '.agents/instructions/',
+    providerId: 'codex',
+    // Direct `.agents/instructions/<name>.md` children only (the canonical
+    // fragment shape); never the state file or a nested subtree.
+    matches: (path) =>
+      path.startsWith('.agents/instructions/') &&
+      path.endsWith('.md') &&
+      !path.slice('.agents/instructions/'.length).includes('/'),
+    recover: recoverFragmentFromCanonical,
+  },
   {
     prefix: '.github/instructions/',
     providerId: 'copilot',
@@ -220,6 +264,21 @@ interface DiscoveredFragment {
   body: string;
 }
 
+/**
+ * #37 + C6 (#44): the resolution outcome for one fragment that becomes
+ * canonical — the candidates that contributed and which one (if any) was
+ * chosen. Drives the backup + removal split: provider-directory originals are
+ * removed (so the projected `hh.*` twin does not double-load), while a
+ * canonical-home (`.agents/instructions/`) source is overwritten in place and
+ * backed up only when a contradiction replaced its content (AD5/AD6).
+ */
+interface FragmentOutcome {
+  /** All candidate sources discovered for this fragment name. */
+  candidates: DiscoveredFragment[];
+  /** Source path of the chosen candidate, or null for an AI-merge (no single source). */
+  chosenSourcePath: string | null;
+}
+
 function byPath(a: { path: string }, b: { path: string }): number {
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
 }
@@ -240,20 +299,42 @@ function isHarnessOwnedFragmentPath(sourcePath: string): boolean {
 }
 
 /**
- * UN1 — already-canonical fast-fail trigger. The repo is "already onboarded"
- * when EITHER a `.agents/` directory exists (the canonical home), OR a root
- * `AGENTS.md` exists AND is itself a generated/projected file (carries a
- * SignedSource header — it was emitted by `apply`, not hand-authored). A
- * plain hand-written root `AGENTS.md` with NO `.agents/` is exactly the
- * drifted repo init is meant to onboard, so it does NOT trip UN1.
+ * C6 (#44): true when a fragment source IS the canonical home itself
+ * (`.agents/instructions/<name>.md`). Reachable only under `--adopt`. Such a
+ * source is overwritten in place by init's own canonical write, so — unlike a
+ * provider-directory original — it is NEVER removed (removing it would delete
+ * the file the write just (re)created) and is backed up only when a
+ * contradiction replaces its content (AD5/AD6).
  */
-function isAlreadyCanonical(snapshot: RepoSnapshot, reader: ProviderFileReader): boolean {
-  const hasAgentsDir = snapshot.files.some((file) => file.path.startsWith('.agents/'));
-  if (hasAgentsDir) {
+function isCanonicalFragmentHome(sourcePath: string): boolean {
+  return sourcePath.startsWith('.agents/instructions/');
+}
+
+/**
+ * UN1 (C6 #44, revised) — "tool-canonical": harness-haircut has ALREADY
+ * onboarded this repo, so `apply` (not `init`) is the right command. The
+ * unambiguous markers are tool-EMITTED artifacts: the state file every
+ * successful `apply` writes (`.agents/.harness-state.json`), or a root
+ * `AGENTS.md` carrying a SignedSource header (only `apply` emits one). A bare
+ * hand-built `.agents/` tree carries NEITHER — it is `hand-shaped`, handled by
+ * `--adopt`, not by this refusal.
+ */
+function isToolCanonical(snapshot: RepoSnapshot, reader: ProviderFileReader): boolean {
+  if (snapshot.files.some((file) => file.path === APPLY_STATE_PATH)) {
     return true;
   }
   const rootAgents = reader.read('AGENTS.md');
   return rootAgents !== null && detectHeaderPlacement(rootAgents) !== 'none';
+}
+
+/**
+ * C6 (#44) — "canonical-shaped": a `.agents/` tree exists. Combined with
+ * `isToolCanonical` returning false this is the HAND-BUILT case: a repo that
+ * adopted `.agents/skills/` / `.agents/instructions/` by hand. Default `init`
+ * refuses it toward `init --adopt` (AD2); `--adopt` proceeds (AD3).
+ */
+function hasCanonicalShape(snapshot: RepoSnapshot): boolean {
+  return snapshot.files.some((file) => file.path.startsWith('.agents/'));
 }
 
 /** Gathers candidate root-instruction texts from each existing provider file. */
@@ -452,8 +533,10 @@ export async function init(deps: InitDeps): Promise<InitReport> {
     .filter((config): config is NonNullable<typeof config> => config !== null)
     .map((config) => ({ providerId: config.providerId, paths: config.paths }));
 
-  // ---- step 2: UN1 already-canonical fast-fail ----
-  if (isAlreadyCanonical(snapshot, deps.reader)) {
+  // ---- step 2: UN1 (C6 #44) — tool-canonical refuses toward `apply` (AD1);
+  // a hand-built `.agents/` tree refuses toward `init --adopt` unless --adopt is
+  // set (AD2/AD3); a non-canonical repo passes both checks and onboards (AD8).
+  if (isToolCanonical(snapshot, deps.reader)) {
     return {
       exitCode: 1,
       refused: 'already-canonical',
@@ -462,9 +545,27 @@ export async function init(deps: InitDeps): Promise<InitReport> {
       contradictions: [],
       planned: [],
       notes: [
-        'this repo already has canonical artifacts (a .agents/ directory or a ' +
-          'generated root AGENTS.md). init onboards a non-canonical repo — run ' +
-          '`harness-haircut apply` to refresh projections instead.',
+        'this repo is already managed by harness-haircut (a .agents/.harness-state.json ' +
+          'state file, or a generated root AGENTS.md). init onboards a repo from scratch — ' +
+          'run `harness-haircut apply` to refresh projections instead.',
+      ],
+      backups: [],
+    };
+  }
+  if (hasCanonicalShape(snapshot) && !flags.adopt) {
+    return {
+      exitCode: 1,
+      refused: 'hand-canonical-needs-adopt',
+      dryRun: flags.dryRun,
+      detected,
+      contradictions: [],
+      planned: [],
+      notes: [
+        'this repo has a hand-built .agents/ layout but no harness-haircut state file. ' +
+          'Run `harness-haircut init --adopt` to adopt that tree as canonical and consolidate ' +
+          'the remaining provider files (claude-only skills, scoped instructions, the Copilot ' +
+          'file) into it. (`apply` only projects an already-canonical tree; it would not import ' +
+          'them.)',
       ],
       backups: [],
     };
@@ -680,10 +781,10 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- decide the canonical scoped fragments (F1) ----
   const plannedFragmentWrites: { path: string; content: string; origin: string }[] = [];
-  // #37: every source of a fragment that becomes canonical. Each is re-projected
-  // under the tool-owned `hh.*` name, so its ORIGINAL provider file is displaced
-  // (backed up + removed) below to avoid double-loading against the projection.
-  const displacedFragmentSourcesRaw: DiscoveredFragment[] = [];
+  // #37 + C6: the resolution outcome per fragment that becomes canonical, used
+  // below to back up + remove displaced provider originals (and, under --adopt,
+  // back up a replaced canonical-home source) without silent loss.
+  const fragmentOutcomes: FragmentOutcome[] = [];
   for (const [name, discoveredRaw] of [...fragmentsByName].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     // Sort identically to the contradiction's candidate order so a `choose`
     // index resolves to the same fragment the resolver was shown.
@@ -711,7 +812,7 @@ export async function init(deps: InitDeps): Promise<InitReport> {
           content: resolution.text,
           origin: `ai-merged (${discovered.map((f) => f.providerId).join(', ')})`,
         });
-        displacedFragmentSourcesRaw.push(...discovered);
+        fragmentOutcomes.push({ candidates: discovered, chosenSourcePath: null });
         continue;
       }
       chosen = resolution.kind === 'choose' ? discovered[resolution.index] ?? null : null;
@@ -725,8 +826,20 @@ export async function init(deps: InitDeps): Promise<InitReport> {
       content: fragmentCanonicalText(chosen),
       origin,
     });
-    displacedFragmentSourcesRaw.push(...discovered);
+    fragmentOutcomes.push({ candidates: discovered, chosenSourcePath: chosen.sourcePath });
   }
+
+  // C6 (#44): a malformed EXISTING canonical fragment (under .agents/instructions/
+  // but with no `scope:`, so skipped above as unparseable rather than treated as a
+  // candidate) that sits exactly where a recovered provider fragment will be
+  // written would be overwritten by that write. Track those paths so their
+  // verbatim original is backed up (no silent loss, PRD goal 3) and the
+  // "left in place" note stays honest.
+  const plannedFragmentWriteByPath = new Map(plannedFragmentWrites.map((w) => [w.path, w.content]));
+  const overwrittenUnparseable = unparseableFragments.filter(
+    (path) => path.startsWith('.agents/instructions/') && plannedFragmentWriteByPath.has(path),
+  );
+  const overwrittenUnparseableSet = new Set(overwrittenUnparseable);
 
   // ---- assemble the planned layout ----
   const planned: PlannedFile[] = [];
@@ -748,12 +861,25 @@ export async function init(deps: InitDeps): Promise<InitReport> {
   }
   // F1: a fragment we could not parse a scope from is never dropped silently —
   // it stays in place and we tell the user to give it canonical backing by hand.
-  if (unparseableFragments.length > 0) {
+  // (C6: exclude any overwritten below — they were NOT left in place.)
+  const leftInPlaceUnparseable = unparseableFragments.filter(
+    (path) => !overwrittenUnparseableSet.has(path),
+  );
+  if (leftInPlaceUnparseable.length > 0) {
     notes.push(
-      `could not recover ${unparseableFragments.length} scoped instruction file(s) ` +
-        `(${unparseableFragments.sort().join(', ')}) — no applyTo:/paths: frontmatter to derive a ` +
+      `could not recover ${leftInPlaceUnparseable.length} scoped instruction file(s) ` +
+        `(${leftInPlaceUnparseable.sort().join(', ')}) — no applyTo:/paths: frontmatter to derive a ` +
         'scope from. They were left in place; add `scope:` frontmatter under .agents/instructions/ ' +
         'by hand and re-run `harness-haircut apply` to bring them under canonical ownership.',
+    );
+  }
+  // C6 (#44): a malformed canonical fragment replaced in place by a recovered
+  // provider fragment of the same name — its original is backed up below.
+  if (overwrittenUnparseable.length > 0) {
+    notes.push(
+      `replaced ${overwrittenUnparseable.length} malformed canonical fragment(s) lacking a ` +
+        `scope: key (${overwrittenUnparseable.sort().join(', ')}) with a recovered provider ` +
+        'fragment of the same name; each original was backed up to the init backup dir.',
     );
   }
   // FIX 2(a): a discovered skill/fragment whose name is not a safe path segment
@@ -775,43 +901,98 @@ export async function init(deps: InitDeps): Promise<InitReport> {
     );
   }
 
-  // ---- F2 + #37: compute the backup plan ----
-  // Root/skill contradictions: back up each non-chosen candidate's recovered
-  // text. FRAGMENTS are handled separately below — a recovered fragment's
-  // ORIGINAL provider file is displaced wholesale (it would otherwise
-  // double-load against the projected hh.* twin), so it is backed up VERBATIM
-  // regardless of which candidate won; `planBackups` would instead store only
-  // the non-chosen side in its converted `scope:` form. So fragment slots are
-  // excluded from the generic plan and re-added here from the verbatim source.
+  // ---- F2 + #37 + C6: compute the fragment backup + removal plan ----
+  // Root/skill contradictions: `planBackups` stores each NON-chosen candidate's
+  // recovered text. FRAGMENTS are handled here from the VERBATIM source instead:
+  // a displaced provider original is preserved byte-for-byte (it would otherwise
+  // double-load against the projected hh.* twin), regardless of which candidate
+  // won — so fragment slots are excluded from the generic plan and re-added here.
   const aliasOf = deps.aliasOf ?? (() => null);
-  // A source already at the tool-owned hh.* path is overwritten in place by the
-  // projection (no separate twin), so it is left for apply to own. #35: a source
-  // reached through an in-repo symlink alias is left untouched (skip, not crash).
-  // Each provider file yields at most one fragment, so these are unique.
-  const displacedFragmentSources = displacedFragmentSourcesRaw.filter(
-    (f) => !isHarnessOwnedFragmentPath(f.sourcePath) && aliasOf(f.sourcePath) === null,
-  );
+  const fragmentBackups: { path: string; content: string }[] = [];
+  const fragmentRemovals: string[] = [];
+  // Canonical-home (.agents/instructions/) originals rewritten in place with a
+  // verbatim backup — surfaced in a note so the rewrite is never silent.
+  const canonicalRewrites: string[] = [];
+  // Each provider file yields at most one fragment, so a source path appears in
+  // at most one outcome — no dedup needed across outcomes.
+  for (const outcome of fragmentOutcomes) {
+    for (const source of outcome.candidates) {
+      const sp = source.sourcePath;
+      // #35: a source reached through an in-repo symlink alias is left untouched.
+      if (aliasOf(sp) !== null) {
+        continue;
+      }
+      // hh.* projected path: apply overwrites it in place; its content is derived
+      // (no unique user text), so it is neither backed up nor removed.
+      if (isHarnessOwnedFragmentPath(sp)) {
+        continue;
+      }
+      if (isCanonicalFragmentHome(sp)) {
+        // AD5: the canonical home is overwritten in place by init's own write,
+        // never removed. No silent loss: back up the verbatim original whenever
+        // that rewrite is NOT byte-identical to the original. This covers a
+        // contradiction resolved to another candidate / an AI-merge (AD6) AND a
+        // lossy NORMALIZATION — `fragmentCanonicalText` emits only `scope:`+body,
+        // so any extra frontmatter key (description/owner/…) or a reshaped scope
+        // is dropped from the rewrite and must be recoverable. A true round-trip
+        // (single-`scope:` fragment, no byte change) needs no backup.
+        const rewritten = plannedFragmentWriteByPath.get(sp);
+        if (rewritten === undefined || source.sourceContent !== rewritten) {
+          fragmentBackups.push({
+            path: `${INIT_BACKUP_DIR}/${sanitizeBackupName(sp)}`,
+            content: source.sourceContent,
+          });
+          canonicalRewrites.push(sp);
+        }
+        continue;
+      }
+      // A provider-directory original (#37): back it up verbatim AND remove it,
+      // so the projected hh.* twin becomes the only copy in that provider dir.
+      fragmentBackups.push({
+        path: `${INIT_BACKUP_DIR}/${sanitizeBackupName(sp)}`,
+        content: source.sourceContent,
+      });
+      fragmentRemovals.push(sp);
+    }
+  }
+  // C6 (#44): preserve the verbatim original of every malformed canonical
+  // fragment about to be overwritten by a same-named recovered provider fragment
+  // (it was not a candidate, so it would otherwise be lost silently). The write
+  // overwrites it in place — it is NOT removed.
+  for (const path of overwrittenUnparseable) {
+    const original = deps.reader.read(path);
+    if (original !== null) {
+      fragmentBackups.push({
+        path: `${INIT_BACKUP_DIR}/${sanitizeBackupName(path)}`,
+        content: original,
+      });
+    }
+  }
   const nonFragmentContradictions = contradictions.filter((c) => !c.slot.startsWith('fragment:'));
   const backupPlan = planBackups(nonFragmentContradictions, resolutionBySlot);
   for (const note of backupNotes(nonFragmentContradictions, resolutionBySlot)) {
     notes.push(note);
   }
-  for (const source of displacedFragmentSources) {
-    backupPlan.push({
-      path: `${INIT_BACKUP_DIR}/${sanitizeBackupName(source.sourcePath)}`,
-      content: source.sourceContent,
-    });
+  for (const backup of fragmentBackups) {
+    backupPlan.push(backup);
   }
   const backups = backupPlan.map((b) => b.path);
-  if (displacedFragmentSources.length > 0) {
-    const moves = displacedFragmentSources
-      .map((s) => `${s.sourcePath} -> ${INIT_BACKUP_DIR}/${sanitizeBackupName(s.sourcePath)}`)
+  if (fragmentRemovals.length > 0) {
+    const moves = fragmentRemovals
+      .map((sp) => `${sp} -> ${INIT_BACKUP_DIR}/${sanitizeBackupName(sp)}`)
       .sort()
       .join(', ');
     notes.push(
-      `consolidation recovers ${displacedFragmentSources.length} provider instruction file(s) into ` +
+      `consolidation recovers ${fragmentRemovals.length} provider instruction file(s) into ` +
         'canonical .agents/instructions/ and moves each original to the init backup dir, so the ' +
         `projected hh.* twin does not double-load (${moves}).`,
+    );
+  }
+  if (canonicalRewrites.length > 0) {
+    notes.push(
+      `adopt rewrote ${canonicalRewrites.length} existing canonical fragment(s) in place to the ` +
+        `canonical scope:+body shape (${canonicalRewrites.sort().join(', ')}); the verbatim ` +
+        'original of each was backed up to the init backup dir (no content lost).',
     );
   }
 
@@ -843,12 +1024,14 @@ export async function init(deps: InitDeps): Promise<InitReport> {
   for (const write of plannedSkillWrites) {
     deps.writer.write(write.path, write.content);
   }
-  // #37: remove each displaced fragment original (its content was backed up just
-  // above and now lives canonically). Done BEFORE the chained apply so the hh.*
-  // twin becomes the only copy of that fragment in the provider directory —
-  // otherwise the original and the projection both load (token bloat + drift).
-  for (const source of displacedFragmentSources) {
-    deps.writer.remove(source.sourcePath);
+  // #37: remove each displaced provider-directory original (its content was
+  // backed up just above and now lives canonically). Done BEFORE the chained
+  // apply so the hh.* twin becomes the only copy of that fragment in the provider
+  // directory — otherwise the original and the projection both load (token bloat
+  // + drift). Canonical-home sources are NOT here (AD5: overwritten in place by
+  // the writes above, never removed).
+  for (const sourcePath of fragmentRemovals) {
+    deps.writer.remove(sourcePath);
   }
 
   const applyReport = await deps.apply();

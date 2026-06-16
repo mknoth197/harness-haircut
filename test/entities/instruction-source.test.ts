@@ -12,6 +12,7 @@ import {
   recoverFromCopilotInstructions,
   recoverFragmentFromCopilot,
   recoverFragmentFromClaudeRule,
+  recoverFragmentFromCanonical,
   fragmentNameFromSource,
 } from '../../dist/index.js';
 
@@ -128,6 +129,49 @@ describe('recoverFragmentFromClaudeRule (F1: paths -> scope)', () => {
   it('returns null when there is no paths frontmatter', () => {
     assert.equal(recoverFragmentFromClaudeRule('# no frontmatter\nbody\n'), null);
     assert.equal(recoverFragmentFromClaudeRule('---\nname: x\n---\nbody\n'), null);
+  });
+});
+
+describe('recoverFragmentFromCanonical (C6 #44: scope -> scope)', () => {
+  it('parses a quoted scope and returns the body verbatim', () => {
+    const file = '---\nscope: "src/**"\n---\n# Security\n\nNo secrets.\n';
+    assert.deepEqual(recoverFragmentFromCanonical(file), {
+      scope: 'src/**',
+      body: '# Security\n\nNo secrets.\n',
+    });
+  });
+
+  it('round-trips a multi-glob comma-joined scope', () => {
+    const file = '---\nscope: "src/**,test/**"\n---\nbody\n';
+    assert.equal(recoverFragmentFromCanonical(file)?.scope, 'src/**,test/**');
+  });
+
+  it('accepts an unquoted scope scalar', () => {
+    const file = '---\nscope: src/**\n---\nbody\n';
+    assert.equal(recoverFragmentFromCanonical(file)?.scope, 'src/**');
+  });
+
+  it('normalizes a hand-written inline-array scope (not captured as a literal string)', () => {
+    const file = '---\nscope: ["src/**", "test/**"]\n---\nbody\n';
+    assert.equal(recoverFragmentFromCanonical(file)?.scope, 'src/**,test/**');
+  });
+
+  it('normalizes a hand-written block-sequence scope', () => {
+    const file = '---\nscope:\n  - src/**\n  - test/**\n---\nbody\n';
+    assert.equal(recoverFragmentFromCanonical(file)?.scope, 'src/**,test/**');
+  });
+
+  it('strips a SignedSource header after the frontmatter', () => {
+    const file =
+      '---\nscope: "src/**"\n---\n' +
+      '<!-- @generated SignedSource<<<aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbb>>> harness-haircut DO NOT EDIT -->\n' +
+      '# Rule\nbody\n';
+    assert.equal(recoverFragmentFromCanonical(file)?.body, '# Rule\nbody\n');
+  });
+
+  it('returns null when there is no scope frontmatter', () => {
+    assert.equal(recoverFragmentFromCanonical('# no frontmatter\nbody\n'), null);
+    assert.equal(recoverFragmentFromCanonical('---\nname: x\n---\nbody\n'), null);
   });
 });
 

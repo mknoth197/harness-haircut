@@ -469,7 +469,25 @@ describe('init E2E (spawn dist/bin.js)', () => {
     assert.match(auditRun.stdout, /clean/);
   });
 
-  it('init on an already-canonical repo fast-fails (exit 1), recommends apply', async () => {
+  it('init on a tool-managed repo (state file) fast-fails (exit 1), recommends apply (C6 AD1)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/.harness-state.json': '{\n  "version": 1,\n  "emitted": {}\n}\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'init', '--cwd', repo.root, '--non-interactive'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /apply/);
+    assert.doesNotMatch(r.stdout, /--adopt/);
+  });
+
+  it('init on a hand-built .agents/ repo fast-fails (exit 1), recommends init --adopt (C6 AD2)', async () => {
     const repo = await mkTempRepo({
       'AGENTS.md': '# Project standards\n\nUse npm test.\n',
       '.agents/skills/foo/SKILL.md':
@@ -482,7 +500,23 @@ describe('init E2E (spawn dist/bin.js)', () => {
       { encoding: 'utf8' },
     );
     assert.equal(r.status, 1);
-    assert.match(r.stdout, /apply/);
+    assert.match(r.stdout, /--adopt/);
+  });
+
+  it('init --adopt adopts a hand-built .agents/ repo (exit 0, C6 AD3)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'init', '--cwd', repo.root, '--adopt', '--non-interactive'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /projected/);
   });
 
   it('init --non-interactive exits 1 on a contradiction', async () => {

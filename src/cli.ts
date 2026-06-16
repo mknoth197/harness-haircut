@@ -165,6 +165,9 @@ function helpText(): string {
     'init options:',
     '  --dry-run           Print the planned canonical layout and exit without writing',
     '  --non-interactive   Never prompt; fail (exit 1) on any unresolved contradiction',
+    '  --adopt             Adopt an existing HAND-BUILT .agents/ tree as canonical and',
+    '                      consolidate the remaining provider files into it (does not',
+    '                      apply to a tool-managed repo — use `apply` for those)',
     '  --assist            Opt-in AI-assisted merge (discovers a credential source and',
     '                      proposes a semantic merge; every send is disclosed, every',
     '                      merge human-approved). Cannot combine with --non-interactive.',
@@ -1044,6 +1047,10 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const dryRun = parsed.flags['--dry-run'] === true;
   const nonInteractive = parsed.flags['--non-interactive'] === true;
   const assistRequested = parsed.flags['--assist'] === true;
+  // C6 (#44): adopt a hand-built `.agents/` tree as canonical (bypasses the
+  // hand-canonical refusal only — see init's UN1; a tool-canonical repo is still
+  // refused toward `apply`).
+  const adopt = parsed.flags['--adopt'] === true;
 
   // #39: ONE EOF-safe, line-buffered stdin prompt for the whole run (created
   // lazily on the first prompt, closed once in `finally`), shared by the
@@ -1124,7 +1131,7 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
           aliasOf: createSymlinkAliasProbe(cwd),
           flags: { allowDirty: true, dryRun, nonInteractive: true },
         }),
-      flags: { dryRun, nonInteractive },
+      flags: { dryRun, nonInteractive, adopt },
     });
   } catch (err) {
     if (err instanceof DomainError) {
@@ -1148,7 +1155,16 @@ function renderInitReport(report: InitReport): string {
   const lines: string[] = [];
 
   if (report.refused === 'already-canonical') {
-    lines.push('refused — this repo is already canonical (run `harness-haircut apply` instead).');
+    lines.push('refused — this repo is already managed by harness-haircut (run `harness-haircut apply` instead).');
+    for (const note of report.notes) {
+      lines.push(`  ${note}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  if (report.refused === 'hand-canonical-needs-adopt') {
+    lines.push('refused — this repo has a hand-built .agents/ layout (run `harness-haircut init --adopt` to adopt it).');
     for (const note of report.notes) {
       lines.push(`  ${note}`);
     }
