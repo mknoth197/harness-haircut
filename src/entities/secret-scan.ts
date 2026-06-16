@@ -29,8 +29,14 @@
  *     char slip past entirely. The OpenAI `sk-` prefix is the one ambiguous
  *     short prefix (it occurs inside ordinary words like `task-…`), so that
  *     rule additionally requires the matched body to clear the entropy floor.
- *   - A format/zero-width pre-pass (`\p{Cf}` stripped, offsets mapped back)
- *     stops an invisible char from splitting a token mid-prefix.
+ *   - A normalization pre-pass runs before matching, with offsets mapped back
+ *     so findings stay byte-exact against the ORIGINAL content. It (a) strips
+ *     invisible splitters (`\p{Cf}` zero-width, `\p{M}` marks, controls) so
+ *     they cannot break a token mid-prefix, and (b) folds lookalike letters to
+ *     their ASCII skeleton — NFKC for compatibility confusables (fullwidth
+ *     `Ａ`, mathematical `𝐀`) plus a curated cross-script map for the
+ *     Cyrillic/Greek homoglyphs (`А`→`A`, `І`→`I`) that NFKC leaves untouched —
+ *     so a credential a human reads as `AKIA…` is matched as `AKIA…`.
  *   - Keyword adjacency spans the candidate's line PLUS the preceding line,
  *     with all line-ending styles (LF/CRLF/CR) normalized, so a secret
  *     documented on the line under its keyword (or in a CRLF file) is caught.
@@ -320,27 +326,101 @@ function isStrippable(ch: string): boolean {
 }
 
 /**
- * Strips the invisibles `isStrippable` flags from a working copy of the
- * content before scanning, so a token split by any of them is rejoined and
- * still matched. Returns the cleaned string and a map from each cleaned-string
- * index to its index in the ORIGINAL content, so findings are reported (and
- * redacted) against the original bytes.
+ * Cross-script homoglyph fold — a focused Unicode-confusables "skeleton".
+ *
+ * NFKC (applied alongside this map in `normalizeForScan`) folds the
+ * COMPATIBILITY lookalikes — fullwidth `Ａ` (U+FF21), mathematical `𝐀`
+ * (U+1D400), Roman-numeral `Ⅰ`, circled forms — down to ASCII. But NFKC
+ * deliberately leaves CROSS-SCRIPT confusables untouched: Cyrillic `А`
+ * (U+0410) and Greek `Α` (U+0391) are distinct letters, not
+ * compatibility-equivalent to Latin `A`, so they normalize to themselves. An
+ * attacker exploits exactly that gap — swap one homoglyph into a credential
+ * (`АKIA…`, which a human still reads as `AKIA…`) and the ASCII shape rules
+ * never fire. This table maps each high-confidence confusable to its ASCII
+ * skeleton so the shape/entropy rules see the credential a human sees.
+ *
+ * Keyed by CODE POINT (built via `String.fromCodePoint`) so no homoglyph
+ * literal lives in this source file. The set is curated, not exhaustive: it
+ * covers the Cyrillic/Greek letters that look like ASCII `A`–`Z`/`a`–`z`. A
+ * confusable outside this set still evades — that residual is the fail-closed
+ * limit of a regex scanner — but folding only ever turns a non-ASCII letter
+ * INTO an ASCII one, so the worst case is an over-match (block), never a
+ * hidden secret.
  */
-function stripFormatChars(content: string): { cleaned: string; map: number[] } {
+const CONFUSABLE_TO_ASCII: ReadonlyArray<readonly [number, string]> = [
+  // Cyrillic capitals → Latin capitals
+  [0x0410, 'A'], [0x0412, 'B'], [0x0415, 'E'], [0x041a, 'K'], [0x041c, 'M'],
+  [0x041d, 'H'], [0x041e, 'O'], [0x0420, 'P'], [0x0421, 'C'], [0x0422, 'T'],
+  [0x0423, 'Y'], [0x0425, 'X'], [0x0405, 'S'], [0x0406, 'I'], [0x0408, 'J'],
+  [0x04c0, 'I'], [0x051a, 'Q'], [0x051c, 'W'],
+  // Cyrillic smalls → Latin smalls
+  [0x0430, 'a'], [0x0435, 'e'], [0x043e, 'o'], [0x0440, 'p'], [0x0441, 'c'],
+  [0x0443, 'y'], [0x0445, 'x'], [0x0455, 's'], [0x0456, 'i'], [0x0458, 'j'],
+  [0x0501, 'd'],
+  // Greek capitals → Latin capitals
+  [0x0391, 'A'], [0x0392, 'B'], [0x0395, 'E'], [0x0396, 'Z'], [0x0397, 'H'],
+  [0x0399, 'I'], [0x039a, 'K'], [0x039c, 'M'], [0x039d, 'N'], [0x039f, 'O'],
+  [0x03a1, 'P'], [0x03a4, 'T'], [0x03a5, 'Y'], [0x03a7, 'X'], [0x03f9, 'C'],
+  // Greek smalls → Latin smalls
+  [0x03bf, 'o'], [0x03c1, 'p'],
+  // Other Latin lookalikes NFKC keeps as-is
+  [0x0131, 'i'], // dotless i
+];
+
+const CONFUSABLES: ReadonlyMap<string, string> = new Map(
+  CONFUSABLE_TO_ASCII.map(([cp, ascii]) => [String.fromCodePoint(cp), ascii]),
+);
+
+/** Maps each code point of `s` through the confusables table (ASCII chars pass through). */
+function foldConfusables(s: string): string {
+  let out = '';
+  for (const ch of s) {
+    out += CONFUSABLES.get(ch) ?? ch;
+  }
+  return out;
+}
+
+/**
+ * Builds the working copy the rules actually match against: invisible
+ * splitters (`isStrippable`) removed, then every surviving char NFKC-folded
+ * and run through `foldConfusables`, so split tokens rejoin and lookalike
+ * letters collapse to their ASCII skeleton. Returns the cleaned string plus,
+ * for every cleaned UTF-16 unit, the ORIGINAL `[start, end)` span of the
+ * source code point it came from — so findings (and `redactFindings`) report
+ * against the original bytes even when a char was stripped, NFKC-expanded into
+ * several chars, or folded. A match landing anywhere inside a folded form maps
+ * back to the WHOLE original code point, so redaction always removes it.
+ * Mark-stripping is re-applied to the NFKC output because a compatibility
+ * decomposition can itself surface a combining mark.
+ */
+function normalizeForScan(content: string): {
+  cleaned: string;
+  mapStart: number[];
+  mapEnd: number[];
+} {
   let cleaned = '';
-  const map: number[] = [];
-  // Iterate by code point so astral chars are not split.
+  const mapStart: number[] = [];
+  const mapEnd: number[] = [];
   let i = 0;
+  // Iterate by code point so astral chars are not split.
   for (const ch of content) {
+    const next = i + ch.length;
     if (!isStrippable(ch)) {
-      cleaned += ch;
-      for (let k = 0; k < ch.length; k++) {
-        map.push(i + k);
+      const folded = foldConfusables(ch.normalize('NFKC'));
+      for (const fch of folded) {
+        if (isStrippable(fch)) {
+          continue; // NFKC may have surfaced a combining mark — drop it too.
+        }
+        cleaned += fch;
+        for (let k = 0; k < fch.length; k++) {
+          mapStart.push(i);
+          mapEnd.push(next);
+        }
       }
     }
-    i += ch.length;
+    i = next;
   }
-  return { cleaned, map };
+  return { cleaned, mapStart, mapEnd };
 }
 
 /**
@@ -361,14 +441,15 @@ export function scanForSecrets(
   const rules = [...BUILTIN_SECRET_RULES, ...(options?.extraRules ?? [])].filter(
     (rule) => !suppress.has(rule.id),
   );
-  // Scan a format-char-stripped copy so invisible chars cannot split tokens;
-  // map every reported offset back to the original content for exact redaction.
-  const { cleaned, map } = stripFormatChars(content);
+  // Scan a normalized copy (invisibles stripped, lookalikes folded to ASCII) so
+  // neither an invisible splitter nor a homoglyph can hide a token; map every
+  // reported offset back to the original content for exact redaction.
+  const { cleaned, mapStart, mapEnd } = normalizeForScan(content);
   const toOriginalStart = (cleanIndex: number): number =>
-    cleanIndex < map.length ? map[cleanIndex]! : content.length;
+    cleanIndex < mapStart.length ? mapStart[cleanIndex]! : content.length;
   const toOriginalEnd = (cleanEndExclusive: number): number =>
-    cleanEndExclusive > 0 && cleanEndExclusive - 1 < map.length
-      ? map[cleanEndExclusive - 1]! + 1
+    cleanEndExclusive > 0 && cleanEndExclusive - 1 < mapEnd.length
+      ? mapEnd[cleanEndExclusive - 1]!
       : content.length;
 
   const findings: SecretFinding[] = [];
