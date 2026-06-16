@@ -443,6 +443,7 @@ describe('apply() — UN3 two overwrite emits target the same path', () => {
         wrote = true;
         writer.write(p, c);
       },
+      remove: writer.remove,
     };
     const collidingAdapter = {
       id: 'codex' as ProviderId,

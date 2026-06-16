@@ -282,6 +282,21 @@ export function createFileWriter(root: string): FileWriter {
         throw new FileSystemError(abs, err);
       }
     },
+    remove(relPath: string): void {
+      // SECURITY: the same two-step containment `write` uses — lexical escape
+      // rejected first, then the deepest existing ancestor must realpath inside
+      // realRoot — so an `rm` can never follow a symlinked parent out of the
+      // repo and delete an external file. `rmSync` on a symlinked leaf removes
+      // the LINK (never its target); `force` makes a missing file a no-op so
+      // callers need not pre-check existence.
+      const abs = assertContained(realRoot, relPath);
+      assertParentContained(realRoot, abs);
+      try {
+        rmSync(abs, { force: true });
+      } catch (err) {
+        throw new FileSystemError(abs, err);
+      }
+    },
   };
 }
 
