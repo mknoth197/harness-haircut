@@ -465,3 +465,64 @@ describe('scanForSecrets() — high-entropy rule no longer false-blocks URLs/pat
     assert.equal(ruleIdsIn(`secret = ${HIGH_ENTROPY}Qx7Zt2\n`).includes('high-entropy-string'), true);
   });
 });
+
+describe('scanForSecrets() — homoglyph-substituted credentials cannot evade the shape rules', () => {
+  // A human reads `АKIA…` (Cyrillic А) as the AWS prefix `AKIA…`, but the
+  // ASCII shape rule never fired before the normalization pass folded the
+  // lookalike to its skeleton. Each variant swaps ONE glyph of `AKIA` for a
+  // confusable from a different family and must still flag aws-access-key-id.
+  const akiaTail = 'B'.repeat(16);
+  const aLookalikes: ReadonlyArray<{ label: string; cp: number }> = [
+    { label: 'Cyrillic capital A U+0410', cp: 0x0410 },
+    { label: 'Greek capital Alpha U+0391', cp: 0x0391 },
+    { label: 'fullwidth A U+FF21 (folded by NFKC)', cp: 0xff21 },
+    { label: 'mathematical bold A U+1D400 (folded by NFKC)', cp: 0x1d400 },
+  ];
+  for (const { label, cp } of aLookalikes) {
+    it(`flags AKIA with its leading A as ${label}`, () => {
+      const sample = String.fromCodePoint(cp) + 'KIA' + akiaTail;
+      assert.equal(ruleIdsIn(`notes ${sample} end\n`).includes('aws-access-key-id'), true);
+    });
+  }
+
+  it('flags AKIA with a Cyrillic capital I U+0406 substituted for the I', () => {
+    const sample = 'AK' + String.fromCodePoint(0x0406) + 'A' + akiaTail;
+    assert.equal(ruleIdsIn(`notes ${sample} end\n`).includes('aws-access-key-id'), true);
+  });
+
+  it('flags a github token whose ghp_ prefix hides a Cyrillic small p U+0440', () => {
+    const token = 'gh' + String.fromCodePoint(0x0440) + '_' + 'a'.repeat(36);
+    assert.equal(ruleIdsIn(`auth ${token} end\n`).includes('github-token'), true);
+  });
+
+  it('does not turn ordinary Cyrillic prose on a keyword line into a finding', () => {
+    // `пароль` folds to a short, low-entropy run — far from a credential shape —
+    // so the fold must not manufacture a secret out of legitimate prose.
+    const cyrillicWord = String.fromCodePoint(0x043f, 0x0430, 0x0440, 0x043e, 0x043b, 0x044c);
+    assert.deepEqual(ruleIdsIn(`password note: ${cyrillicWord}\n`), []);
+  });
+
+  it('keeps offsets byte-exact and redacts the whole secret when it contains a homoglyph', () => {
+    // The matched span must cover the ORIGINAL (homoglyph-bearing) bytes, not
+    // the folded view, so redaction removes the entire secret — the Cyrillic
+    // char included — leaving no recoverable fragment.
+    const cyrA = String.fromCodePoint(0x0410);
+    const token = cyrA + 'KIA' + 'B'.repeat(16);
+    const content = `id ${token} end\n`;
+    const findings = scanForSecrets('AGENTS.md', content);
+    assert.deepEqual(
+      findings.map((f) => f.ruleId),
+      ['aws-access-key-id'],
+    );
+    const finding = findings[0]!;
+    assert.equal(finding.start, content.indexOf(cyrA));
+    assert.equal(finding.end, finding.start + token.length);
+    assert.equal(content.slice(finding.start, finding.end), token);
+    // The masked excerpt shows the ASCII skeleton, never echoing the homoglyph.
+    assert.equal(finding.excerpt, 'AKIA…');
+    const redacted = redactFindings(content, findings);
+    assert.equal(redacted, 'id [REDACTED:aws-access-key-id] end\n');
+    assert.equal(redacted.includes(cyrA), false);
+    assert.equal(redacted.includes('BBBB'), false);
+  });
+});
