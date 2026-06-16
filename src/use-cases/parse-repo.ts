@@ -26,6 +26,14 @@ interface Frontmatter {
   data: Record<string, FrontmatterValue>;
   /** Content after the closing delimiter (the whole file when absent). */
   body: string;
+  /**
+   * Verbatim frontmatter interior — the lines BETWEEN the `---` fences, joined
+   * with `\n` (empty when no frontmatter is present). Lets a caller reproduce
+   * the block faithfully rather than re-serializing the parsed `data` (which
+   * would normalize quoting/order). The Claude skill projection relies on this
+   * to carry provider-specific keys through verbatim (#38).
+   */
+  raw: string;
 }
 
 /*
@@ -50,7 +58,7 @@ interface Frontmatter {
 function parseFrontmatter(content: string, filePath: string): Frontmatter {
   const lines = content.split('\n');
   if ((lines[0] ?? '').trimEnd() !== '---') {
-    return { present: false, data: emptyData(), body: content };
+    return { present: false, data: emptyData(), body: content, raw: '' };
   }
   let end = -1;
   for (let i = 1; i < lines.length; i++) {
@@ -123,7 +131,12 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
       data[key] = unquote(rest);
     }
   }
-  return { present: true, data, body: lines.slice(end + 1).join('\n') };
+  return {
+    present: true,
+    data,
+    body: lines.slice(end + 1).join('\n'),
+    raw: lines.slice(1, end).join('\n'),
+  };
 }
 
 /** Prototype-pollution insurance: frontmatter keys land on a null-prototype record. */
@@ -377,6 +390,10 @@ function assembleSkill(
   skills.push({
     name,
     description,
+    // #38: carry the verbatim frontmatter so the Claude projection reproduces
+    // every key (incl. provider-specific `allowed-tools`/`argument-hint`),
+    // never silently dropping a tool restriction.
+    frontmatter: fm.raw,
     path: entry.path,
     body: fm.body,
     files: folderFiles

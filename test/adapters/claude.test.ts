@@ -215,7 +215,7 @@ describe('claudeAdapter — scoped fragments → .claude/rules (EV2/OPT1)', () =
 });
 
 describe('claudeAdapter — skills → .claude/skills (EV4)', () => {
-  it('emits SKILL.md restricted to common-core frontmatter with the header after the frontmatter', () => {
+  it('emits SKILL.md with the canonical frontmatter and the header after the frontmatter', () => {
     const projection = claudeAdapter.project(ir({ skills: [skill('deploy')] }), ctxWith());
     const file = fileAt(projection.files, '.claude/skills/deploy/SKILL.md');
     const lines = (file?.body ?? '').split('\n');
@@ -226,6 +226,25 @@ describe('claudeAdapter — skills → .claude/skills (EV4)', () => {
     assert.match(lines[4] ?? '', HEADER_RE);
     assert.equal(lines.slice(5).join('\n'), '# deploy\n\nDo the thing.\n');
     assert.equal(projection.surfaces.skills, 'emitted');
+  });
+
+  it('preserves provider-specific frontmatter keys verbatim (#38: allowed-tools, argument-hint, trigger)', () => {
+    // Dropping these silently loosened the skill's tool restrictions; the Claude
+    // projection must carry every canonical key through, not just name/description.
+    const extras = ['allowed-tools: "Read, Edit"', 'argument-hint: "<path>"', 'trigger: /deploy'];
+    const projection = claudeAdapter.project(
+      ir({ skills: [skill('deploy', [], '', extras)] }),
+      ctxWith(),
+    );
+    const file = fileAt(projection.files, '.claude/skills/deploy/SKILL.md');
+    const body = file?.body ?? '';
+    // The frontmatter block (before the after-frontmatter header) holds them all.
+    const fence = body.indexOf('\n---\n');
+    const frontmatter = body.slice(0, fence);
+    assert.match(frontmatter, /^name: deploy$/m);
+    assert.match(frontmatter, /^allowed-tools: "Read, Edit"$/m);
+    assert.match(frontmatter, /^argument-hint: "<path>"$/m);
+    assert.match(frontmatter, /^trigger: \/deploy$/m);
   });
 
   it('copies sibling attachments verbatim (no header — a header would corrupt scripts/assets)', () => {
@@ -392,6 +411,30 @@ describe('claudeAdapter — fixture round-trip (rules and skills)', () => {
 
       const attachment = fileAt(projection.files, '.claude/skills/deploy/scripts/run.sh');
       assert.equal(attachment?.body, '#!/usr/bin/env bash\necho ship\n');
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('carries provider-specific skill frontmatter keys through parse→project (#38)', async () => {
+    // The dogfood repro: a canonical skill with allowed-tools/argument-hint/trigger
+    // must reach .claude/skills/<name>/SKILL.md intact — dropping allowed-tools
+    // would silently loosen the skill's tool restrictions.
+    const skillBody = '# Graphify\n\nDo the graph.\n';
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# T\n\nHi.\n',
+      '.agents/skills/graphify/SKILL.md':
+        `---\nname: graphify\ndescription: "to a knowledge graph"\nallowed-tools: "read_file, edit_file"\nargument-hint: "<input>"\ntrigger: /graphify\n---\n${skillBody}`,
+    });
+    try {
+      const { ir: parsed } = await parseRepo({ readRepo: () => readRepoSnapshot(repo.root) });
+      const projection = claudeAdapter.project(parsed, { cwd: repo.root });
+      const skillMd = fileAt(projection.files, '.claude/skills/graphify/SKILL.md');
+      const fence = (skillMd?.body ?? '').indexOf('\n---\n');
+      const frontmatter = (skillMd?.body ?? '').slice(0, fence);
+      assert.match(frontmatter, /^allowed-tools: "read_file, edit_file"$/m);
+      assert.match(frontmatter, /^argument-hint: "<input>"$/m);
+      assert.match(frontmatter, /^trigger: \/graphify$/m);
     } finally {
       await repo.cleanup();
     }
