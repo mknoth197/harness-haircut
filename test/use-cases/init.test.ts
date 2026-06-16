@@ -14,7 +14,9 @@
  *   EV3  — the resolver's choice is recorded and written.
  *   OPT1 — --non-interactive fails (exit 1) on any contradiction, writes none.
  *   OPT2 — --dry-run reports the planned layout, writes nothing, no apply.
- *   UN1  — already-canonical (.agents/ exists) fast-fails, writes nothing.
+ *   UN1  — tool-canonical (state file / generated AGENTS.md) fast-fails toward
+ *          `apply`; a hand-built .agents/ fast-fails toward `init --adopt` (C6 #44).
+ *   AD1-AD8 — `init --adopt` adopts a hand-built canonical repo (C6 #44).
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,6 +63,8 @@ async function setup(files: Record<string, string>): Promise<TempRepo> {
 interface RunInitOptions {
   dryRun?: boolean;
   nonInteractive?: boolean;
+  /** C6 (#44): adopt a hand-built `.agents/` tree as canonical. */
+  adopt?: boolean;
   /** Scripted resolutions per contradiction slot; default is "skip". */
   resolve?: Record<string, Resolution>;
   /** Records every slot the resolver was asked about. */
@@ -99,7 +103,11 @@ function runInit(root: string, options: RunInitOptions = {}): Promise<InitReport
         flags: { allowDirty: true, dryRun: options.dryRun ?? false, nonInteractive: true },
       }),
     aliasOf: createSymlinkAliasProbe(root),
-    flags: { dryRun: options.dryRun ?? false, nonInteractive: options.nonInteractive ?? false },
+    flags: {
+      dryRun: options.dryRun ?? false,
+      nonInteractive: options.nonInteractive ?? false,
+      adopt: options.adopt ?? false,
+    },
   });
 }
 
@@ -237,8 +245,8 @@ describe('init() — OPT2 --dry-run', () => {
   });
 });
 
-describe('init() — UN1 already-canonical fast-fail', () => {
-  it('fails (exit 1) and writes nothing when .agents/ exists', async () => {
+describe('init() — UN1 tool-canonical vs hand-built distinction (C6 #44)', () => {
+  it('AD2: a hand-built .agents/ (no state file) without --adopt refuses toward init --adopt, writes nothing', async () => {
     const repo = await setup({
       'AGENTS.md': '# Project\n',
       '.agents/skills/foo/SKILL.md':
@@ -247,14 +255,14 @@ describe('init() — UN1 already-canonical fast-fail', () => {
     });
     const report = await runInit(repo.root);
     assert.equal(report.exitCode, 1);
-    assert.equal(report.refused, 'already-canonical');
+    assert.equal(report.refused, 'hand-canonical-needs-adopt');
     assert.equal(report.planned.length, 0);
     // Nothing new written: no apply, no provider files.
     assert.equal(report.apply, undefined);
     assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
   });
 
-  it('fails when root AGENTS.md is itself a generated/projected file', async () => {
+  it('AD1: a SignedSource root AGENTS.md is tool-canonical → already-canonical (recommend apply)', async () => {
     const repo = await setup({
       'AGENTS.md':
         '<!-- @generated SignedSource<<<aaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbb>>> harness-haircut DO NOT EDIT -->\n' +
@@ -263,6 +271,20 @@ describe('init() — UN1 already-canonical fast-fail', () => {
     const report = await runInit(repo.root);
     assert.equal(report.exitCode, 1);
     assert.equal(report.refused, 'already-canonical');
+  });
+
+  it('AD1: a .agents/.harness-state.json marks the repo tool-canonical, even with --adopt', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project\n',
+      '.agents/.harness-state.json': '{\n  "version": 1,\n  "emitted": {}\n}\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n',
+    });
+    const report = await runInit(repo.root, { adopt: true });
+    assert.equal(report.exitCode, 1);
+    assert.equal(report.refused, 'already-canonical');
+    assert.equal(report.planned.length, 0);
+    assert.equal(report.apply, undefined);
   });
 });
 
@@ -679,5 +701,213 @@ describe('init() — #35 symlinked canonical home', () => {
     assert.equal(existsSync(join(repo.root, 'AGENTS.md')), false);
     assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
     assert.equal(existsSync(join(repo.root, 'cfg-agents', '.harness-state.json')), false);
+  });
+});
+
+describe('init() — --adopt hand-built canonical (C6 #44)', () => {
+  it('AD3: adopts a hand-built repo end-to-end — imports a claude-only skill + a Copilot fragment, audit exits 0', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n',
+      // claude-only skill — not yet under canonical .agents/skills/.
+      '.claude/skills/bar/SKILL.md':
+        '---\nname: bar\ndescription: Use when barring\n---\n# Bar\n',
+      // a scoped Copilot fragment to import into canonical.
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    const report = await runInit(repo.root, { adopt: true });
+    assert.equal(report.exitCode, 0);
+    assert.notEqual(report.refused, 'hand-canonical-needs-adopt');
+    // The hand-built canonical skill is retained, and the claude-only skill is
+    // imported into canonical .agents/skills/.
+    assert.equal(existsSync(join(repo.root, '.agents', 'skills', 'foo', 'SKILL.md')), true);
+    assert.equal(existsSync(join(repo.root, '.agents', 'skills', 'bar', 'SKILL.md')), true);
+    // The Copilot fragment is consolidated into canonical .agents/instructions/.
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'security.md')), true);
+    // The full loop is clean (gemini excluded — it cannot path-scope fragments,
+    // HH-W007 → exit 2, orthogonal to adoption).
+    const auditReport = await runAudit(repo.root, ['gemini']);
+    assert.equal(auditReport.exitCode, 0);
+  });
+
+  it('AD8: --adopt on a NON-canonical repo behaves exactly like plain init', async () => {
+    const body = '@AGENTS.md\n\n# Project standards\n\nUse npm test.\n';
+    const repo = await setup({ 'CLAUDE.md': body, 'GEMINI.md': body });
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, { adopt: true, resolverCalls });
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.refused, undefined);
+    assert.deepEqual(report.contradictions, []);
+    assert.deepEqual(resolverCalls, []);
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), true);
+    assert.ok(report.apply !== undefined && report.apply.written.length > 0);
+  });
+
+  it('AD4 + AD5: an existing canonical fragment that AGREES with a provider twin collapses (EV1), no clobber, no needless backup', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      '.agents/instructions/security.md':
+        '---\nscope: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+      // a same-named Copilot fragment with byte-identical (normalized) scope+body.
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, { adopt: true, resolverCalls });
+    assert.equal(report.exitCode, 0);
+    // EV1: agreement → no fragment:security contradiction, resolver never asked.
+    assert.ok(!resolverCalls.includes('fragment:security'));
+    assert.ok(!report.contradictions.some((c) => c.slot === 'fragment:security'));
+    // AD5: the canonical fragment is kept in place (never removed).
+    assert.equal(existsSync(join(repo.root, '.agents', 'instructions', 'security.md')), true);
+    // AD6: agreement → the canonical original is NOT backed up (it was chosen).
+    assert.ok(
+      !report.backups.includes('.harness-haircut-init-backup/.agents__instructions__security.md'),
+    );
+    // The provider original IS displaced (removed + backed up); only the hh.* twin remains.
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'security.instructions.md')),
+      false,
+    );
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'hh.security.instructions.md')),
+      true,
+    );
+    assert.ok(
+      report.backups.includes(
+        '.harness-haircut-init-backup/.github__instructions__security.instructions.md',
+      ),
+    );
+  });
+
+  it('AD4 + AD6: a canonical fragment that DISAGREES surfaces a contradiction; choosing the provider backs up the canonical original verbatim', async () => {
+    const canonical = '---\nscope: "src/**"\n---\n# Security\n\nOld canonical rule.\n';
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      '.agents/instructions/security.md': canonical,
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNew provider rule.\n',
+    });
+    const resolverCalls: string[] = [];
+    // Candidates sort by providerId: [codex (canonical), copilot]; index 1 = copilot.
+    const report = await runInit(repo.root, {
+      adopt: true,
+      resolverCalls,
+      resolve: { 'fragment:security': { kind: 'choose', index: 1 } },
+    });
+    assert.equal(report.exitCode, 0);
+    assert.ok(resolverCalls.includes('fragment:security'));
+    // The provider candidate won — canonical now carries the provider's body.
+    const written = await readFile(join(repo.root, '.agents', 'instructions', 'security.md'), 'utf8');
+    assert.match(written, /New provider rule\./);
+    // AD6: the replaced canonical original is preserved VERBATIM in the backup dir.
+    const canonicalBackup = '.harness-haircut-init-backup/.agents__instructions__security.md';
+    assert.ok(report.backups.includes(canonicalBackup));
+    const backedUp = await readFile(join(repo.root, canonicalBackup), 'utf8');
+    assert.equal(backedUp, canonical);
+    // The provider original is also displaced (removed + backed up).
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'security.instructions.md')),
+      false,
+    );
+  });
+
+  it('AD7: --adopt --dry-run previews the plan but writes/removes/backs-up nothing', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n',
+      '.github/instructions/security.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Security\n\nNever log secrets.\n',
+    });
+    const report = await runInit(repo.root, { adopt: true, dryRun: true });
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.dryRun, true);
+    assert.ok(report.planned.length > 0);
+    // Nothing mutated: no apply, no backups, provider original untouched, no twin.
+    assert.equal(report.apply, undefined);
+    assert.deepEqual(report.backups, []);
+    assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'security.instructions.md')),
+      true,
+    );
+    assert.equal(
+      existsSync(join(repo.root, '.github', 'instructions', 'hh.security.instructions.md')),
+      false,
+    );
+  });
+
+  it('no silent loss: a malformed canonical fragment (no scope:) overwritten by a provider twin is backed up verbatim', async () => {
+    const malformed = '# Foo\n\nMalformed canonical — no scope key.\n';
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      // Lacks a `scope:` key → skipped as unparseable, NOT a candidate.
+      '.agents/instructions/foo.md': malformed,
+      // A valid same-named provider fragment recovers to .agents/instructions/foo.md.
+      '.github/instructions/foo.instructions.md':
+        '---\napplyTo: "src/**"\n---\n# Foo\n\nProvider body wins.\n',
+    });
+    const report = await runInit(repo.root, { adopt: true });
+    assert.equal(report.exitCode, 0);
+    // The provider fragment overwrote the malformed canonical file in place.
+    const written = await readFile(join(repo.root, '.agents', 'instructions', 'foo.md'), 'utf8');
+    assert.match(written, /Provider body wins\./);
+    // The malformed original is preserved VERBATIM (never silent loss).
+    const backupRel = '.harness-haircut-init-backup/.agents__instructions__foo.md';
+    assert.ok(report.backups.includes(backupRel));
+    assert.equal(await readFile(join(repo.root, backupRel), 'utf8'), malformed);
+    // Honest notes: a "replaced ... malformed" note, and NOT a "left in place" one.
+    assert.ok(report.notes.some((n) => /replaced .*malformed canonical fragment/i.test(n)));
+    assert.ok(!report.notes.some((n) => /left in place/i.test(n) && /foo/.test(n)));
+  });
+
+  it('no silent loss: a canonical fragment with extra frontmatter keys is backed up verbatim before its in-place rewrite', async () => {
+    // `fragmentCanonicalText` emits only scope:+body, so the in-place rewrite
+    // drops description/owner — the verbatim original must be recoverable.
+    const richCanonical =
+      '---\nscope: "src/**"\ndescription: Hand-written security policy\nowner: platform-team\n---\n# Security\n\nNever log secrets.\n';
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      '.agents/instructions/security.md': richCanonical,
+    });
+    const report = await runInit(repo.root, { adopt: true });
+    assert.equal(report.exitCode, 0);
+    // The canonical file is normalized to scope:+body (extra keys dropped) ...
+    const written = await readFile(join(repo.root, '.agents', 'instructions', 'security.md'), 'utf8');
+    assert.doesNotMatch(written, /owner: platform-team/);
+    // ... but the verbatim original (with the extra keys) is preserved + reported.
+    const backupRel = '.harness-haircut-init-backup/.agents__instructions__security.md';
+    assert.ok(report.backups.includes(backupRel));
+    assert.equal(await readFile(join(repo.root, backupRel), 'utf8'), richCanonical);
+    assert.ok(report.notes.some((n) => /rewrote .*canonical fragment/i.test(n)));
+  });
+
+  it('no scope broadening: a hand-written array-form scope is normalized, not captured as a literal that matches every file', async () => {
+    const arrayCanonical = '---\nscope: ["src/**", "test/**"]\n---\n# Scoped\n\nRule body.\n';
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm.\n',
+      '.agents/instructions/scoped.md': arrayCanonical,
+    });
+    const report = await runInit(repo.root, { adopt: true });
+    assert.equal(report.exitCode, 0);
+    // The scope is normalized to a comma-joined string, NOT the literal array
+    // (which would downgrade to "**" — loading the rule for every file).
+    const written = await readFile(join(repo.root, '.agents', 'instructions', 'scoped.md'), 'utf8');
+    assert.match(written, /scope: "src\/\*\*,test\/\*\*"/);
+    // Verbatim original preserved.
+    assert.equal(
+      await readFile(
+        join(repo.root, '.harness-haircut-init-backup/.agents__instructions__scoped.md'),
+        'utf8',
+      ),
+      arrayCanonical,
+    );
+    // No HH-W001 scope broadening: a follow-up audit is clean (gemini excluded —
+    // HH-W007 is inherent to scoped fragments, orthogonal to this fix).
+    const auditReport = await runAudit(repo.root, ['gemini']);
+    assert.equal(auditReport.exitCode, 0);
   });
 });

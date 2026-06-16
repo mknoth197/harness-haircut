@@ -103,7 +103,7 @@ function runInit(root: string, options: RunInitOptions = {}): Promise<InitReport
           writer.write(APPLY_STATE_PATH, serializeState(state)),
         flags: { allowDirty: true, dryRun: false, nonInteractive: true },
       }),
-    flags: { dryRun: false, nonInteractive: false },
+    flags: { dryRun: false, nonInteractive: false, adopt: false },
   });
 }
 
