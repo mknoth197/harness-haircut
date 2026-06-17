@@ -126,6 +126,8 @@ Global options:
 **`audit`**
 - Read-only. No file writes.
 - Exit codes: `0` clean, `1` drift detected, `2` lossy-translation warning, `3` invalid config, `64+` system error.
+- `--fail-on <warn|drift>` (#43): `warn` (default) keeps the exit-2 lossy-warning code; `drift` de-escalates a warnings-only run to exit 0 (warnings still print), so CI can tolerate standing `HH-Wxxx` the way the pre-commit hook does. Overrides `--strict` for warnings.
+- When a drift is reported and an *enabled* provider has no files at all in the repo, the report names it and points at `providers_disabled` — so a repo that doesn't use a provider isn't read as "I must create files I don't want".
 - `--json` emits a structured report.
 
 **`apply`**
@@ -308,8 +310,8 @@ discover → parse → IR → adapters → emit
 
 Two artifacts ship with v1:
 
-1. **`harness-haircut install-precommit`** — installs a `.husky/pre-commit` (or plain `.git/hooks/pre-commit`) shim that runs `npx harness-haircut audit --json` and blocks the commit on non-zero.
-2. **`templates/github-action.yml`** — a documented snippet users can paste into `.github/workflows/`. The action runs `npx harness-haircut audit` and fails the check on drift.
+1. **`harness-haircut install-precommit`** — installs a `.husky/pre-commit` (or plain `.git/hooks/pre-commit`) shim that runs `npx harness-haircut audit --json`, blocking the commit on drift (1) / bad config (3) but **tolerating a standing lossy warning** (exit 2): a permanent `HH-Wxxx` (e.g. W001/W007) must not wedge every commit on a drift-free repo.
+2. **`templates/github-action.yml`** — a documented snippet users can paste into `.github/workflows/`. It runs `npx harness-haircut audit --fail-on drift` so the CI policy **matches the pre-commit hook**: real drift fails the check, while a standing lossy warning prints but does not (#43 — a bare `audit` made the stock template permanently red on a drift-free repo). Drop the flag to fail on warnings too.
 
 Both artifacts are documentation + simple scripts in v1; no GitHub App, no marketplace listing.
 

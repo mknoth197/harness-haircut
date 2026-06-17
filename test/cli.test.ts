@@ -360,6 +360,59 @@ describe('audit E2E (spawn dist/bin.js)', () => {
     });
     assert.equal(r.status, 1);
   });
+
+  // #43: a stock CI template running bare `audit` goes permanently red on a
+  // standing HH-Wxxx (exit 2). `--fail-on drift` tolerates it like the
+  // pre-commit hook, while still printing the warning and failing on real drift.
+  it('#43 --fail-on drift exits 0 on a warnings-only repo (warning still printed)', async () => {
+    const repo = await lossyRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'audit', '--cwd', repo.root, '--fail-on', 'drift'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /HH-W007/);
+  });
+
+  it('#43 --fail-on drift still fails (exit 1) on real drift', async () => {
+    const repo = await lossyRepo();
+    await rm(join(repo.root, '.github', 'copilot-instructions.md'));
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'audit', '--cwd', repo.root, '--fail-on', 'drift'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+  });
+
+  it('#43 --fail-on with an invalid value exits 64', async () => {
+    const repo = await cleanRepo();
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'audit', '--cwd', repo.root, '--fail-on', 'sometimes'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 64);
+    assert.match(r.stderr, /--fail-on/);
+  });
+
+  it('#43 names an absent provider with the providers_disabled remedy', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n\nUse npm test.\n' });
+    repos.push(repo);
+    // apply creates every enabled provider's files; remove Gemini's only file so
+    // gemini is entirely absent — the no-Gemini-repo shape from the dogfood.
+    spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
+      encoding: 'utf8',
+    });
+    await rm(join(repo.root, '.gemini', 'settings.json'));
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /providers_disabled/);
+    assert.match(r.stdout, /gemini/);
+  });
 });
 
 describe('apply E2E (spawn dist/bin.js)', () => {

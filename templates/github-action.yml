@@ -1,10 +1,12 @@
 # harness-haircut drift check — paste into .github/workflows/ (I1, PRD §13).
 #
-# Runs `harness-haircut audit` on every push and pull request. The audit is
-# read-only and exits non-zero on any drift (1), lossy-translation warning (2),
-# or invalid config (3) — so a divergence between your canonical sources and
-# the committed provider files fails the check. Action SHAs are pinned to match
-# this repo's own .github/workflows/ci.yml.
+# Runs `harness-haircut audit --fail-on drift` on every push and pull request.
+# The audit is read-only; with `--fail-on drift` it fails ONLY on real drift
+# (exit 1) or invalid config (exit 3). A standing lossy-translation warning
+# (exit 2 — e.g. HH-W001/W007, permanent properties of your globs/providers)
+# still PRINTS but does not fail the check, matching the pre-commit hook's
+# policy so a drift-free repo's CI is never permanently red. Drop the flag to
+# also fail on warnings. Action SHAs are pinned to match this repo's ci.yml.
 name: harness-haircut
 
 on:
@@ -31,6 +33,8 @@ jobs:
       - name: Install
         run: npm ci
 
-      # Fails the check on non-zero exit (drift, lossy warning, or bad config).
+      # Fails the check on drift (exit 1) or invalid config (exit 3). A standing
+      # lossy-translation warning (exit 2) prints but does not fail — drop
+      # `--fail-on drift` to treat warnings as failures too.
       - name: Audit AI-provider configuration drift
-        run: npx harness-haircut audit
+        run: npx harness-haircut audit --fail-on drift

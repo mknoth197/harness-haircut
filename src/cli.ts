@@ -77,7 +77,7 @@ export interface ParsedArgs {
 
 const KNOWN_COMMANDS = new Set(['init', 'audit', 'apply', 'doctor', 'install-precommit']);
 
-const VALUE_FLAGS = new Set(['--cwd', '--config', '--assist-model']);
+const VALUE_FLAGS = new Set(['--cwd', '--config', '--assist-model', '--fail-on']);
 
 /** Value flags that may appear more than once; values accumulate into `repeated`. */
 const REPEATABLE_VALUE_FLAGS = new Set(['--assist-include', '--assist-allow-secret']);
@@ -150,7 +150,7 @@ function helpText(): string {
     '',
     'Commands:',
     '  init       Bootstrap canonical layout from an existing repo (interactive merge)',
-    '  audit      Read-only drift check; exits non-zero on any divergence or warning',
+    '  audit      Read-only drift check; exits 1 on drift, 2 on a lossy warning',
     '  apply      Project canonical sources into provider-specific files',
     '  doctor     Print configuration, detected providers, and version info',
     '  install-precommit  Install a git pre-commit hook that runs `audit`',
@@ -164,6 +164,13 @@ function helpText(): string {
     '  -v, --verbose       Verbose logging',
     '  -h, --help          Show help',
     '  --version           Show version',
+    '',
+    'audit options:',
+    '  --fail-on <level>   "warn" (default): a lossy-translation warning exits 2.',
+    '                      "drift": only real drift (exit 1) or invalid config',
+    '                      (exit 3) fail; a warnings-only run exits 0 (the',
+    '                      warnings still print). Use in CI to tolerate standing',
+    '                      HH-Wxxx warnings the way the pre-commit hook does.',
     '',
     'init options:',
     '  --dry-run           Print the planned canonical layout and exit without writing',
@@ -468,6 +475,16 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
     : undefined;
   const json = parsed.flags['--json'] === true;
   const strict = parsed.flags['--strict'] === true;
+  // #43: `--fail-on drift` makes a warnings-only run exit 0 (the CI-template
+  // parallel to the pre-commit hook's exit-2 tolerance). Default 'warn'.
+  const failOnFlag = parsed.flags['--fail-on'];
+  if (failOnFlag !== undefined && failOnFlag !== 'warn' && failOnFlag !== 'drift') {
+    io.stderr.write(
+      `harness-haircut: --fail-on must be "warn" (default) or "drift", got ${JSON.stringify(failOnFlag)}\n`,
+    );
+    return 64;
+  }
+  const failOn: 'warn' | 'drift' = failOnFlag === 'drift' ? 'drift' : 'warn';
 
   let report: AuditReport;
   try {
@@ -489,6 +506,7 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       contextFor,
       aliasOf: createSymlinkAliasProbe(cwd),
       strict: strict || config.warningsAsErrors,
+      failOn,
     });
   } catch (err) {
     if (err instanceof DomainError) {
@@ -534,6 +552,35 @@ function renderAuditReport(report: AuditReport): string {
     for (const file of aliased) {
       lines.push(`  aliased\t${file.path} [${file.providerId}]`);
     }
+  }
+
+  // #43: an ENABLED provider whose every expected file is missing has no
+  // presence in this repo. Name it with the `providers_disabled` remedy, so a
+  // no-Gemini repo's "missing .gemini/settings.json" drift is not read as
+  // "I must create Gemini files I don't want".
+  const byProvider = new Map<ProviderId, FileAudit[]>();
+  for (const file of report.files) {
+    if (file.status === 'aliased') {
+      continue;
+    }
+    const list = byProvider.get(file.providerId);
+    if (list === undefined) {
+      byProvider.set(file.providerId, [file]);
+    } else {
+      list.push(file);
+    }
+  }
+  const absentProviders = [...byProvider.entries()]
+    .filter(([, files]) => files.length > 0 && files.every((f) => f.status === 'drift:missing'))
+    .map(([id]) => id);
+  if (absentProviders.length > 0) {
+    lines.push('');
+    lines.push(
+      `hint: ${absentProviders.length} enabled provider(s) have no files in this repo ` +
+        `(${absentProviders.join(', ')}). Run \`harness-haircut apply\` to create them, or — if a ` +
+        'provider is not used here — add it to `providers_disabled` in harness-haircut.config.json ' +
+        'so audit stops expecting it.',
+    );
   }
 
   if (report.warnings.length > 0) {

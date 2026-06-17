@@ -54,7 +54,12 @@ async function setup(
 
 function runAudit(
   root: string,
-  options: { strict?: boolean; disabled?: ProviderId[]; geminiMode?: 'settings' | 'shim' } = {},
+  options: {
+    strict?: boolean;
+    disabled?: ProviderId[];
+    geminiMode?: 'settings' | 'shim';
+    failOn?: 'warn' | 'drift';
+  } = {},
 ) {
   const reader = createProviderFileReader(root);
   const adapters = createAllAdapters().filter(
@@ -67,6 +72,7 @@ function runAudit(
     contextFor: contextFactory(root, reader, options.geminiMode ?? 'settings'),
     aliasOf: createSymlinkAliasProbe(root),
     strict: options.strict,
+    failOn: options.failOn,
   });
 }
 
@@ -307,6 +313,30 @@ describe('audit() — lossy warnings (EV4, OPT1)', () => {
     const report = await runAudit(repo.root, { strict: true });
     assert.equal(report.drift, false);
     assert.equal(report.exitCode, 1);
+  });
+
+  it('--fail-on drift makes a lossy-only warning exit 0, not 2 (#43)', async () => {
+    const repo = await setup(LOSSY);
+    const report = await runAudit(repo.root, { failOn: 'drift' });
+    assert.equal(report.drift, false);
+    // The warning is still reported; only the exit code is de-escalated.
+    assert.ok(report.warnings.some((w) => w.code === 'HH-W007'));
+    assert.equal(report.exitCode, 0);
+  });
+
+  it('--fail-on drift still fails (exit 1) on real drift (#43)', async () => {
+    const repo = await setup(LOSSY);
+    await rm(join(repo.root, '.github', 'copilot-instructions.md'));
+    const report = await runAudit(repo.root, { failOn: 'drift' });
+    assert.equal(report.drift, true);
+    assert.equal(report.exitCode, 1);
+  });
+
+  it('--fail-on drift overrides --strict for warnings (de-escalates to 0) (#43)', async () => {
+    const repo = await setup(LOSSY);
+    const report = await runAudit(repo.root, { strict: true, failOn: 'drift' });
+    assert.equal(report.drift, false);
+    assert.equal(report.exitCode, 0);
   });
 
   // The §9 v0.3.1 amendment exists so an edit to an emitted frontmatter glob
