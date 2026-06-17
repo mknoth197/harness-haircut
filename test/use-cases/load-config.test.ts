@@ -45,6 +45,12 @@ describe('loadConfig — fields', () => {
     assert.equal(config.warningsAsErrors, true);
     assert.equal(config.gemini.mode, 'shim');
   });
+
+  it('defaults exclude to an empty list and reads an explicit one (#42)', () => {
+    assert.deepEqual(loadConfig(null).exclude, []);
+    const config = loadConfig('{"exclude":["evals/fixtures/**","test/fixtures/**"]}');
+    assert.deepEqual(config.exclude, ['evals/fixtures/**', 'test/fixtures/**']);
+  });
 });
 
 describe('loadConfig — invalid input', () => {
@@ -79,6 +85,15 @@ describe('loadConfig — invalid input', () => {
     assert.throws(
       () => loadConfig('{"gemini":{"mode":"yaml"}}'),
       (err: unknown) => err instanceof InvalidConfigError && /gemini\.mode/.test(err.message),
+    );
+  });
+
+  it('throws when exclude is not an array of non-empty strings (#42)', () => {
+    assert.throws(() => loadConfig('{"exclude":"evals/**"}'), InvalidConfigError);
+    assert.throws(() => loadConfig('{"exclude":[123]}'), InvalidConfigError);
+    assert.throws(
+      () => loadConfig('{"exclude":[""]}'),
+      (err: unknown) => err instanceof InvalidConfigError && /exclude/.test(err.message),
     );
   });
 });

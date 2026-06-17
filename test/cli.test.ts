@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { mkdir, rm, symlink, writeFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { parseArgs, run } from '../dist/index.js';
@@ -484,6 +484,36 @@ describe('apply E2E (spawn dist/bin.js)', () => {
     assert.match(r.stdout, /blocked 1 file\(s\)/);
     assert.match(r.stdout, /unmanaged\t\S*copilot-instructions\.md/);
     assert.match(readFileSync(ciAbs, 'utf8'), /Precious/);
+  });
+
+  // #42: a tracked test/eval fixture containing a provider file must not be
+  // detected as a real config, and apply must not write projections INTO it.
+  it('#42 honors the exclude config: no projection written into an excluded fixture dir', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      'evals/fixtures/codex/cerebro-skill/AGENTS.md': '# Fixture\n\nFixture content.\n',
+      'harness-haircut.config.json': '{"exclude":["evals/fixtures/**"]}\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    // The root projection still lands...
+    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), true);
+    // ...but nothing is written into the excluded fixture, and no nested-AGENTS
+    // projection (hh.nested-*) is emitted for it.
+    assert.equal(
+      existsSync(join(repo.root, 'evals', 'fixtures', 'codex', 'cerebro-skill', 'CLAUDE.md')),
+      false,
+    );
+    const instrDir = join(repo.root, '.github', 'instructions');
+    const nested = existsSync(instrDir)
+      ? readdirSync(instrDir).filter((f) => f.startsWith('hh.nested-'))
+      : [];
+    assert.deepEqual(nested, [], 'no nested-fixture instructions projection');
   });
 });
 

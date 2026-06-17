@@ -384,6 +384,7 @@ async function walk(
   absDir: string,
   relDir: string,
   patterns: readonly IgnorePattern[],
+  excludePatterns: readonly IgnorePattern[],
   include: (relPath: string) => boolean,
   state: WalkState,
 ): Promise<void> {
@@ -403,6 +404,12 @@ async function walk(
       if (isNonCanonicalJunk(entry.name)) {
         continue;
       }
+      // #42: a `exclude` config glob prunes the directory BEFORE the gitignore
+      // check — it is an explicit "not canonical here", not a lost source, so
+      // it earns no HH-W012 even when the path is also canonical-shaped.
+      if (isIgnored(rel, true, excludePatterns)) {
+        continue;
+      }
       if (isIgnored(rel, true, patterns)) {
         // Git never descends into an excluded directory, so canonical
         // sources beneath it are lost. Surface the exclusion instead of
@@ -417,13 +424,18 @@ async function walk(
         }
         continue;
       }
-      await walk(join(absDir, entry.name), rel, patterns, include, state);
+      await walk(join(absDir, entry.name), rel, patterns, excludePatterns, include, state);
     } else if (entry.isFile()) {
       // #41: OS/editor noise + lockfiles are never canonical content — skip
       // BEFORE the ignore check so they fire neither HH-W010 (collected as an
       // unknown `.agents/` attachment) nor HH-W012 (whose "un-ignore it" advice
       // is wrong for a gitignored `.DS_Store`/lockfile).
       if (isNonCanonicalJunk(entry.name)) {
+        continue;
+      }
+      // #42: an `exclude` config glob drops the file BEFORE the gitignore check
+      // (explicit "not canonical", so no HH-W012 even if canonical-shaped).
+      if (isIgnored(rel, false, excludePatterns)) {
         continue;
       }
       // Symlinks and special files are skipped: following links could
@@ -480,11 +492,17 @@ function recordExcludedCanonicalDir(rel: string, state: WalkState): void {
  * When a canonical-shaped path is excluded by an ignore rule it is reported
  * in `excludedCanonicalPaths` (sorted) rather than silently dropped; the
  * `parseRepo` use case maps those into `HH-W012` warnings (EV1).
+ *
+ * `exclude` (#42) is the config `exclude` list — gitignore-style globs whose
+ * matches are dropped from collection BEFORE the ignore check, so they are not
+ * detected, parsed, or projected into, and (unlike a `.gitignore` match) never
+ * surface as HH-W012. Compiled once via the same glob subset as `.gitignore`.
  */
-export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
+export async function readRepoSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
+  const excludePatterns = parseGitignore(exclude.join('\n'));
   const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, isCanonicalPath, state);
+  await walk(root, '', patterns, excludePatterns, isCanonicalPath, state);
   return finishSnapshot(root, state);
 }
 
@@ -494,11 +512,14 @@ export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
  * candidate recovery (see `isInitPath`). Same `.gitignore`/skip rules and
  * sorting as `readRepoSnapshot`; paths are repo-relative POSIX, BOM stripped.
  * Excluded canonical sources are still reported in `excludedCanonicalPaths`.
+ * `exclude` (#42) drops config-excluded paths from collection, exactly as in
+ * `readRepoSnapshot` — so init never adopts a fixture's provider files.
  */
-export async function readInitSnapshot(root: string): Promise<RepoSnapshot> {
+export async function readInitSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
+  const excludePatterns = parseGitignore(exclude.join('\n'));
   const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, isInitPath, state);
+  await walk(root, '', patterns, excludePatterns, isInitPath, state);
   return finishSnapshot(root, state);
 }
 

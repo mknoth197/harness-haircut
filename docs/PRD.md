@@ -179,11 +179,13 @@ Global options:
   "providers_disabled": [],
   "warningsAsErrors": false,
   "writeGitignore": true,
+  "exclude": ["evals/fixtures/**", "test/fixtures/**"],
   "gemini": { "mode": "settings" }
 }
 ```
 
 - `gemini.mode`: `"settings"` (default — write `context.fileName` into `.gemini/settings.json`) or `"shim"` (emit a `GEMINI.md` `@AGENTS.md` import instead). See A3 (#9).
+- `exclude` (#42): gitignore-style globs (same subset as the root `.gitignore`) whose matches are dropped from canonical collection — so a *tracked* test/eval fixture that contains a provider file (e.g. `evals/fixtures/codex/x/AGENTS.md`) is neither detected as a real config, lifted into the IR, nor projected into (without it, `apply` writes `CLAUDE.md` / `hh.*.instructions.md` **inside** the fixture). Defaults to `[]`. Honored by the repo walk, so detection, collection, and projection all respect it; an excluded canonical-shaped path is an explicit opt-out and never raises `HH-W012`. (OS junk and lockfiles are always skipped without needing this — see [HH-W012](warnings/HH-W012.md) / #41.)
 
 ## 9. SignedSource header *(new)*
 

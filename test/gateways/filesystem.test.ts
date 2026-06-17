@@ -300,6 +300,62 @@ describe('readRepoSnapshot — #41 OS-junk / lockfile denylist', () => {
   });
 });
 
+// #42: the `exclude` config glob list drops matches from canonical collection
+// BEFORE the ignore check, so a tracked fixture's provider file is neither
+// collected (→ not detected, not parsed, not projected into) nor surfaced as a
+// lost canonical source (no HH-W012 — the exclusion is explicit, not accidental).
+describe('readRepoSnapshot — #42 exclude config globs', () => {
+  it('drops a tracked fixture AGENTS.md and fires no HH-W012', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'evals/fixtures/codex/cerebro-skill/AGENTS.md': '# Fixture\n\nFixture content.\n',
+      'evals/fixtures/codex/cerebro-skill-partial/AGENTS.md': '# Partial fixture\n',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root, ['evals/fixtures/**']);
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md']);
+      // The fixture AGENTS.md files are canonical-SHAPED, but excluded by config
+      // is an explicit "not canonical" — never an HH-W012 "un-ignore it".
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('collects the fixture AGENTS.md when no exclude glob is configured (default)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'evals/fixtures/codex/cerebro-skill/AGENTS.md': '# Fixture\n',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), [
+        'AGENTS.md',
+        'evals/fixtures/codex/cerebro-skill/AGENTS.md',
+      ]);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('a single-segment exclude name drops a directory subtree at any depth', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'pkg/__fixtures__/AGENTS.md': '# fixture',
+      'pkg/real/AGENTS.md': '# real nested',
+    });
+    try {
+      // Unanchored basename match (gitignore subset): `__fixtures__` matches the
+      // dir at any depth; the real nested AGENTS.md is untouched.
+      const snapshot = await readRepoSnapshot(repo.root, ['__fixtures__']);
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md', 'pkg/real/AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+});
+
 describe('isIgnored (pure matcher)', () => {
   it('negation flips an earlier exclusion (last matching pattern wins)', () => {
     assert.equal(ignored('*.md\n', 'AGENTS.md'), true);

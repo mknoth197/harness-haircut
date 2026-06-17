@@ -50,6 +50,17 @@ export interface HarnessConfig {
   warningsAsErrors: boolean;
   /** Reserved for C2 (`apply`); parsed here so the schema validates whole. */
   writeGitignore: boolean;
+  /**
+   * #42: gitignore-style globs whose matches are excluded from canonical
+   * collection — so a tracked test/eval fixture that happens to contain a
+   * provider file (e.g. `evals/fixtures/codex/x/AGENTS.md`) is neither detected
+   * as a real config, lifted into the IR, nor projected into (apply would
+   * otherwise write `CLAUDE.md` / `hh.*.instructions.md` INTO the fixture).
+   * Honored by the repo walk, so it flows through detection, collection, and
+   * projection at once. Empty by default. `.gitignore` cannot serve this role
+   * because fixtures are typically tracked.
+   */
+  exclude: string[];
   gemini: { mode: GeminiMode };
   /** C4 AI-assist policy (PRD §17); defaults leave assist disabled. */
   assist: AssistConfig;
@@ -74,6 +85,7 @@ export function defaultConfig(): HarnessConfig {
     providersDisabled: [],
     warningsAsErrors: false,
     writeGitignore: true,
+    exclude: [],
     gemini: { mode: 'settings' },
     assist: defaultAssistConfig(),
   };
@@ -101,6 +113,21 @@ function readProviderArray(
     }
   }
   return value as ProviderId[];
+}
+
+function readStringArray(value: unknown, key: string, path: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new InvalidConfigError(path, `"${key}" must be an array of strings`);
+  }
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry === '') {
+      throw new InvalidConfigError(
+        path,
+        `"${key}" must contain only non-empty strings, got ${JSON.stringify(entry)}`,
+      );
+    }
+  }
+  return value as string[];
 }
 
 function readBoolean(value: unknown, key: string, path: string, fallback: boolean): boolean {
@@ -159,6 +186,10 @@ export function loadConfig(raw: string | null, path = 'harness-haircut.config.js
     path,
     config.writeGitignore,
   );
+
+  if (obj['exclude'] !== undefined) {
+    config.exclude = readStringArray(obj['exclude'], 'exclude', path);
+  }
 
   const gemini = obj['gemini'];
   if (gemini !== undefined) {
