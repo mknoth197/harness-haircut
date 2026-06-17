@@ -378,6 +378,8 @@ interface WalkState {
   out: FileSnapshot[];
   /** Canonical-shaped paths excluded by an ignore rule (drives HH-W012). */
   excludedCanonical: string[];
+  /** #45: symlinked entries at a collected location the walk did not follow. */
+  skippedSymlinks: string[];
 }
 
 async function walk(
@@ -465,6 +467,24 @@ async function walk(
         content = content.slice(1);
       }
       state.out.push({ path: rel, content });
+    } else if (entry.isSymbolicLink()) {
+      // #45: the walk NEVER follows a symlink (it could escape the repo or
+      // cycle — the pen-test stance). A symlinked file/dir at a location we
+      // would otherwise collect is therefore invisible to import. Record it
+      // (when it passes the same junk/ignore/exclude/include gates a real entry
+      // would) so `init` can surface a visible note instead of silently
+      // dropping it. Junk / ignored / config-excluded links are skipped quietly
+      // — the user already excluded them. A symlink is treated as a file for
+      // matching (git tracks the link itself, not its target).
+      if (isNonCanonicalJunk(entry.name)) {
+        continue;
+      }
+      if (isIgnored(rel, false, excludePatterns) || isIgnored(rel, false, patterns)) {
+        continue;
+      }
+      if (include(rel)) {
+        state.skippedSymlinks.push(rel);
+      }
     }
   }
 }
@@ -501,7 +521,7 @@ function recordExcludedCanonicalDir(rel: string, state: WalkState): void {
 export async function readRepoSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
   const excludePatterns = parseGitignore(exclude.join('\n'));
-  const state: WalkState = { out: [], excludedCanonical: [] };
+  const state: WalkState = { out: [], excludedCanonical: [], skippedSymlinks: [] };
   await walk(root, '', patterns, excludePatterns, isCanonicalPath, state);
   return finishSnapshot(root, state);
 }
@@ -518,15 +538,16 @@ export async function readRepoSnapshot(root: string, exclude: readonly string[] 
 export async function readInitSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
   const excludePatterns = parseGitignore(exclude.join('\n'));
-  const state: WalkState = { out: [], excludedCanonical: [] };
+  const state: WalkState = { out: [], excludedCanonical: [], skippedSymlinks: [] };
   await walk(root, '', patterns, excludePatterns, isInitPath, state);
   return finishSnapshot(root, state);
 }
 
-/** Sort the collected files + deduped excluded-canonical paths into a snapshot. */
+/** Sort the collected files + deduped excluded-canonical / skipped-symlink paths into a snapshot. */
 function finishSnapshot(root: string, state: WalkState): RepoSnapshot {
   const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
   state.out.sort((a, b) => cmp(a.path, b.path));
   const excludedCanonicalPaths = [...new Set(state.excludedCanonical)].sort(cmp);
-  return { root, files: state.out, excludedCanonicalPaths };
+  const skippedSymlinks = [...new Set(state.skippedSymlinks)].sort(cmp);
+  return { root, files: state.out, excludedCanonicalPaths, skippedSymlinks };
 }

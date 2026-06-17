@@ -704,6 +704,29 @@ describe('init() — #35 symlinked canonical home', () => {
   });
 });
 
+describe('init() — #45 skipped symlinked provider files are noted', () => {
+  it('notes a symlinked .claude/skills entry instead of silently dropping it', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project\n\nUse npm test.\n',
+      // The real skill content lives outside the init-collected paths; only the
+      // symlink at the provider location would surface it — and that is skipped.
+      'elsewhere/demo/SKILL.md': '---\nname: demo\ndescription: d\n---\nBody.\n',
+      '.claude/skills/keep.md': 'placeholder to create the dir\n',
+    });
+    await symlink(join('..', '..', 'elsewhere', 'demo'), join(repo.root, '.claude', 'skills', 'demo'));
+
+    const report = await runInit(repo.root);
+    assert.equal(report.exitCode, 0);
+    // The skip is now a visible note, not a silent omission (#45).
+    const note = report.notes.find(
+      (n) => n.includes('.claude/skills/demo') && /symlink/.test(n),
+    );
+    assert.notEqual(note, undefined, 'init should note the skipped symlinked skill');
+    // The symlinked skill is NOT imported into the canonical layout.
+    assert.equal(report.planned.some((f) => f.path.includes('skills/demo')), false);
+  });
+});
+
 describe('init() — --adopt hand-built canonical (C6 #44)', () => {
   it('AD3: adopts a hand-built repo end-to-end — imports a claude-only skill + a Copilot fragment, audit exits 0', async () => {
     const repo = await setup({
