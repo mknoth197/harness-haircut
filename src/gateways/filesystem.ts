@@ -12,6 +12,43 @@ import { FileSystemError } from '../entities/errors.js';
 /** Skipped unconditionally, at any depth, regardless of .gitignore. */
 const ALWAYS_SKIPPED_DIRS: ReadonlySet<string> = new Set(['.git', 'node_modules', 'dist']);
 
+/**
+ * OS / editor noise files and package-manager lockfiles that are never
+ * AI-provider canonical content (#41). Skipped at any depth BEFORE the
+ * `.gitignore` check, so they neither enter the IR (no HH-W010 "unknown
+ * attachment under .agents/") nor — when a global rule like `.DS_Store` or
+ * `*.lock` ignores one under `.agents/` — surface as HH-W012, whose remedy is
+ * "un-ignore it": advising a user to un-ignore `.DS_Store` is actively wrong.
+ * This is the file-level analogue of `node_modules`/`dist` already being
+ * pruned unconditionally as directories — regenerable tooling, not content.
+ */
+const NON_CANONICAL_JUNK_NAMES: ReadonlySet<string> = new Set([
+  '.DS_Store',
+  '.AppleDouble',
+  'Thumbs.db',
+  'ehthumbs.db',
+  'desktop.ini',
+  'Desktop.ini',
+  '.Spotlight-V100',
+  '.Trashes',
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'bun.lockb',
+]);
+
+/** Editor swap/backup suffixes (vim `.swp`/`.swo`, emacs/gedit `~`). */
+const NON_CANONICAL_JUNK_SUFFIXES: readonly string[] = ['.swp', '.swo', '~'];
+
+/** True for OS/editor noise + lockfiles that must never be collected as canonical (#41). */
+function isNonCanonicalJunk(basename: string): boolean {
+  return (
+    NON_CANONICAL_JUNK_NAMES.has(basename) ||
+    NON_CANONICAL_JUNK_SUFFIXES.some((suffix) => basename.endsWith(suffix))
+  );
+}
+
 export interface IgnorePattern {
   regex: RegExp;
   /** Pattern ended with '/': matches directories only. */
@@ -362,6 +399,10 @@ async function walk(
       if (ALWAYS_SKIPPED_DIRS.has(entry.name)) {
         continue;
       }
+      // #41: OS-junk directories (.Spotlight-V100, .Trashes) are never content.
+      if (isNonCanonicalJunk(entry.name)) {
+        continue;
+      }
       if (isIgnored(rel, true, patterns)) {
         // Git never descends into an excluded directory, so canonical
         // sources beneath it are lost. Surface the exclusion instead of
@@ -378,6 +419,13 @@ async function walk(
       }
       await walk(join(absDir, entry.name), rel, patterns, include, state);
     } else if (entry.isFile()) {
+      // #41: OS/editor noise + lockfiles are never canonical content — skip
+      // BEFORE the ignore check so they fire neither HH-W010 (collected as an
+      // unknown `.agents/` attachment) nor HH-W012 (whose "un-ignore it" advice
+      // is wrong for a gitignored `.DS_Store`/lockfile).
+      if (isNonCanonicalJunk(entry.name)) {
+        continue;
+      }
       // Symlinks and special files are skipped: following links could
       // escape the repo or cycle, and canonical sources are plain files.
       if (isIgnored(rel, false, patterns)) {

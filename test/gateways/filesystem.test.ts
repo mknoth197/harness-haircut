@@ -245,6 +245,61 @@ describe('readRepoSnapshot', () => {
   });
 });
 
+// #41: OS/editor noise + lockfiles are never canonical content. The original
+// dogfood bug: a global `.DS_Store` rule made `.agents/.DS_Store` fire HH-W012
+// advising the user to un-ignore their Finder junk. They must be skipped before
+// the ignore check — collected by neither the snapshot nor the W012 tracker.
+describe('readRepoSnapshot — #41 OS-junk / lockfile denylist', () => {
+  it('does not collect a gitignored .agents/.DS_Store nor surface HH-W012 (the dogfood repro)', async () => {
+    const repo = await mkTempRepo({
+      '.gitignore': '.DS_Store\n',
+      'AGENTS.md': '# root',
+      '.agents/.DS_Store': 'macOS Finder junk',
+      '.agents/instructions/arch.md': '---\nscope: "src/**"\n---\nbody',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/instructions/arch.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does not collect OS junk under .agents/ even when NOT gitignored (no HH-W010 attachment)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      '.agents/.DS_Store': 'macOS Finder junk',
+      '.agents/skills/foo/Thumbs.db': 'Windows thumbnail cache',
+      '.agents/skills/foo/SKILL.md': '---\nname: foo\ndescription: d\n---\n',
+      '.agents/instructions/arch.swp': 'vim swap file',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/foo/SKILL.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does not advise un-ignoring a gitignored lockfile inside a skill dir', async () => {
+    const repo = await mkTempRepo({
+      '.gitignore': 'package-lock.json\n',
+      'AGENTS.md': '# root',
+      '.agents/skills/foo/SKILL.md': '---\nname: foo\ndescription: d\n---\n',
+      '.agents/skills/foo/package-lock.json': '{"lockfileVersion":3}',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/foo/SKILL.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+});
+
 describe('isIgnored (pure matcher)', () => {
   it('negation flips an earlier exclusion (last matching pattern wins)', () => {
     assert.equal(ignored('*.md\n', 'AGENTS.md'), true);
