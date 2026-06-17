@@ -1077,3 +1077,68 @@ describe('symlink-aliased targets E2E (#35, spawn dist/bin.js)', () => {
     assert.equal(existsSync(join(repo.root, '.harness-haircut-init-backup')), false);
   });
 });
+
+/** #47 — three CLI-polish frictions from dogfooding, bundled. */
+describe('#47 CLI polish E2E (spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('(1) apply --dry-run previews on a DIRTY git tree without --allow-dirty', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n\nUse npm test.\n' });
+    repos.push(repo);
+    spawnSync('git', ['init', '-q'], { cwd: repo.root });
+    spawnSync('git', ['config', 'user.email', 't@t.co'], { cwd: repo.root });
+    spawnSync('git', ['config', 'user.name', 't'], { cwd: repo.root });
+    spawnSync('git', ['add', '-A'], { cwd: repo.root });
+    spawnSync('git', ['commit', '-qm', 'seed'], { cwd: repo.root });
+    // Leave an uncommitted change → a dirty tree.
+    await writeFile(join(repo.root, 'scratch.txt'), 'uncommitted\n', 'utf8');
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--dry-run'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /dry run/);
+    assert.doesNotMatch(r.stdout, /refused/);
+    // It really was a preview: no provider file landed.
+    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
+  });
+
+  it('(2) a piped prompt answer is echoed with a newline (no run-on)', async () => {
+    // Two DIFFERENT root files → one root-instructions contradiction (2 + skip).
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      '.github/copilot-instructions.md': '# Project\nUse pnpm test.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '1\n',
+    });
+    assert.equal(r.status, 0);
+    // The consumed answer is echoed + newline, so the report does not run onto
+    // the prompt line ("Choice [1-3]: resolved …" was the old bug).
+    assert.match(r.stdout, /Choice \[1-3\]: 1\r?\n/);
+  });
+
+  it('(3) init surfaces the chained apply warnings instead of swallowing them', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project\n\nUse npm test.\n',
+      '.github/instructions/testing.instructions.md':
+        '---\napplyTo: "test/**/*.ts"\n---\n# Testing\n\nUse node:test.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '',
+    });
+    assert.equal(r.status, 0);
+    // The recovered fragment is unrepresentable for Gemini → HH-W007. Init must
+    // print it now, not leave it as a surprise for the next `audit` (exit 2).
+    assert.match(r.stdout, /HH-W007/);
+    assert.match(r.stdout, /standing/);
+  });
+});

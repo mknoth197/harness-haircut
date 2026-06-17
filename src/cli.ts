@@ -629,6 +629,12 @@ function createStdinPrompt(
   let closed = false;
   const buffered: string[] = [];
   const waiters: Array<(answer: string) => void> = [];
+  // #47: a real terminal echoes the user's keystrokes + the Enter newline, but
+  // PIPED stdin (tests, CI, `printf … |`) is not echoed by readline — so the
+  // consumed answer and the next output ran together ("Choice [1-3]: detected
+  // …"). On non-TTY input we echo the answer ourselves; on a TTY we must not,
+  // or the answer would print twice.
+  const isTty = (input as Partial<NodeJS.ReadStream>).isTTY === true;
   const ensure = (): void => {
     if (rl !== undefined) {
       return;
@@ -637,6 +643,11 @@ function createStdinPrompt(
     rl.on('line', (line) => {
       const waiter = waiters.shift();
       if (waiter !== undefined) {
+        // The common piped path: the prompt was already rendered via
+        // rl.prompt(); echo the answer + newline so the next output starts fresh.
+        if (!isTty) {
+          output.write(`${line}\n`);
+        }
         waiter(line.trim());
       } else {
         buffered.push(line);
@@ -654,11 +665,16 @@ function createStdinPrompt(
       ensure();
       const line = buffered.shift();
       if (line !== undefined) {
-        output.write(question);
+        // A line that arrived BEFORE this prompt (piped read-ahead). On non-TTY
+        // input echo the answer + newline with the question so the transcript
+        // reads cleanly; on a TTY the keystrokes were already echoed when typed.
+        output.write(isTty ? question : `${question}${line}\n`);
         return Promise.resolve(line.trim());
       }
       if (closed) {
-        output.write(question);
+        // #47: EOF — no answer to echo, but still terminate the prompt line so
+        // the following output starts fresh instead of running on.
+        output.write(`${question}\n`);
         return Promise.resolve('');
       }
       // Render the question through readline (not a bare output.write) so a
@@ -1339,6 +1355,19 @@ function renderInitReport(report: InitReport): string {
       `projected ${report.apply.written.length} provider file(s) via apply ` +
         `(exit ${report.apply.exitCode}).`,
     );
+    // #47: surface the chained apply's warnings here. Init used to swallow them,
+    // so a user first learned about a STANDING lossy translation (HH-W001/W007)
+    // from the next `audit` (exit 2) — reading like a surprise regression.
+    // Showing them now sets expectations: these warnings are permanent and the
+    // CI template tolerates them (see `audit --fail-on drift`, #43).
+    if (report.apply.warnings.length > 0) {
+      lines.push(`  ${report.apply.warnings.length} warning(s) from the projection (these are standing — not new drift):`);
+      for (const warning of report.apply.warnings) {
+        const where = warning.canonicalPath ?? warning.providerId ?? '';
+        const suffix = where === '' ? '' : ` (${where})`;
+        lines.push(`    ${warning.code}\t${warning.message}${suffix}`);
+      }
+    }
   }
 
   if (report.notes.length > 0) {
