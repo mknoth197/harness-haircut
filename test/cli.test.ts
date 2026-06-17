@@ -441,6 +441,50 @@ describe('apply E2E (spawn dist/bin.js)', () => {
     assert.match(r.stdout, /dry run/);
     assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
   });
+
+  // #40: a hand-written (unmanaged) provider file must be backed up + prompted,
+  // never silently clobbered as it was before.
+  it('#40 prompts before taking over a hand-written file and backs it up on confirm', async () => {
+    const repo = await canonicalRepo();
+    const ciAbs = join(repo.root, '.github', 'copilot-instructions.md');
+    await mkdir(dirname(ciAbs), { recursive: true });
+    await writeFile(ciAbs, '# Hand-written copilot notes\n\nPrecious.\n', 'utf8');
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
+      { encoding: 'utf8', input: 'y\n' },
+    );
+    assert.equal(r.status, 0);
+    // The prompt names the file as hand-written and discloses the backup path.
+    assert.match(r.stdout, /is hand-written/);
+    assert.match(r.stdout, /\.harness-haircut-apply-backup/);
+    assert.match(r.stdout, /preserved 1 hand-written file\(s\)/);
+    // The original is recoverable; the path now holds the generated projection.
+    const backupAbs = join(
+      repo.root,
+      '.harness-haircut-apply-backup',
+      '.github__copilot-instructions.md',
+    );
+    assert.equal(existsSync(backupAbs), true);
+    assert.match(readFileSync(backupAbs, 'utf8'), /Precious/);
+    assert.match(readFileSync(ciAbs, 'utf8'), /@generated SignedSource/);
+  });
+
+  it('#40 refuses to overwrite a hand-written file under --non-interactive (exit 1, preserved)', async () => {
+    const repo = await canonicalRepo();
+    const ciAbs = join(repo.root, '.github', 'copilot-instructions.md');
+    await mkdir(dirname(ciAbs), { recursive: true });
+    await writeFile(ciAbs, '# Hand-written copilot notes\n\nPrecious.\n', 'utf8');
+    const r = spawnSync(
+      process.execPath,
+      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty', '--non-interactive'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /blocked 1 file\(s\)/);
+    assert.match(r.stdout, /unmanaged\t\S*copilot-instructions\.md/);
+    assert.match(readFileSync(ciAbs, 'utf8'), /Precious/);
+  });
 });
 
 describe('init E2E (spawn dist/bin.js)', () => {
@@ -818,7 +862,10 @@ describe('prompt lifecycle E2E (#39, spawn dist/bin.js)', () => {
     assert.equal(r.status, 0);
     assert.doesNotMatch(r.stderr, /readline was closed/);
     assert.match(r.stdout, /wrote 1 file\(s\)/);
-    assert.match(r.stdout, /blocked 1 edited file\(s\)/);
+    // #40 generalized the blocked header (edited/unmanaged share it). Both files
+    // here are generated-then-edited, so nothing is reported as `unmanaged`.
+    assert.match(r.stdout, /blocked 1 file\(s\)/);
+    assert.doesNotMatch(r.stdout, /unmanaged/);
   });
 });
 

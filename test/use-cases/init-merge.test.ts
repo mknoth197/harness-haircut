@@ -101,7 +101,7 @@ function runInit(root: string, options: RunInitOptions = {}): Promise<InitReport
         readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
         writeState: (state: ApplyState): void =>
           writer.write(APPLY_STATE_PATH, serializeState(state)),
-        flags: { allowDirty: true, dryRun: false, nonInteractive: true },
+        flags: { allowDirty: true, dryRun: false, nonInteractive: true, claimUnmanaged: true },
       }),
     flags: { dryRun: false, nonInteractive: false, adopt: false },
   });
@@ -122,7 +122,7 @@ function runApply(root: string) {
     confirm: () => Promise.resolve(false),
     readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
     writeState: (state: ApplyState): void => writer.write(APPLY_STATE_PATH, serializeState(state)),
-    flags: { allowDirty: true, dryRun: false, nonInteractive: true },
+    flags: { allowDirty: true, dryRun: false, nonInteractive: true, claimUnmanaged: true },
   });
 }
 

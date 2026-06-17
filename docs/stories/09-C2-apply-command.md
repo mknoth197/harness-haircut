@@ -19,12 +19,14 @@
 - **UN1.** If a target file's SignedSource header indicates user edits (`verifyHeader → 'edited'`), then the command shall prompt for overwrite, or fail with exit 1 when `--non-interactive` is set.
 - **UN2.** If a `merge-key` target file is malformed (invalid JSON/TOML), then the command shall fail with exit 3, naming the file.
 - **UN3.** If two adapters target the same path with `mode: overwrite`, then the command shall fail before any write.
+- **UN4.** (#40) If a target file verifies as `unmanaged` (an owned path holds a hand-written file with **no** SignedSource header), then the command shall **back up the original verbatim** under `.harness-haircut-apply-backup/` and **prompt** for overwrite, or **fail with exit 1** when `--non-interactive` is set — honoring [PRD §9](../PRD.md) "never overwrite an unmanaged file silently". `init`'s chained `apply` is the sole exception: it has already reconciled the pre-existing foreign files interactively (C3), so it claims those paths without a prompt or backup (`claimUnmanaged`).
 
 ## Acceptance criteria
 
 - [ ] Command at `src/commands/apply.ts`.
 - [ ] Idempotency test: `apply && audit` exits 0.
 - [ ] Tests cover: clean run, user-edited file prompt path, `--non-interactive` failure path, `--allow-dirty`, `--dry-run`, merge-key into existing JSON preserves foreign keys, conflict between adapters fails fast.
+- [ ] Tests cover the `unmanaged` takeover (UN4): interactive confirm → original backed up + path overwritten; interactive decline → blocked, original untouched; `--non-interactive` → exit 1, original untouched; `claimUnmanaged` (init's chained apply) → overwrites with no prompt/backup; the backup dir is not re-collected as canonical.
 - [ ] Git status check uses `git status --porcelain` shelled out (not a libgit dependency).
 
 ## Design note — headerless fully-owned JSON files (PRD §9 carve-out 2)

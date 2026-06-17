@@ -55,6 +55,7 @@ import type {
 import type { Attachment } from '../entities/ir.js';
 import { isSafeName } from '../entities/ir.js';
 import { APPLY_STATE_PATH } from '../entities/apply-state.js';
+import { INIT_BACKUP_DIR, sanitizeBackupName } from '../entities/backup.js';
 import type { ApplyReport } from './apply.js';
 import type {
   CandidateText,
@@ -1081,22 +1082,6 @@ function hookNotes(detected: { providerId: ProviderId; paths: string[] }[]): str
       'harness-haircut does not reverse-engineer provider hooks into canonical hooks in v1. ' +
       'Author canonical hooks under .agents/hooks/ and re-run `harness-haircut apply`.',
   ];
-}
-
-/**
- * F2 — the backup directory lives at the REPO ROOT, deliberately OUTSIDE
- * `.agents/`. The parser walk (`readRepoSnapshot` → `parseRepo`) only collects
- * `AGENTS.md` at any depth plus everything under root `.agents/`, so a
- * top-level `.harness-haircut-init-backup/` is never read back into IR or
- * re-projected by the follow-up `apply`. (Placing backups under `.agents/`
- * would be walked — the `.harness-state.json` skip lives in `parse-repo.ts`,
- * which this PR must not touch — so the root location is the safe choice.)
- */
-const INIT_BACKUP_DIR = '.harness-haircut-init-backup';
-
-/** Maps a source path to a flat, filesystem-safe backup filename. */
-function sanitizeBackupName(path: string): string {
-  return path.replace(/[/\\]/g, '__');
 }
 
 /**
