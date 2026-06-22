@@ -413,6 +413,27 @@ describe('audit E2E (spawn dist/bin.js)', () => {
     assert.match(r.stdout, /providers_disabled/);
     assert.match(r.stdout, /gemini/);
   });
+
+  it('#43 does NOT name gemini absent when .gemini/settings.json exists but lacks the key (gauntlet)', async () => {
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n\nUse npm test.\n' });
+    repos.push(repo);
+    spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
+      encoding: 'utf8',
+    });
+    // The file EXISTS but the user dropped the owned key → drift:differs, not a
+    // missing file. The absent-provider hint must not claim gemini "has no files".
+    await writeFile(
+      join(repo.root, '.gemini', 'settings.json'),
+      `${JSON.stringify({ theme: 'x' }, null, 2)}\n`,
+      'utf8',
+    );
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1); // still drift (the owned key diverges)
+    assert.doesNotMatch(r.stdout, /no files in this repo \(gemini\)/);
+    assert.doesNotMatch(r.stdout, /providers_disabled/);
+  });
 });
 
 describe('apply E2E (spawn dist/bin.js)', () => {

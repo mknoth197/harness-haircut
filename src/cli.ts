@@ -171,6 +171,8 @@ function helpText(): string {
     '                      (exit 3) fail; a warnings-only run exits 0 (the',
     '                      warnings still print). Use in CI to tolerate standing',
     '                      HH-Wxxx warnings the way the pre-commit hook does.',
+    '                      As an explicit per-run directive, "drift" overrides',
+    '                      both --strict and config warningsAsErrors for warnings.',
     '',
     'init options:',
     '  --dry-run           Print the planned canonical layout and exit without writing',
@@ -554,25 +556,26 @@ function renderAuditReport(report: AuditReport): string {
     }
   }
 
-  // #43: an ENABLED provider whose every expected file is missing has no
-  // presence in this repo. Name it with the `providers_disabled` remedy, so a
-  // no-Gemini repo's "missing .gemini/settings.json" drift is not read as
-  // "I must create Gemini files I don't want".
-  const byProvider = new Map<ProviderId, FileAudit[]>();
+  // #43: an ENABLED provider whose every expected file is MISSING ON DISK has
+  // no presence here. Name it with the `providers_disabled` remedy, so a
+  // no-Gemini repo's "missing .gemini/settings.json" drift is not read as "I
+  // must create Gemini files I don't want". A provider is absent iff it appears
+  // in the report (non-aliased) but none of its files exists — `drift:missing`
+  // now means the FILE is absent (a present-but-keyless merge file is
+  // `drift:differs`, gauntlet fix), so this no longer false-fires for a
+  // hand-kept `.gemini/settings.json` without the owned key.
+  const seen = new Set<ProviderId>();
+  const present = new Set<ProviderId>();
   for (const file of report.files) {
     if (file.status === 'aliased') {
       continue;
     }
-    const list = byProvider.get(file.providerId);
-    if (list === undefined) {
-      byProvider.set(file.providerId, [file]);
-    } else {
-      list.push(file);
+    seen.add(file.providerId);
+    if (file.status !== 'drift:missing') {
+      present.add(file.providerId);
     }
   }
-  const absentProviders = [...byProvider.entries()]
-    .filter(([, files]) => files.length > 0 && files.every((f) => f.status === 'drift:missing'))
-    .map(([id]) => id);
+  const absentProviders = [...seen].filter((id) => !present.has(id));
   if (absentProviders.length > 0) {
     lines.push('');
     lines.push(
