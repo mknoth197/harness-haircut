@@ -300,18 +300,9 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   let report: DoctorReport;
   try {
     // Read the raw config text (or null when absent) here in layer 4; the use
-    // case parses it so an invalid config surfaces as the doctor's exit 3.
+    // case parses it ONCE (driving both the exit-3 diagnosis and the snapshot's
+    // #42 `exclude` list, which it passes back into the snapshot factory below).
     const { raw, configPath, explicitConfigMissing } = await readConfigText(cwd, configFlag);
-    // #42: detection should honor the `exclude` globs too, but doctor reads RAW
-    // config (it diagnoses an invalid one rather than throwing). Best-effort
-    // parse for the snapshot only: a bad config yields no exclude here and is
-    // still reported by the use case.
-    let doctorExclude: string[] = [];
-    try {
-      doctorExclude = loadConfig(raw, configPath).exclude;
-    } catch {
-      // invalid config — the use case surfaces it as exit 3; no exclude to apply.
-    }
     // Reuse the same paid-call-free discovery `init --assist` uses, so doctor
     // reports the available AI-assist credential sources WITHOUT a model call.
     const assistSources = discoverCredentialSources(createDiscoveryProbes()).map((source) => ({
@@ -325,7 +316,7 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       nodeVersion: process.version,
       cwd,
       adapters: createAllAdapters(),
-      snapshot: () => readInitSnapshot(cwd, doctorExclude),
+      snapshot: (exclude) => readInitSnapshot(cwd, exclude),
       configRaw: raw,
       configPath,
       explicitConfigMissing,

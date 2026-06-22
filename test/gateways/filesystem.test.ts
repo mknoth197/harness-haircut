@@ -298,6 +298,47 @@ describe('readRepoSnapshot — #41 OS-junk / lockfile denylist', () => {
       await repo.cleanup();
     }
   });
+
+  it('skips a *.lock file (Cargo.lock) under a skill dir, but keeps the SKILL.md (gauntlet)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      '.agents/skills/foo/SKILL.md': '---\nname: foo\ndescription: d\n---\n',
+      '.agents/skills/foo/Cargo.lock': '# rust lockfile, not content',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/foo/SKILL.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does NOT prune a tracked directory whose name ends in a junk suffix (gauntlet: suffixes are file-only)', async () => {
+    // The editor-suffix denylist (.swp/.swo/~/.lock) describes FILES; a real
+    // directory named `notes~` or `vendor.lock` (with canonical content under
+    // it) must still be walked — pruning it would silently drop the content.
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'notes~/AGENTS.md': '# nested under a tilde-suffixed dir',
+      'vendor.lock/AGENTS.md': '# nested under a .lock-suffixed dir',
+      '.agents/instructions/scratch.swp': 'vim swap FILE — still skipped',
+      '.agents/instructions/keep.md': '---\nscope: "src/**"\n---\nkeep',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), [
+        '.agents/instructions/keep.md',
+        'AGENTS.md',
+        'notes~/AGENTS.md',
+        'vendor.lock/AGENTS.md',
+      ]);
+      // The swap FILE was still skipped (suffix applies to files); no W012/W010.
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
 });
 
 // #42: the `exclude` config glob list drops matches from canonical collection

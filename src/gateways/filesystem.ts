@@ -38,15 +38,24 @@ const NON_CANONICAL_JUNK_NAMES: ReadonlySet<string> = new Set([
   'bun.lockb',
 ]);
 
-/** Editor swap/backup suffixes (vim `.swp`/`.swo`, emacs/gedit `~`). */
-const NON_CANONICAL_JUNK_SUFFIXES: readonly string[] = ['.swp', '.swo', '~'];
+/**
+ * Suffix-matched junk: editor swap/backup files (vim `.swp`/`.swo`, emacs/gedit
+ * `~`) and the broad `*.lock` family (Cargo.lock, Gemfile.lock, poetry.lock,
+ * composer.lock, flake.lock, …) the exact-name set above does not enumerate.
+ * These describe FILES, never directories — so they are matched only in the
+ * file branch of `walk` (a legitimately-tracked directory named `build~` or
+ * `vendor.lock` must not be silently pruned).
+ */
+const NON_CANONICAL_JUNK_FILE_SUFFIXES: readonly string[] = ['.swp', '.swo', '~', '.lock'];
 
-/** True for OS/editor noise + lockfiles that must never be collected as canonical (#41). */
-function isNonCanonicalJunk(basename: string): boolean {
-  return (
-    NON_CANONICAL_JUNK_NAMES.has(basename) ||
-    NON_CANONICAL_JUNK_SUFFIXES.some((suffix) => basename.endsWith(suffix))
-  );
+/** Exact-name OS/VCS junk — checked for BOTH files and directories (e.g. `.Spotlight-V100`). */
+function isJunkName(basename: string): boolean {
+  return NON_CANONICAL_JUNK_NAMES.has(basename);
+}
+
+/** True for a junk FILE: an exact junk name OR an editor-swap / lockfile suffix (#41). */
+function isNonCanonicalJunkFile(basename: string): boolean {
+  return isJunkName(basename) || NON_CANONICAL_JUNK_FILE_SUFFIXES.some((s) => basename.endsWith(s));
 }
 
 export interface IgnorePattern {
@@ -401,7 +410,9 @@ async function walk(
         continue;
       }
       // #41: OS-junk directories (.Spotlight-V100, .Trashes) are never content.
-      if (isNonCanonicalJunk(entry.name)) {
+      // Exact names only — the suffix set (`.swp`/`~`/`.lock`) describes FILES,
+      // so it must not silently prune a tracked dir like `build~` or `x.lock`.
+      if (isJunkName(entry.name)) {
         continue;
       }
       // #42: a `exclude` config glob prunes the directory BEFORE the gitignore
@@ -429,8 +440,9 @@ async function walk(
       // #41: OS/editor noise + lockfiles are never canonical content — skip
       // BEFORE the ignore check so they fire neither HH-W010 (collected as an
       // unknown `.agents/` attachment) nor HH-W012 (whose "un-ignore it" advice
-      // is wrong for a gitignored `.DS_Store`/lockfile).
-      if (isNonCanonicalJunk(entry.name)) {
+      // is wrong for a gitignored `.DS_Store`/lockfile). Files match the full
+      // set (exact names + `.swp`/`.swo`/`~`/`.lock` suffixes).
+      if (isNonCanonicalJunkFile(entry.name)) {
         continue;
       }
       // #42: an `exclude` config glob drops the file BEFORE the gitignore check
@@ -499,10 +511,25 @@ function recordExcludedCanonicalDir(rel: string, state: WalkState): void {
  * surface as HH-W012. Compiled once via the same glob subset as `.gitignore`.
  */
 export async function readRepoSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
+  return snapshot(root, exclude, isCanonicalPath);
+}
+
+/**
+ * Shared snapshot core for both readers: load the root `.gitignore`, compile
+ * the config `exclude` globs once, walk under `include`, and finish. The two
+ * public readers differ ONLY in the `include` predicate (canonical-only vs the
+ * wider init set), so the gitignore/exclude compilation + WalkState boilerplate
+ * lives here once.
+ */
+async function snapshot(
+  root: string,
+  exclude: readonly string[],
+  include: (relPath: string) => boolean,
+): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
   const excludePatterns = parseGitignore(exclude.join('\n'));
   const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, excludePatterns, isCanonicalPath, state);
+  await walk(root, '', patterns, excludePatterns, include, state);
   return finishSnapshot(root, state);
 }
 
@@ -516,11 +543,7 @@ export async function readRepoSnapshot(root: string, exclude: readonly string[] 
  * `readRepoSnapshot` — so init never adopts a fixture's provider files.
  */
 export async function readInitSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
-  const patterns = await loadRootGitignore(root);
-  const excludePatterns = parseGitignore(exclude.join('\n'));
-  const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, excludePatterns, isInitPath, state);
-  return finishSnapshot(root, state);
+  return snapshot(root, exclude, isInitPath);
 }
 
 /** Sort the collected files + deduped excluded-canonical paths into a snapshot. */
