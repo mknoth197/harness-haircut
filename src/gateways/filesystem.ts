@@ -12,6 +12,52 @@ import { FileSystemError } from '../entities/errors.js';
 /** Skipped unconditionally, at any depth, regardless of .gitignore. */
 const ALWAYS_SKIPPED_DIRS: ReadonlySet<string> = new Set(['.git', 'node_modules', 'dist']);
 
+/**
+ * OS / editor noise files and package-manager lockfiles that are never
+ * AI-provider canonical content (#41). Skipped at any depth BEFORE the
+ * `.gitignore` check, so they neither enter the IR (no HH-W010 "unknown
+ * attachment under .agents/") nor — when a global rule like `.DS_Store` or
+ * `*.lock` ignores one under `.agents/` — surface as HH-W012, whose remedy is
+ * "un-ignore it": advising a user to un-ignore `.DS_Store` is actively wrong.
+ * This is the file-level analogue of `node_modules`/`dist` already being
+ * pruned unconditionally as directories — regenerable tooling, not content.
+ */
+const NON_CANONICAL_JUNK_NAMES: ReadonlySet<string> = new Set([
+  '.DS_Store',
+  '.AppleDouble',
+  'Thumbs.db',
+  'ehthumbs.db',
+  'desktop.ini',
+  'Desktop.ini',
+  '.Spotlight-V100',
+  '.Trashes',
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'bun.lockb',
+]);
+
+/**
+ * Suffix-matched junk: editor swap/backup files (vim `.swp`/`.swo`, emacs/gedit
+ * `~`) and the broad `*.lock` family (Cargo.lock, Gemfile.lock, poetry.lock,
+ * composer.lock, flake.lock, …) the exact-name set above does not enumerate.
+ * These describe FILES, never directories — so they are matched only in the
+ * file branch of `walk` (a legitimately-tracked directory named `build~` or
+ * `vendor.lock` must not be silently pruned).
+ */
+const NON_CANONICAL_JUNK_FILE_SUFFIXES: readonly string[] = ['.swp', '.swo', '~', '.lock'];
+
+/** Exact-name OS/VCS junk — checked for BOTH files and directories (e.g. `.Spotlight-V100`). */
+function isJunkName(basename: string): boolean {
+  return NON_CANONICAL_JUNK_NAMES.has(basename);
+}
+
+/** True for a junk FILE: an exact junk name OR an editor-swap / lockfile suffix (#41). */
+function isNonCanonicalJunkFile(basename: string): boolean {
+  return isJunkName(basename) || NON_CANONICAL_JUNK_FILE_SUFFIXES.some((s) => basename.endsWith(s));
+}
+
 export interface IgnorePattern {
   regex: RegExp;
   /** Pattern ended with '/': matches directories only. */
@@ -347,6 +393,7 @@ async function walk(
   absDir: string,
   relDir: string,
   patterns: readonly IgnorePattern[],
+  excludePatterns: readonly IgnorePattern[],
   include: (relPath: string) => boolean,
   state: WalkState,
 ): Promise<void> {
@@ -360,6 +407,18 @@ async function walk(
     const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
     if (entry.isDirectory()) {
       if (ALWAYS_SKIPPED_DIRS.has(entry.name)) {
+        continue;
+      }
+      // #41: OS-junk directories (.Spotlight-V100, .Trashes) are never content.
+      // Exact names only — the suffix set (`.swp`/`~`/`.lock`) describes FILES,
+      // so it must not silently prune a tracked dir like `build~` or `x.lock`.
+      if (isJunkName(entry.name)) {
+        continue;
+      }
+      // #42: a `exclude` config glob prunes the directory BEFORE the gitignore
+      // check — it is an explicit "not canonical here", not a lost source, so
+      // it earns no HH-W012 even when the path is also canonical-shaped.
+      if (isIgnored(rel, true, excludePatterns)) {
         continue;
       }
       if (isIgnored(rel, true, patterns)) {
@@ -376,8 +435,21 @@ async function walk(
         }
         continue;
       }
-      await walk(join(absDir, entry.name), rel, patterns, include, state);
+      await walk(join(absDir, entry.name), rel, patterns, excludePatterns, include, state);
     } else if (entry.isFile()) {
+      // #41: OS/editor noise + lockfiles are never canonical content — skip
+      // BEFORE the ignore check so they fire neither HH-W010 (collected as an
+      // unknown `.agents/` attachment) nor HH-W012 (whose "un-ignore it" advice
+      // is wrong for a gitignored `.DS_Store`/lockfile). Files match the full
+      // set (exact names + `.swp`/`.swo`/`~`/`.lock` suffixes).
+      if (isNonCanonicalJunkFile(entry.name)) {
+        continue;
+      }
+      // #42: an `exclude` config glob drops the file BEFORE the gitignore check
+      // (explicit "not canonical", so no HH-W012 even if canonical-shaped).
+      if (isIgnored(rel, false, excludePatterns)) {
+        continue;
+      }
       // Symlinks and special files are skipped: following links could
       // escape the repo or cycle, and canonical sources are plain files.
       if (isIgnored(rel, false, patterns)) {
@@ -432,11 +504,32 @@ function recordExcludedCanonicalDir(rel: string, state: WalkState): void {
  * When a canonical-shaped path is excluded by an ignore rule it is reported
  * in `excludedCanonicalPaths` (sorted) rather than silently dropped; the
  * `parseRepo` use case maps those into `HH-W012` warnings (EV1).
+ *
+ * `exclude` (#42) is the config `exclude` list — gitignore-style globs whose
+ * matches are dropped from collection BEFORE the ignore check, so they are not
+ * detected, parsed, or projected into, and (unlike a `.gitignore` match) never
+ * surface as HH-W012. Compiled once via the same glob subset as `.gitignore`.
  */
-export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
+export async function readRepoSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
+  return snapshot(root, exclude, isCanonicalPath);
+}
+
+/**
+ * Shared snapshot core for both readers: load the root `.gitignore`, compile
+ * the config `exclude` globs once, walk under `include`, and finish. The two
+ * public readers differ ONLY in the `include` predicate (canonical-only vs the
+ * wider init set), so the gitignore/exclude compilation + WalkState boilerplate
+ * lives here once.
+ */
+async function snapshot(
+  root: string,
+  exclude: readonly string[],
+  include: (relPath: string) => boolean,
+): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
+  const excludePatterns = parseGitignore(exclude.join('\n'));
   const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, isCanonicalPath, state);
+  await walk(root, '', patterns, excludePatterns, include, state);
   return finishSnapshot(root, state);
 }
 
@@ -446,12 +539,11 @@ export async function readRepoSnapshot(root: string): Promise<RepoSnapshot> {
  * candidate recovery (see `isInitPath`). Same `.gitignore`/skip rules and
  * sorting as `readRepoSnapshot`; paths are repo-relative POSIX, BOM stripped.
  * Excluded canonical sources are still reported in `excludedCanonicalPaths`.
+ * `exclude` (#42) drops config-excluded paths from collection, exactly as in
+ * `readRepoSnapshot` — so init never adopts a fixture's provider files.
  */
-export async function readInitSnapshot(root: string): Promise<RepoSnapshot> {
-  const patterns = await loadRootGitignore(root);
-  const state: WalkState = { out: [], excludedCanonical: [] };
-  await walk(root, '', patterns, isInitPath, state);
-  return finishSnapshot(root, state);
+export async function readInitSnapshot(root: string, exclude: readonly string[] = []): Promise<RepoSnapshot> {
+  return snapshot(root, exclude, isInitPath);
 }
 
 /** Sort the collected files + deduped excluded-canonical paths into a snapshot. */

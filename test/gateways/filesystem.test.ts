@@ -245,6 +245,158 @@ describe('readRepoSnapshot', () => {
   });
 });
 
+// #41: OS/editor noise + lockfiles are never canonical content. The original
+// dogfood bug: a global `.DS_Store` rule made `.agents/.DS_Store` fire HH-W012
+// advising the user to un-ignore their Finder junk. They must be skipped before
+// the ignore check — collected by neither the snapshot nor the W012 tracker.
+describe('readRepoSnapshot — #41 OS-junk / lockfile denylist', () => {
+  it('does not collect a gitignored .agents/.DS_Store nor surface HH-W012 (the dogfood repro)', async () => {
+    const repo = await mkTempRepo({
+      '.gitignore': '.DS_Store\n',
+      'AGENTS.md': '# root',
+      '.agents/.DS_Store': 'macOS Finder junk',
+      '.agents/instructions/arch.md': '---\nscope: "src/**"\n---\nbody',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/instructions/arch.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does not collect OS junk under .agents/ even when NOT gitignored (no HH-W010 attachment)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      '.agents/.DS_Store': 'macOS Finder junk',
+      '.agents/skills/foo/Thumbs.db': 'Windows thumbnail cache',
+      '.agents/skills/foo/SKILL.md': '---\nname: foo\ndescription: d\n---\n',
+      '.agents/instructions/arch.swp': 'vim swap file',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/foo/SKILL.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does not advise un-ignoring a gitignored lockfile inside a skill dir', async () => {
+    const repo = await mkTempRepo({
+      '.gitignore': 'package-lock.json\n',
+      'AGENTS.md': '# root',
+      '.agents/skills/foo/SKILL.md': '---\nname: foo\ndescription: d\n---\n',
+      '.agents/skills/foo/package-lock.json': '{"lockfileVersion":3}',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/foo/SKILL.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('skips a *.lock file (Cargo.lock) under a skill dir, but keeps the SKILL.md (gauntlet)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      '.agents/skills/foo/SKILL.md': '---\nname: foo\ndescription: d\n---\n',
+      '.agents/skills/foo/Cargo.lock': '# rust lockfile, not content',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['.agents/skills/foo/SKILL.md', 'AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does NOT prune a tracked directory whose name ends in a junk suffix (gauntlet: suffixes are file-only)', async () => {
+    // The editor-suffix denylist (.swp/.swo/~/.lock) describes FILES; a real
+    // directory named `notes~` or `vendor.lock` (with canonical content under
+    // it) must still be walked — pruning it would silently drop the content.
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'notes~/AGENTS.md': '# nested under a tilde-suffixed dir',
+      'vendor.lock/AGENTS.md': '# nested under a .lock-suffixed dir',
+      '.agents/instructions/scratch.swp': 'vim swap FILE — still skipped',
+      '.agents/instructions/keep.md': '---\nscope: "src/**"\n---\nkeep',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), [
+        '.agents/instructions/keep.md',
+        'AGENTS.md',
+        'notes~/AGENTS.md',
+        'vendor.lock/AGENTS.md',
+      ]);
+      // The swap FILE was still skipped (suffix applies to files); no W012/W010.
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+});
+
+// #42: the `exclude` config glob list drops matches from canonical collection
+// BEFORE the ignore check, so a tracked fixture's provider file is neither
+// collected (→ not detected, not parsed, not projected into) nor surfaced as a
+// lost canonical source (no HH-W012 — the exclusion is explicit, not accidental).
+describe('readRepoSnapshot — #42 exclude config globs', () => {
+  it('drops a tracked fixture AGENTS.md and fires no HH-W012', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'evals/fixtures/codex/cerebro-skill/AGENTS.md': '# Fixture\n\nFixture content.\n',
+      'evals/fixtures/codex/cerebro-skill-partial/AGENTS.md': '# Partial fixture\n',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root, ['evals/fixtures/**']);
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md']);
+      // The fixture AGENTS.md files are canonical-SHAPED, but excluded by config
+      // is an explicit "not canonical" — never an HH-W012 "un-ignore it".
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('collects the fixture AGENTS.md when no exclude glob is configured (default)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'evals/fixtures/codex/cerebro-skill/AGENTS.md': '# Fixture\n',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), [
+        'AGENTS.md',
+        'evals/fixtures/codex/cerebro-skill/AGENTS.md',
+      ]);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('a single-segment exclude name drops a directory subtree at any depth', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'pkg/__fixtures__/AGENTS.md': '# fixture',
+      'pkg/real/AGENTS.md': '# real nested',
+    });
+    try {
+      // Unanchored basename match (gitignore subset): `__fixtures__` matches the
+      // dir at any depth; the real nested AGENTS.md is untouched.
+      const snapshot = await readRepoSnapshot(repo.root, ['__fixtures__']);
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md', 'pkg/real/AGENTS.md']);
+      assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+});
+
 describe('isIgnored (pure matcher)', () => {
   it('negation flips an earlier exclusion (last matching pattern wins)', () => {
     assert.equal(ignored('*.md\n', 'AGENTS.md'), true);

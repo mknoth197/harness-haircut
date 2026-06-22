@@ -300,7 +300,8 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   let report: DoctorReport;
   try {
     // Read the raw config text (or null when absent) here in layer 4; the use
-    // case parses it so an invalid config surfaces as the doctor's exit 3.
+    // case parses it ONCE (driving both the exit-3 diagnosis and the snapshot's
+    // #42 `exclude` list, which it passes back into the snapshot factory below).
     const { raw, configPath, explicitConfigMissing } = await readConfigText(cwd, configFlag);
     // Reuse the same paid-call-free discovery `init --assist` uses, so doctor
     // reports the available AI-assist credential sources WITHOUT a model call.
@@ -315,7 +316,7 @@ async function runDoctor(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       nodeVersion: process.version,
       cwd,
       adapters: createAllAdapters(),
-      snapshot: () => readInitSnapshot(cwd),
+      snapshot: (exclude) => readInitSnapshot(cwd, exclude),
       configRaw: raw,
       configPath,
       explicitConfigMissing,
@@ -360,6 +361,7 @@ function renderDoctorReport(report: DoctorReport): string {
     lines.push('config:');
     lines.push(`  providers     ${Array.isArray(enabled) ? enabled.join(', ') : enabled}`);
     lines.push(`  disabled      ${report.config.providersDisabled.join(', ') || '(none)'}`);
+    lines.push(`  exclude       ${report.config.exclude.join(', ') || '(none)'}`);
     lines.push(`  gemini.mode   ${report.config.gemini.mode}`);
     lines.push(`  warningsAsErrors ${report.config.warningsAsErrors}`);
   }
@@ -472,7 +474,7 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       return ctx;
     };
     report = await audit({
-      parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd) }),
+      parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd, config.exclude) }),
       adapters,
       reader,
       contextFor,
@@ -668,7 +670,7 @@ async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       return ctx;
     };
     report = await apply({
-      parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd) }),
+      parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd, config.exclude) }),
       adapters,
       reader,
       writer,
@@ -1128,7 +1130,7 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
     }
 
     report = await init({
-      snapshot: () => readInitSnapshot(cwd),
+      snapshot: () => readInitSnapshot(cwd, config.exclude),
       reader,
       writer,
       adapters,
@@ -1142,7 +1144,7 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       // a non-interactive stub keeps it from blocking on a surprise.
       apply: () =>
         apply({
-          parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd) }),
+          parse: () => parseRepo({ readRepo: () => readRepoSnapshot(cwd, config.exclude) }),
           adapters,
           reader,
           writer,

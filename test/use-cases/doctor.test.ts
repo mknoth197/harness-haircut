@@ -58,6 +58,37 @@ describe('doctor()', () => {
     assert.equal(report.exitCode, 0);
   });
 
+  // gauntlet fix10: doctor parses the config ONCE and threads its `exclude`
+  // into the snapshot factory (no second best-effort parse + swallowed error).
+  it('threads config.exclude into the snapshot factory (single parse)', async () => {
+    let received: readonly string[] | undefined;
+    const report = await doctor({
+      ...baseDeps,
+      snapshot: (exclude) => {
+        received = exclude;
+        return Promise.resolve(snapshotOf({}));
+      },
+      configRaw: JSON.stringify({ exclude: ['evals/fixtures/**'] }),
+    });
+    assert.equal(report.exitCode, 0);
+    assert.deepEqual(received, ['evals/fixtures/**']);
+  });
+
+  it('passes an empty exclude to the snapshot when the config is invalid (exit 3, no crash)', async () => {
+    let received: readonly string[] | undefined;
+    const report = await doctor({
+      ...baseDeps,
+      snapshot: (exclude) => {
+        received = exclude;
+        return Promise.resolve(snapshotOf({}));
+      },
+      configRaw: '{ not json',
+    });
+    assert.equal(report.exitCode, 3);
+    assert.equal(report.config, null);
+    assert.deepEqual(received, []);
+  });
+
   it('warns when an explicit --config path does not exist', async () => {
     const report = await doctor({
       ...baseDeps,

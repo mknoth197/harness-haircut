@@ -395,6 +395,8 @@ describe('parseRepo — hooks', () => {
 
   it('treats non-hook-shaped files in .agents/hooks/ as attachments with HH-W010', async () => {
     const { ir, warnings } = await parseFixture({
+      // #41: `.DS_Store` is OS junk — the walk skips it BEFORE collection, so it
+      // is no longer an HH-W010 attachment (it was bad advice to flag it at all).
       '.agents/hooks/.DS_Store': 'finder junk',
       '.agents/hooks/README.md': '# about these hooks\n',
       '.agents/hooks/.gitkeep': '',
@@ -405,14 +407,13 @@ describe('parseRepo — hooks', () => {
     assert.deepEqual(
       ir.attachments.map((a) => a.path),
       [
-        '.agents/hooks/.DS_Store',
         '.agents/hooks/.gitkeep',
         '.agents/hooks/README.md',
         '.agents/hooks/pre-tool-use.lint.sh.bak',
         '.agents/hooks/x.toml',
       ],
     );
-    assert.equal(warnings.length, 5);
+    assert.equal(warnings.length, 4);
     assert.equal(warnings.every((warning) => warning.code === 'HH-W010'), true);
   });
 
