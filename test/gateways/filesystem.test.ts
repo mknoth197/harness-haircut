@@ -408,6 +408,27 @@ describe('readInitSnapshot / readRepoSnapshot — #45 skipped symlinks', () => {
       await repo.cleanup();
     }
   });
+
+  it('records a symlinked COLLECTION ROOT (.claude) — include(rel) is false but include(rel + "/") catches it (gauntlet)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'shared-claude/skills/demo/SKILL.md': '---\nname: demo\ndescription: d\n---\nBody.\n',
+    });
+    try {
+      // The whole `.claude` provider root is a symlink (dotfiles-style). The
+      // walk never follows it, and the bare path `.claude` is not itself a
+      // collected path — but its descendants would be, so it must be recorded.
+      await symlink(join('shared-claude'), join(repo.root, '.claude'));
+      const snapshot = await readInitSnapshot(repo.root);
+      assert.ok(
+        (snapshot.skippedSymlinks ?? []).includes('.claude'),
+        'a symlinked .claude collection root must be recorded',
+      );
+      assert.equal(snapshot.files.some((f) => f.path.startsWith('.claude/')), false);
+    } finally {
+      await repo.cleanup();
+    }
+  });
 });
 
 describe('isIgnored (pure matcher)', () => {

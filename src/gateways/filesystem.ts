@@ -482,7 +482,13 @@ async function walk(
       if (isIgnored(rel, false, excludePatterns) || isIgnored(rel, false, patterns)) {
         continue;
       }
-      if (include(rel)) {
+      // Record the link when its OWN path would be collected (a symlinked file),
+      // OR when it is a collection ROOT whose descendants would be — e.g. a
+      // symlinked `.claude` / `.github/instructions` / `.agents` dir, for which
+      // `include(rel)` is false (the bare root is not itself a collected path)
+      // but `include(rel + '/')` is true (gauntlet/Codex). Without the second
+      // probe a symlinked root was still silently omitted — the #45 gap.
+      if (include(rel) || include(`${rel}/`)) {
         state.skippedSymlinks.push(rel);
       }
     }
