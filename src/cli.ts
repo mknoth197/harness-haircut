@@ -998,7 +998,8 @@ async function buildAssistResolver(opts: {
   // Discover, then narrow to approved endpoints (C5 OPT1) and order by the
   // configured provider preference (pre-select only, never auto-run).
   const endpointPolicy = { policy: assist.endpointPolicy, approved: assist.approved };
-  let sources = discoverCredentialSources(createDiscoveryProbes()).filter(
+  const discovered = discoverCredentialSources(createDiscoveryProbes());
+  let sources = discovered.filter(
     (source) => checkEndpointPolicy(endpointPolicy, source.provider).allowed,
   );
   if (assist.provider !== null) {
@@ -1010,14 +1011,32 @@ async function buildAssistResolver(opts: {
   }
 
   if (sources.length === 0) {
+    // #46: distinguish a genuine NO-credentials situation from an endpoint-POLICY
+    // refusal. When discovery DID find sources but the approved-endpoint
+    // allowlist filtered every one, blaming "no credential source" sends the
+    // user chasing CLI logins / env keys instead of their org's
+    // `init.assist.endpointPolicy` — the exact admin-locked-down scenario the
+    // policy exists for.
+    const policyFilteredAll = discovered.length > 0;
+    const policyMessage =
+      `--assist: ${discovered.length} credential source(s) discovered, but none is on the ` +
+      `approved-endpoint allowlist (init.assist.endpointPolicy = ${JSON.stringify(assist.endpointPolicy)}` +
+      `${assist.approved.length > 0 ? `, approved: ${assist.approved.join(', ')}` : ', approved is empty'}). ` +
+      'Add the provider to init.assist.approved, relax the policy, or drop --assist';
     if (assist.onUnavailable === 'fail') {
       throw new AssistBackendUnavailableError(
-        '--assist found no usable AI credential source. Set a provider API key ' +
-          '(e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) or log in to a ' +
-          'provider CLI (claude / codex / gemini / copilot), or drop --assist.',
+        policyFilteredAll
+          ? `${policyMessage}.`
+          : '--assist found no usable AI credential source. Set a provider API key ' +
+              '(e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) or log in to a ' +
+              'provider CLI (claude / codex / gemini / copilot), or drop --assist.',
       );
     }
-    warn('--assist found no AI credential source; using the deterministic resolver.');
+    warn(
+      policyFilteredAll
+        ? `${policyMessage}; using the deterministic resolver.`
+        : '--assist found no AI credential source; using the deterministic resolver.',
+    );
     return null;
   }
 

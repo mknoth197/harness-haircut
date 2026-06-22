@@ -870,6 +870,50 @@ describe('init --assist (C4 CLI)', () => {
     assert.equal(auditRun.status, 0);
     assert.match(auditRun.stdout, /clean/);
   });
+
+  // #46: an `endpointPolicy: "approved-only"` (no allowlist) refusal is a POLICY
+  // block, NOT missing credentials. Scrub the env, then set ONE api key so
+  // discovery finds exactly one source which the empty allowlist then filters.
+  it('(f) #46 policy refusal (approved-only) is reported distinctly, not as "no credential source"', async () => {
+    const repo = await contradictingRepo();
+    await writeFile(
+      join(repo.root, 'harness-haircut.config.json'),
+      `${JSON.stringify({ init: { assist: { enabled: true, endpointPolicy: 'approved-only' } } })}\n`,
+      'utf8',
+    );
+    const env = await scrubbedEnv();
+    env['ANTHROPIC_API_KEY'] = 'sk-ant-test-not-a-real-key';
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '1\n', // fallback resolver handles the surviving contradiction.
+      env,
+    });
+    assert.equal(r.status, 0);
+    // The message names the POLICY, not missing credentials.
+    assert.match(r.stderr, /approved-endpoint allowlist/);
+    assert.match(r.stderr, /endpointPolicy/);
+    assert.doesNotMatch(r.stderr, /found no AI credential source/);
+    assert.equal(existsSync(join(repo.root, 'AGENTS.md')), true);
+  });
+
+  it('(g) #46 policy refusal under onUnavailable:"fail" exits 3 naming the policy', async () => {
+    const repo = await contradictingRepo();
+    await writeFile(
+      join(repo.root, 'harness-haircut.config.json'),
+      `${JSON.stringify({ init: { assist: { enabled: true, onUnavailable: 'fail', endpointPolicy: 'approved-only' } } })}\n`,
+      'utf8',
+    );
+    const env = await scrubbedEnv();
+    env['ANTHROPIC_API_KEY'] = 'sk-ant-test-not-a-real-key';
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '',
+      env,
+    });
+    assert.equal(r.status, 3);
+    assert.match(r.stderr, /approved-endpoint allowlist/);
+    assert.doesNotMatch(r.stderr, /no usable AI credential source/);
+  });
 });
 
 /**
