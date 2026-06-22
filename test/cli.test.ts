@@ -1124,6 +1124,25 @@ describe('#47 CLI polish E2E (spawn dist/bin.js)', () => {
     assert.match(r.stdout, /Choice \[1-3\]: 1\r?\n/);
   });
 
+  it('(2b) EOF while a prompt is pending still terminates the prompt line (gauntlet/Codex)', async () => {
+    // `printf '' | init` on a contradiction: EOF resolves the PENDING waiter via
+    // the close handler — which previously wrote no newline, so the refusal ran
+    // onto the prompt line ("Choice [1-3]: refused — …").
+    const repo = await mkTempRepo({
+      'CLAUDE.md': '@AGENTS.md\n\n# Project\nUse npm test.\n',
+      '.github/copilot-instructions.md': '# Project\nUse pnpm test.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {
+      encoding: 'utf8',
+      input: '', // EOF immediately, while the Choice prompt is pending.
+    });
+    assert.equal(r.status, 1); // unresolved contradiction → refused
+    // The prompt line is terminated; the refusal/detection output starts fresh.
+    assert.match(r.stdout, /Choice \[1-3\]:\s*\r?\n/);
+    assert.doesNotMatch(r.stdout, /Choice \[1-3\]: *(refused|detected)/);
+  });
+
   it('(3) init surfaces the chained apply warnings instead of swallowing them', async () => {
     const repo = await mkTempRepo({
       'AGENTS.md': '# Project\n\nUse npm test.\n',

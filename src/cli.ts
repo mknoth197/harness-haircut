@@ -21,6 +21,7 @@ import type {
   EgressDestination,
   EgressFlags,
   EgressPlan,
+  Warning,
 } from './entities/index.js';
 import {
   createDiscoveryProbes,
@@ -526,6 +527,21 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   return report.exitCode;
 }
 
+/**
+ * One formatted line per warning — `<indent><code>\t<message> (<where>)`, where
+ * `where` is the warning's canonical path or provider id when present. Shared by
+ * the audit / apply / init renderers (gauntlet/Thermos: the loop was previously
+ * copy-pasted verbatim in all three). The header line + indent stay with each
+ * caller, since those differ.
+ */
+function warningLines(warnings: readonly Warning[], indent: string): string[] {
+  return warnings.map((warning) => {
+    const where = warning.canonicalPath ?? warning.providerId ?? '';
+    const suffix = where === '' ? '' : ` (${where})`;
+    return `${indent}${warning.code}\t${warning.message}${suffix}`;
+  });
+}
+
 function renderAuditReport(report: AuditReport): string {
   const lines: string[] = [];
   // `aliased` (#35) is neither clean nor drift — those paths were skipped, so
@@ -586,11 +602,7 @@ function renderAuditReport(report: AuditReport): string {
   if (report.warnings.length > 0) {
     lines.push('');
     lines.push(`${report.warnings.length} warning(s):`);
-    for (const warning of report.warnings) {
-      const where = warning.canonicalPath ?? warning.providerId ?? '';
-      const suffix = where === '' ? '' : ` (${where})`;
-      lines.push(`  ${warning.code}\t${warning.message}${suffix}`);
-    }
+    lines.push(...warningLines(report.warnings, '  '));
   }
 
   lines.push('');
@@ -655,7 +667,16 @@ function createStdinPrompt(
     });
     rl.on('close', () => {
       closed = true;
-      for (const waiter of waiters.splice(0)) {
+      const pending = waiters.splice(0);
+      // gauntlet (Codex): EOF arriving while a prompt is already pending is
+      // resolved HERE, not via the prompt()/buffered path — so the newline that
+      // path writes was missing, and the next output ran onto the prompt line
+      // (`printf '' | … init` → "Choice [1-3]: refused — …"). On non-TTY input,
+      // terminate the dangling prompt line once before resolving the waiter(s).
+      if (!isTty && pending.length > 0) {
+        output.write('\n');
+      }
+      for (const waiter of pending) {
         waiter('');
       }
     });
@@ -840,11 +861,7 @@ function renderApplyReport(report: ApplyReport): string {
   if (report.warnings.length > 0) {
     lines.push('');
     lines.push(`${report.warnings.length} warning(s):`);
-    for (const warning of report.warnings) {
-      const where = warning.canonicalPath ?? warning.providerId ?? '';
-      const suffix = where === '' ? '' : ` (${where})`;
-      lines.push(`  ${warning.code}\t${warning.message}${suffix}`);
-    }
+    lines.push(...warningLines(report.warnings, '  '));
   }
 
   lines.push('');
@@ -1362,11 +1379,7 @@ function renderInitReport(report: InitReport): string {
     // CI template tolerates them (see `audit --fail-on drift`, #43).
     if (report.apply.warnings.length > 0) {
       lines.push(`  ${report.apply.warnings.length} warning(s) from the projection (these are standing — not new drift):`);
-      for (const warning of report.apply.warnings) {
-        const where = warning.canonicalPath ?? warning.providerId ?? '';
-        const suffix = where === '' ? '' : ` (${where})`;
-        lines.push(`    ${warning.code}\t${warning.message}${suffix}`);
-      }
+      lines.push(...warningLines(report.apply.warnings, '    '));
     }
   }
 
