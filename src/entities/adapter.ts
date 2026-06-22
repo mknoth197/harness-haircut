@@ -111,6 +111,16 @@ export interface RepoSnapshot {
    * Sorted; absent or empty when nothing canonical was excluded.
    */
   excludedCanonicalPaths?: string[];
+  /**
+   * #45: repo-relative POSIX paths of SYMLINKED entries the walk reached at a
+   * collected location but did not follow. The walk never follows symlinks (a
+   * link can escape the repo or cycle — the pen-test security stance), so a
+   * symlinked provider file/dir (e.g. a `.claude/skills/<name>` that links into
+   * `.agents/skills/`) is invisible to import. `init` surfaces these so the
+   * skip is a visible note instead of a silent omission. Sorted; absent or
+   * empty when no relevant symlink was skipped.
+   */
+  skippedSymlinks?: string[];
 }
 
 export interface ExistingProviderConfig {

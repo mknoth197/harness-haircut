@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readRepoSnapshot } from '../../dist/index.js';
+import { symlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { readRepoSnapshot, readInitSnapshot } from '../../dist/index.js';
 import { isIgnored, parseGitignore } from '../../dist/gateways/filesystem.js';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
 
@@ -391,6 +393,79 @@ describe('readRepoSnapshot — #42 exclude config globs', () => {
       const snapshot = await readRepoSnapshot(repo.root, ['__fixtures__']);
       assert.deepEqual(paths(snapshot.files), ['AGENTS.md', 'pkg/real/AGENTS.md']);
       assert.deepEqual(snapshot.excludedCanonicalPaths ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+});
+
+// #45: the walk never follows a symlink, so a symlinked provider file/dir is
+// invisible to import. It must be RECORDED (skippedSymlinks) so init can note
+// the skip rather than dropping it silently.
+describe('readInitSnapshot / readRepoSnapshot — #45 skipped symlinks', () => {
+  it('records a symlinked .claude/skills entry without following it (init snapshot)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'elsewhere/demo/SKILL.md': '---\nname: demo\ndescription: d\n---\nBody.\n',
+      '.claude/skills/keep.md': 'placeholder to create the dir\n',
+    });
+    try {
+      await symlink(join('..', '..', 'elsewhere', 'demo'), join(repo.root, '.claude', 'skills', 'demo'));
+      const snapshot = await readInitSnapshot(repo.root);
+      assert.deepEqual(snapshot.skippedSymlinks, ['.claude/skills/demo']);
+      // The symlink's content is NOT collected (the walk never follows it).
+      assert.equal(snapshot.files.some((f) => f.path.startsWith('.claude/skills/demo')), false);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('records a symlinked canonical .agents/ entry (repo snapshot) and does not follow it', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      '.agents/skills/real/SKILL.md': '---\nname: real\ndescription: d\n---\n',
+    });
+    try {
+      await symlink(join('..', 'real'), join(repo.root, '.agents', 'skills', 'linked'));
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.ok((snapshot.skippedSymlinks ?? []).includes('.agents/skills/linked'));
+      assert.equal(snapshot.files.some((f) => f.path.startsWith('.agents/skills/linked')), false);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('does not record a symlink the user gitignored (skipped quietly)', async () => {
+    const repo = await mkTempRepo({
+      '.gitignore': '.claude/skills/demo\n',
+      'AGENTS.md': '# root',
+      '.claude/skills/keep.md': 'placeholder\n',
+    });
+    try {
+      await symlink(join('..', '..', 'nowhere'), join(repo.root, '.claude', 'skills', 'demo'));
+      const snapshot = await readInitSnapshot(repo.root);
+      assert.deepEqual(snapshot.skippedSymlinks ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
+
+  it('records a symlinked COLLECTION ROOT (.claude) — include(rel) is false but include(rel + "/") catches it (gauntlet)', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# root',
+      'shared-claude/skills/demo/SKILL.md': '---\nname: demo\ndescription: d\n---\nBody.\n',
+    });
+    try {
+      // The whole `.claude` provider root is a symlink (dotfiles-style). The
+      // walk never follows it, and the bare path `.claude` is not itself a
+      // collected path — but its descendants would be, so it must be recorded.
+      await symlink(join('shared-claude'), join(repo.root, '.claude'));
+      const snapshot = await readInitSnapshot(repo.root);
+      assert.ok(
+        (snapshot.skippedSymlinks ?? []).includes('.claude'),
+        'a symlinked .claude collection root must be recorded',
+      );
+      assert.equal(snapshot.files.some((f) => f.path.startsWith('.claude/')), false);
     } finally {
       await repo.cleanup();
     }

@@ -856,6 +856,20 @@ export async function init(deps: InitDeps): Promise<InitReport> {
 
   // ---- carried-over hooks note (scoped deviation: not reverse-engineered) ----
   const notes = hookNotes(detected);
+  // #45: the snapshot walk never follows symlinks (a link can escape the repo
+  // or cycle — the pen-test stance), so a symlinked provider file/dir is
+  // invisible to import. Surface each one as a note so the skip is visible
+  // rather than a silent omission (e.g. a `.claude/skills/<name>` that links
+  // into `.agents/skills/` would otherwise just vanish from the consolidation).
+  const skippedSymlinks = snapshot.skippedSymlinks ?? [];
+  if (skippedSymlinks.length > 0) {
+    notes.push(
+      `skipped ${skippedSymlinks.length} symlinked path(s) — symlinks are not followed, so ` +
+        `their content was NOT imported (${[...skippedSymlinks].sort().join(', ')}). Replace a ` +
+        'symlink with the real file/directory to bring it under canonical ownership, or ignore ' +
+        'this if the link points at content already collected elsewhere.',
+    );
+  }
   // C4: surface which candidate's sibling attachments an AI-merged skill carried.
   for (const note of mergeSiblingNotes) {
     notes.push(note);

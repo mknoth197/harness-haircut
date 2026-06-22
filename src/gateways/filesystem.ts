@@ -387,6 +387,8 @@ interface WalkState {
   out: FileSnapshot[];
   /** Canonical-shaped paths excluded by an ignore rule (drives HH-W012). */
   excludedCanonical: string[];
+  /** #45: symlinked entries at a collected location the walk did not follow. */
+  skippedSymlinks: string[];
 }
 
 async function walk(
@@ -477,6 +479,31 @@ async function walk(
         content = content.slice(1);
       }
       state.out.push({ path: rel, content });
+    } else if (entry.isSymbolicLink()) {
+      // #45: the walk NEVER follows a symlink (it could escape the repo or
+      // cycle — the pen-test stance). A symlinked file/dir at a location we
+      // would otherwise collect is therefore invisible to import. Record it
+      // (when it passes the same junk/ignore/exclude/include gates a real entry
+      // would) so `init` can surface a visible note instead of silently
+      // dropping it. Junk / ignored / config-excluded links are skipped quietly
+      // — the user already excluded them. A symlink is treated as a file for
+      // matching (git tracks the link itself, not its target), so it uses the
+      // file-level junk predicate (exact names + `.swp`/`~`/`.lock` suffixes).
+      if (isNonCanonicalJunkFile(entry.name)) {
+        continue;
+      }
+      if (isIgnored(rel, false, excludePatterns) || isIgnored(rel, false, patterns)) {
+        continue;
+      }
+      // Record the link when its OWN path would be collected (a symlinked file),
+      // OR when it is a collection ROOT whose descendants would be — e.g. a
+      // symlinked `.claude` / `.github/instructions` / `.agents` dir, for which
+      // `include(rel)` is false (the bare root is not itself a collected path)
+      // but `include(rel + '/')` is true (gauntlet/Codex). Without the second
+      // probe a symlinked root was still silently omitted — the #45 gap.
+      if (include(rel) || include(`${rel}/`)) {
+        state.skippedSymlinks.push(rel);
+      }
     }
   }
 }
@@ -528,7 +555,7 @@ async function snapshot(
 ): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
   const excludePatterns = parseGitignore(exclude.join('\n'));
-  const state: WalkState = { out: [], excludedCanonical: [] };
+  const state: WalkState = { out: [], excludedCanonical: [], skippedSymlinks: [] };
   await walk(root, '', patterns, excludePatterns, include, state);
   return finishSnapshot(root, state);
 }
@@ -546,10 +573,11 @@ export async function readInitSnapshot(root: string, exclude: readonly string[] 
   return snapshot(root, exclude, isInitPath);
 }
 
-/** Sort the collected files + deduped excluded-canonical paths into a snapshot. */
+/** Sort the collected files + deduped excluded-canonical / skipped-symlink paths into a snapshot. */
 function finishSnapshot(root: string, state: WalkState): RepoSnapshot {
   const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
   state.out.sort((a, b) => cmp(a.path, b.path));
   const excludedCanonicalPaths = [...new Set(state.excludedCanonical)].sort(cmp);
-  return { root, files: state.out, excludedCanonicalPaths };
+  const skippedSymlinks = [...new Set(state.skippedSymlinks)].sort(cmp);
+  return { root, files: state.out, excludedCanonicalPaths, skippedSymlinks };
 }

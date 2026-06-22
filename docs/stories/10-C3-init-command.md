@@ -48,5 +48,9 @@ When a contradiction is resolved by choosing one candidate (or skipping), the ot
 - **Reports** the backups: `InitReport.backups: string[]` carries the backup paths (surfaced by `--json`), `renderInitReport` lists which source paths were preserved and the backup directory, and per-contradiction notes name them.
 - The interactive resolver preview was widened from 60 chars to the first ~12 lines (≤~400 chars, with a truncation marker) so the choice between candidates is informed.
 
+### #45 — skipped symlinked provider files are noted (no silent omission)
+
+The snapshot walk never follows symlinks (a link can escape the repo or cycle — the pen-test stance), so a symlinked provider file/dir (e.g. a `.claude/skills/<name>` that links into `.agents/skills/`) is invisible to import. Rather than drop it silently, the gateway records each such path in `RepoSnapshot.skippedSymlinks`, and `init` surfaces them in `InitReport.notes` (mirroring the hooks/unparseable-fragment notes): *"skipped N symlinked path(s) — symlinks are not followed, so their content was NOT imported (…). Replace a symlink with the real file/directory…"*. The skip itself remains correct policy; only the silence is fixed. A symlink the user gitignored or `exclude`d is skipped quietly (the exclusion is intentional).
+
 ## Out of scope
 - Migration commands from specific tools (`migrate-from cursor`) — listed in PRD §15 future scope.
