@@ -21,6 +21,7 @@ import type {
   EgressDestination,
   EgressFlags,
   EgressPlan,
+  Warning,
 } from './entities/index.js';
 import {
   createDiscoveryProbes,
@@ -519,6 +520,21 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   return report.exitCode;
 }
 
+/**
+ * One formatted line per warning — `<indent><code>\t<message> (<where>)`, where
+ * `where` is the warning's canonical path or provider id when present. Shared by
+ * the audit / apply / init renderers (gauntlet/Thermos: the loop was previously
+ * copy-pasted verbatim in all three). The header line + indent stay with each
+ * caller, since those differ.
+ */
+function warningLines(warnings: readonly Warning[], indent: string): string[] {
+  return warnings.map((warning) => {
+    const where = warning.canonicalPath ?? warning.providerId ?? '';
+    const suffix = where === '' ? '' : ` (${where})`;
+    return `${indent}${warning.code}\t${warning.message}${suffix}`;
+  });
+}
+
 function renderAuditReport(report: AuditReport): string {
   const lines: string[] = [];
   // `aliased` (#35) is neither clean nor drift — those paths were skipped, so
@@ -580,11 +596,7 @@ function renderAuditReport(report: AuditReport): string {
   if (report.warnings.length > 0) {
     lines.push('');
     lines.push(`${report.warnings.length} warning(s):`);
-    for (const warning of report.warnings) {
-      const where = warning.canonicalPath ?? warning.providerId ?? '';
-      const suffix = where === '' ? '' : ` (${where})`;
-      lines.push(`  ${warning.code}\t${warning.message}${suffix}`);
-    }
+    lines.push(...warningLines(report.warnings, '  '));
   }
 
   lines.push('');
@@ -623,6 +635,12 @@ function createStdinPrompt(
   let closed = false;
   const buffered: string[] = [];
   const waiters: Array<(answer: string) => void> = [];
+  // #47: a real terminal echoes the user's keystrokes + the Enter newline, but
+  // PIPED stdin (tests, CI, `printf … |`) is not echoed by readline — so the
+  // consumed answer and the next output ran together ("Choice [1-3]: detected
+  // …"). On non-TTY input we echo the answer ourselves; on a TTY we must not,
+  // or the answer would print twice.
+  const isTty = (input as Partial<NodeJS.ReadStream>).isTTY === true;
   const ensure = (): void => {
     if (rl !== undefined) {
       return;
@@ -631,6 +649,11 @@ function createStdinPrompt(
     rl.on('line', (line) => {
       const waiter = waiters.shift();
       if (waiter !== undefined) {
+        // The common piped path: the prompt was already rendered via
+        // rl.prompt(); echo the answer + newline so the next output starts fresh.
+        if (!isTty) {
+          output.write(`${line}\n`);
+        }
         waiter(line.trim());
       } else {
         buffered.push(line);
@@ -638,7 +661,16 @@ function createStdinPrompt(
     });
     rl.on('close', () => {
       closed = true;
-      for (const waiter of waiters.splice(0)) {
+      const pending = waiters.splice(0);
+      // gauntlet (Codex): EOF arriving while a prompt is already pending is
+      // resolved HERE, not via the prompt()/buffered path — so the newline that
+      // path writes was missing, and the next output ran onto the prompt line
+      // (`printf '' | … init` → "Choice [1-3]: refused — …"). On non-TTY input,
+      // terminate the dangling prompt line once before resolving the waiter(s).
+      if (!isTty && pending.length > 0) {
+        output.write('\n');
+      }
+      for (const waiter of pending) {
         waiter('');
       }
     });
@@ -648,11 +680,16 @@ function createStdinPrompt(
       ensure();
       const line = buffered.shift();
       if (line !== undefined) {
-        output.write(question);
+        // A line that arrived BEFORE this prompt (piped read-ahead). On non-TTY
+        // input echo the answer + newline with the question so the transcript
+        // reads cleanly; on a TTY the keystrokes were already echoed when typed.
+        output.write(isTty ? question : `${question}${line}\n`);
         return Promise.resolve(line.trim());
       }
       if (closed) {
-        output.write(question);
+        // #47: EOF — no answer to echo, but still terminate the prompt line so
+        // the following output starts fresh instead of running on.
+        output.write(`${question}\n`);
         return Promise.resolve('');
       }
       // Render the question through readline (not a bare output.write) so a
@@ -818,11 +855,7 @@ function renderApplyReport(report: ApplyReport): string {
   if (report.warnings.length > 0) {
     lines.push('');
     lines.push(`${report.warnings.length} warning(s):`);
-    for (const warning of report.warnings) {
-      const where = warning.canonicalPath ?? warning.providerId ?? '';
-      const suffix = where === '' ? '' : ` (${where})`;
-      lines.push(`  ${warning.code}\t${warning.message}${suffix}`);
-    }
+    lines.push(...warningLines(report.warnings, '  '));
   }
 
   lines.push('');
@@ -1333,6 +1366,15 @@ function renderInitReport(report: InitReport): string {
       `projected ${report.apply.written.length} provider file(s) via apply ` +
         `(exit ${report.apply.exitCode}).`,
     );
+    // #47: surface the chained apply's warnings here. Init used to swallow them,
+    // so a user first learned about a STANDING lossy translation (HH-W001/W007)
+    // from the next `audit` (exit 2) — reading like a surprise regression.
+    // Showing them now sets expectations: these warnings are permanent and the
+    // CI template tolerates them (see `audit --fail-on drift`, #43).
+    if (report.apply.warnings.length > 0) {
+      lines.push(`  ${report.apply.warnings.length} warning(s) from the projection (these are standing — not new drift):`);
+      lines.push(...warningLines(report.apply.warnings, '    '));
+    }
   }
 
   if (report.notes.length > 0) {

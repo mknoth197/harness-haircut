@@ -14,8 +14,8 @@
 - **EV1.** When the canonical IR matches every emitted-file projection on disk, the command shall print `nothing to do` and exit 0.
 - **EV2.** When an emitted file's body differs from disk, the command shall overwrite it (subject to UN-rules below) and add it to the change report.
 - **EV3.** When any adapter emits a `merge-key` file, the command shall read the existing file, replace only the owned key(s), and write the merged result.
-- **STATE1.** While the working tree contains uncommitted changes (per `git status --porcelain`), the command shall refuse to run unless `--allow-dirty` was passed.
-- **OPT1.** Where `--dry-run` is set, the command shall print the would-emit diff and exit without writing.
+- **STATE1.** While the working tree contains uncommitted changes (per `git status --porcelain`), the command shall refuse to run unless `--allow-dirty` was passed. (#47) A `--dry-run` preview is **exempt** — it writes nothing (and no state file), so the dirty-tree guard would be pure friction on the most natural use of a preview ("what would this do to my work-in-progress repo?"). The gate is for real writes only.
+- **OPT1.** Where `--dry-run` is set, the command shall print the would-emit diff and exit without writing (on a clean OR dirty tree, per STATE1).
 - **UN1.** If a target file's SignedSource header indicates user edits (`verifyHeader → 'edited'`), then the command shall prompt for overwrite, or fail with exit 1 when `--non-interactive` is set.
 - **UN2.** If a `merge-key` target file is malformed (invalid JSON/TOML), then the command shall fail with exit 3, naming the file.
 - **UN3.** If two adapters target the same path with `mode: overwrite`, then the command shall fail before any write.

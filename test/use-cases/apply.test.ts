@@ -383,6 +383,24 @@ describe('apply() — OPT1 dry run', () => {
     // The state file must NOT be written on a dry run.
     assert.equal(existsSync(join(repo.root, '.agents', '.harness-state.json')), false);
   });
+
+  it('#47 previews on a DIRTY tree without --allow-dirty (the dirty-tree gate is write-only)', async () => {
+    const repo = await setup(CANONICAL);
+    const before = await snapshotDir(repo.root);
+    const report = await runApply(repo.root, { dirty: true, dryRun: true });
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.dryRun, true);
+    assert.notEqual(report.refused, 'dirty-tree');
+    assert.ok(report.written.length > 0, 'dry run still reports what it would write');
+    assert.deepEqual(await snapshotDir(repo.root), before, 'dry run mutates nothing');
+  });
+
+  it('#47 a REAL (non-dry) apply on a dirty tree still refuses without --allow-dirty', async () => {
+    const repo = await setup(CANONICAL);
+    const report = await runApply(repo.root, { dirty: true });
+    assert.equal(report.exitCode, 1);
+    assert.equal(report.refused, 'dirty-tree');
+  });
 });
 
 describe('apply() — UN1 edited header file prompt path', () => {

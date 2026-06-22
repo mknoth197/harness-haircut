@@ -52,5 +52,10 @@ When a contradiction is resolved by choosing one candidate (or skipping), the ot
 
 The snapshot walk never follows symlinks (a link can escape the repo or cycle — the pen-test stance), so a symlinked provider file/dir (e.g. a `.claude/skills/<name>` that links into `.agents/skills/`) is invisible to import. Rather than drop it silently, the gateway records each such path in `RepoSnapshot.skippedSymlinks`, and `init` surfaces them in `InitReport.notes` (mirroring the hooks/unparseable-fragment notes): *"skipped N symlinked path(s) — symlinks are not followed, so their content was NOT imported (…). Replace a symlink with the real file/directory…"*. The skip itself remains correct policy; only the silence is fixed. A symlink the user gitignored or `exclude`d is skipped quietly (the exclusion is intentional).
 
+### #47 — init surfaces the chained apply's warnings; piped prompts echo cleanly
+
+- `init` chains `apply`; that projection can raise standing lossy warnings (HH-W001/W007). `init` used to print only `projected N provider file(s) via apply (exit 0)` and drop the warnings, so a user first met them at the *next* `audit` (exit 2), which reads like a surprise regression. `renderInitReport` now prints the chained apply's warning block under the projection line, labelled *standing — not new drift*.
+- The shared `createStdinPrompt` (layer 4, used by `init`/`apply`) echoes a consumed answer + newline when stdin is **piped** (readline does not echo a non-TTY), so transcripts/CI logs no longer run the next output onto the prompt line (`Choice [1-3]: detected …`). A real TTY already echoes keystrokes, so the manual echo is suppressed there.
+
 ## Out of scope
 - Migration commands from specific tools (`migrate-from cursor`) — listed in PRD §15 future scope.

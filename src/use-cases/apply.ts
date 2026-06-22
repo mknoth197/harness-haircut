@@ -392,7 +392,11 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   // STATE1: refuse on a dirty tree unless --allow-dirty. Exit 1 (a refusal to
   // act, not a config error — distinct from the parse/config exit 3 below).
   // Checked before parsing so a dirty repo fails fast and writes nothing.
-  if (!flags.allowDirty && (await deps.isDirty())) {
+  // #47: a `--dry-run` writes nothing (and no state file), so the dirty-tree
+  // guard is pure friction there — it blocks the most natural use of a preview
+  // ("what would this do to my work-in-progress repo?"). The gate is for real
+  // writes only, so a dry run skips it.
+  if (!flags.allowDirty && !flags.dryRun && (await deps.isDirty())) {
     return {
       files: [],
       warnings: [],

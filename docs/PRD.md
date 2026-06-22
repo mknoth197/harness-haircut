@@ -131,7 +131,7 @@ Global options:
 - `--json` emits a structured report.
 
 **`apply`**
-- Refuses to run with a dirty git tree unless `--allow-dirty`.
+- Refuses to run with a dirty git tree unless `--allow-dirty`. A `--dry-run` preview is exempt — it writes nothing, so the dirty-tree gate is for real writes only (#47).
 - For each emitted file: if `@generated SignedSource` hash mismatch (user edited), prompt before overwrite (or fail with `--non-interactive`).
 - Flags: `--dry-run`, `--non-interactive`, `--allow-dirty`.
 - Idempotent: `apply && audit` always exits 0 on a clean tree.
