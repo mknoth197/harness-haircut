@@ -10,3 +10,4 @@ export * from './instruction-source.js';
 export * from './secret-scan.js';
 export * from './egress-policy.js';
 export * from './egress-disclosure.js';
+export * from './backup.js';

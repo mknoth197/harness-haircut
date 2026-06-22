@@ -48,10 +48,12 @@ interface RunApplyOptions {
   allowDirty?: boolean;
   dryRun?: boolean;
   nonInteractive?: boolean;
-  /** Scripted answers to the `edited` prompt, keyed by emitted path. */
-  confirm?: Record<string, boolean> | ((path: string) => boolean);
+  /** Scripted answers to the `edited`/`unmanaged` prompt, keyed by emitted path. */
+  confirm?: Record<string, boolean> | ((path: string, reason: 'edited' | 'unmanaged') => boolean);
   geminiMode?: 'settings' | 'shim';
   disabled?: ProviderId[];
+  /** #40: emulate init's chained apply, which claims unmanaged files without prompt/backup. */
+  claimUnmanaged?: boolean;
 }
 
 async function setup(files: Record<string, string>): Promise<TempRepo> {
@@ -66,9 +68,9 @@ function runApply(root: string, options: RunApplyOptions = {}): Promise<ApplyRep
   const adapters = createAllAdapters().filter(
     (adapter) => !(options.disabled ?? []).includes(adapter.id),
   );
-  const confirmFn = (path: string): Promise<boolean> => {
+  const confirmFn = (path: string, reason: 'edited' | 'unmanaged'): Promise<boolean> => {
     if (typeof options.confirm === 'function') {
-      return Promise.resolve(options.confirm(path));
+      return Promise.resolve(options.confirm(path, reason));
     }
     return Promise.resolve(options.confirm?.[path] ?? false);
   };
@@ -87,6 +89,10 @@ function runApply(root: string, options: RunApplyOptions = {}): Promise<ApplyRep
       allowDirty: options.allowDirty ?? false,
       dryRun: options.dryRun ?? false,
       nonInteractive: options.nonInteractive ?? false,
+      // Only pass claimUnmanaged when a test sets it, so the many tests that
+      // omit it exercise the OPTIONAL default (false = safe prompt+backup) —
+      // the back-compat shape an external caller of the exported apply() uses.
+      ...(options.claimUnmanaged !== undefined ? { claimUnmanaged: options.claimUnmanaged } : {}),
     },
   });
 }
@@ -424,6 +430,101 @@ describe('apply() — UN1 edited header file prompt path', () => {
       second.blocked.includes('.codex/hooks.json'),
       'a previously-blocked edit must still be classified edited, not silently overwritable',
     );
+  });
+});
+
+// #40: a header-bearing owned path holding a HAND-WRITTEN file with no
+// SignedSource header verifies as `unmanaged`. A standalone apply must back the
+// original up and prompt (never overwrite it silently — PRD §9); init's chained
+// apply (claimUnmanaged) keeps the pre-#40 write-freely path.
+describe('apply() — #40 unmanaged hand-written file (prompt + backup)', () => {
+  const COPILOT_PATH = '.github/copilot-instructions.md';
+  const BACKUP_PATH = '.harness-haircut-apply-backup/.github__copilot-instructions.md';
+  const HAND_WRITTEN = '# Hand-written copilot notes\n\nPrecious, never generated.\n';
+
+  it('backs up the original then overwrites when confirmed (reason: unmanaged)', async () => {
+    const repo = await setup({ ...CANONICAL, [COPILOT_PATH]: HAND_WRITTEN });
+    const report = await runApply(repo.root, { confirm: { [COPILOT_PATH]: true } });
+    assert.equal(report.exitCode, 0);
+    const ci = report.files.find((f) => f.path === COPILOT_PATH);
+    assert.equal(ci?.action, 'written');
+    assert.equal(ci?.reason, 'unmanaged');
+    // The original is preserved verbatim under the apply backup dir...
+    assert.deepEqual(report.backups, [BACKUP_PATH]);
+    assert.equal(await readFile(join(repo.root, ...BACKUP_PATH.split('/')), 'utf8'), HAND_WRITTEN);
+    // ...and the path now holds the generated, header-bearing projection.
+    const onDisk = await readFile(join(repo.root, ...COPILOT_PATH.split('/')), 'utf8');
+    assert.notEqual(onDisk, HAND_WRITTEN);
+    assert.match(onDisk, /@generated SignedSource/);
+  });
+
+  it('declined interactively: blocked, original untouched, no backup, exit 0', async () => {
+    const repo = await setup({ ...CANONICAL, [COPILOT_PATH]: HAND_WRITTEN });
+    const report = await runApply(repo.root, { confirm: { [COPILOT_PATH]: false } });
+    assert.equal(report.exitCode, 0);
+    const ci = report.files.find((f) => f.path === COPILOT_PATH);
+    assert.equal(ci?.action, 'blocked');
+    assert.equal(ci?.reason, 'unmanaged');
+    assert.ok(report.blocked.includes(COPILOT_PATH));
+    assert.deepEqual(report.backups, []);
+    assert.equal(await readFile(join(repo.root, ...COPILOT_PATH.split('/')), 'utf8'), HAND_WRITTEN);
+    assert.equal(existsSync(join(repo.root, ...BACKUP_PATH.split('/'))), false);
+  });
+
+  it('refuses under --non-interactive: blocked, original untouched, exit 1', async () => {
+    const repo = await setup({ ...CANONICAL, [COPILOT_PATH]: HAND_WRITTEN });
+    const report = await runApply(repo.root, { nonInteractive: true });
+    assert.equal(report.exitCode, 1);
+    assert.ok(report.blocked.includes(COPILOT_PATH));
+    const ci = report.files.find((f) => f.path === COPILOT_PATH);
+    assert.equal(ci?.reason, 'unmanaged');
+    assert.deepEqual(report.backups, []);
+    assert.equal(await readFile(join(repo.root, ...COPILOT_PATH.split('/')), 'utf8'), HAND_WRITTEN);
+  });
+
+  it('claimUnmanaged (init chained apply): overwrites without prompt or backup', async () => {
+    const repo = await setup({ ...CANONICAL, [COPILOT_PATH]: HAND_WRITTEN });
+    const report = await runApply(repo.root, {
+      claimUnmanaged: true,
+      confirm: () => {
+        throw new Error('must not prompt for an unmanaged file when claimUnmanaged is set');
+      },
+    });
+    assert.equal(report.exitCode, 0);
+    const ci = report.files.find((f) => f.path === COPILOT_PATH);
+    assert.equal(ci?.action, 'written');
+    assert.equal(ci?.reason, 'unmanaged');
+    assert.deepEqual(report.backups, []);
+    assert.notEqual(
+      await readFile(join(repo.root, ...COPILOT_PATH.split('/')), 'utf8'),
+      HAND_WRITTEN,
+    );
+    assert.equal(existsSync(join(repo.root, ...BACKUP_PATH.split('/'))), false);
+  });
+
+  it('dry run: unmanaged surfaces as blocked-in-preview, nothing written, no backup', async () => {
+    const repo = await setup({ ...CANONICAL, [COPILOT_PATH]: HAND_WRITTEN });
+    const before = await snapshotDir(repo.root);
+    const report = await runApply(repo.root, { dryRun: true });
+    assert.equal(report.exitCode, 0);
+    assert.equal(report.dryRun, true);
+    assert.ok(report.blocked.includes(COPILOT_PATH));
+    assert.deepEqual(report.backups, []);
+    assert.deepEqual(await snapshotDir(repo.root), before, 'dry run mutates nothing');
+  });
+
+  it('after a confirmed takeover, apply→audit is clean and the backup dir is not re-collected', async () => {
+    const repo = await setup({ ...CANONICAL, [COPILOT_PATH]: HAND_WRITTEN });
+    const applied = await runApply(repo.root, { confirm: { [COPILOT_PATH]: true } });
+    assert.equal(applied.exitCode, 0);
+    // The backup lives at the repo root, OUTSIDE the parse walk: audit is clean
+    // (no drift), no audited file is the backup, and a second apply is a no-op.
+    const auditReport = await runAudit(repo.root);
+    assert.equal(auditReport.drift, false);
+    assert.equal(auditReport.exitCode, 0);
+    assert.ok(!auditReport.files.some((f) => f.path.startsWith('.harness-haircut-apply-backup/')));
+    const second = await runApply(repo.root);
+    assert.equal(second.nothingToDo, true);
   });
 });
 

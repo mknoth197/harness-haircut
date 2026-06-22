@@ -12,6 +12,9 @@ import {
   renderEgressDisclosure,
   renderEgressPreview,
   EGRESS_CONSENT_PROMPT,
+  APPLY_BACKUP_DIR,
+  INIT_BACKUP_DIR,
+  sanitizeBackupName,
 } from './entities/index.js';
 import type {
   CandidateText,
@@ -180,7 +183,8 @@ function helpText(): string {
     'apply options:',
     '  --dry-run           Print the would-emit plan and exit without writing',
     '  --allow-dirty       Run even when the git working tree is dirty',
-    '  --non-interactive   Never prompt; fail (exit 1) on a user-edited file',
+    '  --non-interactive   Never prompt; fail (exit 1) on a user-edited or',
+    '                      hand-written (unmanaged) provider file',
     '',
     'install-precommit options:',
     '  --force             Overwrite an existing pre-commit hook (else append)',
@@ -612,16 +616,24 @@ function createStdinPrompt(
 }
 
 /**
- * Interactive overwrite confirmation for an `edited` file (UN1) over the
- * shared prompt. Anything other than `y`/`yes` (case-insensitive) declines,
- * so a bare Enter — and EOF, which resolves to `''` — is safe.
- * `--non-interactive` bypasses this entirely (the use case auto-declines).
+ * Interactive overwrite confirmation (UN1) over the shared prompt. The message
+ * is tailored to the case: an `edited` generated file (whose content derives
+ * from canonical sources) vs an `unmanaged` hand-written file apply is about to
+ * back up and take over for the first time (#40) — the latter names the backup
+ * location so the user knows the original is recoverable. Anything other than
+ * `y`/`yes` (case-insensitive) declines, so a bare Enter — and EOF, which
+ * resolves to `''` — is safe. `--non-interactive` bypasses this entirely (the
+ * use case auto-declines).
  */
-function confirmOverwrite(prompt: Prompt): (path: string) => Promise<boolean> {
-  return async (path: string): Promise<boolean> => {
-    const answer = await prompt(
-      `harness-haircut: ${path} was edited since it was generated. Overwrite? [y/N] `,
-    );
+function confirmOverwrite(prompt: Prompt): (path: string, reason: 'edited' | 'unmanaged') => Promise<boolean> {
+  return async (path: string, reason: 'edited' | 'unmanaged'): Promise<boolean> => {
+    const question =
+      reason === 'unmanaged'
+        ? `harness-haircut: ${path} is hand-written (no harness-haircut header) and not ` +
+          `yet managed. Back up to ${APPLY_BACKUP_DIR}/${sanitizeBackupName(path)} and ` +
+          `overwrite with the generated projection? [y/N] `
+        : `harness-haircut: ${path} was edited since it was generated. Overwrite? [y/N] `;
+    const answer = await prompt(question);
     const normalized = answer.toLowerCase();
     return normalized === 'y' || normalized === 'yes';
   };
@@ -668,7 +680,9 @@ async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
       readState: (): ApplyState => parseState(reader.read(APPLY_STATE_PATH)),
       writeState: (state: ApplyState): void => writer.write(APPLY_STATE_PATH, serializeState(state)),
       aliasOf: createSymlinkAliasProbe(cwd),
-      flags: { allowDirty, dryRun, nonInteractive },
+      // #40: a standalone apply never claims a hand-written unmanaged file
+      // silently — it backs it up and prompts (or refuses under --non-interactive).
+      flags: { allowDirty, dryRun, nonInteractive, claimUnmanaged: false },
     });
   } catch (err) {
     if (err instanceof DomainError) {
@@ -712,10 +726,20 @@ function renderApplyReport(report: ApplyReport): string {
       }
     }
     if (report.blocked.length > 0) {
-      lines.push(`blocked ${report.blocked.length} edited file(s) (not overwritten):`);
+      lines.push(`blocked ${report.blocked.length} file(s) (not overwritten):`);
       for (const file of report.files.filter((f) => f.action === 'blocked')) {
-        lines.push(`  edited\t${file.path} [${file.providerId}]`);
+        lines.push(`  ${file.reason}\t${file.path} [${file.providerId}]`);
       }
+    }
+  }
+  // #40: hand-written files apply took over had their originals preserved.
+  if (report.backups.length > 0) {
+    lines.push(
+      `preserved ${report.backups.length} hand-written file(s) before overwriting ` +
+        `(originals backed up under ${APPLY_BACKUP_DIR}/):`,
+    );
+    for (const file of report.files.filter((f) => f.action === 'written' && f.reason === 'unmanaged')) {
+      lines.push(`  ${file.path} -> ${APPLY_BACKUP_DIR}/${sanitizeBackupName(file.path)}`);
     }
   }
   const aliasedSkips = report.files.filter((file) => file.reason === 'aliased');
@@ -1129,7 +1153,11 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
           writeState: (state: ApplyState): void =>
             writer.write(APPLY_STATE_PATH, serializeState(state)),
           aliasOf: createSymlinkAliasProbe(cwd),
-          flags: { allowDirty: true, dryRun, nonInteractive: true },
+          // #40: init already reconciled pre-existing foreign files
+          // interactively and backed up the non-chosen candidates, so the
+          // chained apply legitimately claims the unmanaged originals it left in
+          // place without re-prompting.
+          flags: { allowDirty: true, dryRun, nonInteractive: true, claimUnmanaged: true },
         }),
       flags: { dryRun, nonInteractive, adopt },
     });
@@ -1220,7 +1248,7 @@ function renderInitReport(report: InitReport): string {
     lines.push('preserved non-chosen candidates (originals backed up):');
     for (const contradiction of report.contradictions) {
       for (const candidate of contradiction.candidates) {
-        const backupPath = `.harness-haircut-init-backup/${candidate.path.replace(/[/\\]/g, '__')}`;
+        const backupPath = `${INIT_BACKUP_DIR}/${sanitizeBackupName(candidate.path)}`;
         if (backupSet.has(backupPath)) {
           lines.push(`  ${contradiction.slot}: ${candidate.path} -> ${backupPath}`);
         }

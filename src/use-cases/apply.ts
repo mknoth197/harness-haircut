@@ -16,9 +16,17 @@
  *   header-bearing   clean                          → skip
  *   (verifyAgainst)  stale (sources changed)        → write
  *                    edited (header BODY_HASH bad)   → prompt; write or block
- *                    unmanaged (no header)          → write (own the path; C3
- *                                                      handles pre-existing
- *                                                      foreign files at init)
+ *                    unmanaged (no header)          → back up the original, then
+ *                                                      prompt; write or block
+ *                                                      (#40: PRD §9 "never
+ *                                                      overwrite an unmanaged
+ *                                                      file silently"). The
+ *                                                      `claimUnmanaged` flag —
+ *                                                      set only by init's chained
+ *                                                      apply, which already
+ *                                                      reconciled foreign files
+ *                                                      interactively — restores
+ *                                                      the old write-freely path.
  *                    missing                        → write
  *   merge-key        owned key deep-equals proj      → skip
  *                    else                            → shallow-merge owned key,
@@ -33,8 +41,9 @@
  *
  * Exit codes (PRD §7; choices documented inline):
  *   0  success — files written, or "nothing to do"
- *   1  refused (dirty tree without --allow-dirty), or a blocked `edited` file
- *      under --non-interactive, or an overwrite/overwrite path collision
+ *   1  refused (dirty tree without --allow-dirty), or a blocked `edited`/
+ *      `unmanaged` file under --non-interactive, or an overwrite/overwrite path
+ *      collision
  *   3  invalid config / malformed merge-key target (propagated DomainError)
  */
 import type {
@@ -46,6 +55,7 @@ import type {
 } from '../entities/adapter.js';
 import type { ApplyState } from '../entities/apply-state.js';
 import { APPLY_STATE_PATH, classifyHeaderless, contentHash } from '../entities/apply-state.js';
+import { APPLY_BACKUP_DIR, sanitizeBackupName } from '../entities/backup.js';
 import {
   EmitPathCollisionError,
   MalformedProviderConfigError,
@@ -67,11 +77,13 @@ export interface FileApply {
   action: ApplyAction;
   /**
    * Why the file got its action — drives the human-readable change report.
-   * `clean` only ever pairs with `skipped`; `edited` pairs with `written`
-   * (confirmed) or `blocked` (declined / --non-interactive). `aliased` (#35)
-   * pairs with `skipped`: the path resolves through an in-repo symlink onto
-   * another repo path, so writing it would overwrite the symlink's target —
-   * skipped with HH-W013 instead.
+   * `clean` only ever pairs with `skipped`; `edited` and `unmanaged` each pair
+   * with `written` (confirmed) or `blocked` (declined / --non-interactive).
+   * `unmanaged` (#40) is a hand-written file at an owned path with no
+   * SignedSource header: apply backs up the original before overwriting it.
+   * `aliased` (#35) pairs with `skipped`: the path resolves through an in-repo
+   * symlink onto another repo path, so writing it would overwrite the
+   * symlink's target — skipped with HH-W013 instead.
    */
   reason: 'clean' | 'missing' | 'stale' | 'edited' | 'unmanaged' | 'merge-changed' | 'aliased';
   /** For merge-key files, the owned key; absent for fully-owned files. */
@@ -90,8 +102,17 @@ export interface ApplyReport {
   written: string[];
   /** Paths skipped because disk already matched. */
   skipped: string[];
-  /** Paths blocked: an `edited` file the user did not confirm overwriting. */
+  /** Paths blocked: an `edited`/`unmanaged` file the user did not confirm overwriting. */
   blocked: string[];
+  /**
+   * #40: repo-relative paths of the backups apply wrote before taking over a
+   * hand-written `unmanaged` file (under `.harness-haircut-apply-backup/`).
+   * Empty whenever no unmanaged file was overwritten — including on `--dry-run`,
+   * where a preview never prompts, so an unmanaged file surfaces as
+   * blocked-in-preview and no backup is planned. `--json` surfaces this so the
+   * recovery location is machine-readable.
+   */
+  backups: string[];
   /** True when nothing was (or would be) written. */
   nothingToDo: boolean;
   /** True when this was a `--dry-run` (no writes, no state file touched). */
@@ -107,8 +128,26 @@ export interface ApplyFlags {
   allowDirty: boolean;
   /** OPT1: compute the full plan but write nothing (and no state file). */
   dryRun: boolean;
-  /** UN1: never prompt — an `edited` file fails the run (exit 1). */
+  /** UN1: never prompt — an `edited`/`unmanaged` file fails the run (exit 1). */
   nonInteractive: boolean;
+  /**
+   * #40: claim an `unmanaged` (hand-written, never-tool-owned) file without
+   * prompting or backing it up — the pre-#40 "apply owns the path, overwrite
+   * freely" behaviour. Set ONLY by init's chained apply (C3): init has already
+   * reconciled pre-existing foreign files interactively and backed up the
+   * non-chosen candidates, so the projection legitimately takes over the
+   * originals it left in place. A STANDALONE `apply` leaves this false, so an
+   * unmanaged file is backed up + prompted (interactive) / refused
+   * (--non-interactive), honoring PRD §9 "never overwrite an unmanaged file
+   * silently".
+   *
+   * Optional and defaults to `false` (the safe standalone behavior): omitting
+   * it keeps the exported `ApplyFlags` backward-compatible for callers written
+   * against the pre-#40 three-flag shape (DoD: public types stay compatible
+   * within v0.x), and the omitted default is the protective path, never the
+   * silent-overwrite one.
+   */
+  claimUnmanaged?: boolean;
 }
 
 export interface ApplyDeps {
@@ -124,8 +163,12 @@ export interface ApplyDeps {
   contextFor: (id: ProviderId) => ProjectionContext;
   /** STATE1: true when `git status --porcelain` is non-empty (or unverifiable). */
   isDirty: () => Promise<boolean>;
-  /** UN1 prompt: resolves true to overwrite an `edited` file, false to skip it. */
-  confirm: (path: string) => Promise<boolean>;
+  /**
+   * UN1 prompt: resolves true to overwrite, false to skip. `reason` lets layer
+   * 4 word the prompt for the case at hand — an `edited` generated file vs an
+   * `unmanaged` hand-written file apply is about to back up and take over (#40).
+   */
+  confirm: (path: string, reason: 'edited' | 'unmanaged') => Promise<boolean>;
   /** Reads + parses the apply state file (headerless edited-vs-stale memory). */
   readState: () => ApplyState;
   /** Persists the apply state file atomically (only on a real, non-dry run). */
@@ -231,6 +274,12 @@ interface PlannedWrite {
    * stack (different owned keys in one settings.json), so they never conflict.
    */
   emitKind: 'fully-owned' | 'merge-key';
+  /**
+   * #40: when this write takes over a hand-written `unmanaged` file, the
+   * verbatim original to preserve first (under `.harness-haircut-apply-backup/`).
+   * Written before the overwrite on a real run; absent for every other write.
+   */
+  backup?: { path: string; content: string };
 }
 
 type PlanEntry =
@@ -239,31 +288,38 @@ type PlanEntry =
   | { kind: 'write'; file: FileApply; write: PlannedWrite };
 
 /**
- * Decides a header-bearing overwrite file's fate. `clean` → skip; `missing`,
- * `stale`, and `unmanaged` overwrite freely; `edited` defers to the prompt.
+ * Decides a header-bearing overwrite file's fate. `clean` → skip; `missing`
+ * and `stale` overwrite freely; `edited` and `unmanaged` defer to the prompt
+ * (the latter only when not `claimUnmanaged`). `disk` is returned so the caller
+ * can back an unmanaged original up before overwriting it (#40).
  */
 function planHeaderBearing(
   file: EmittedFile,
   providerId: ProviderId,
   writer: FileWriter,
-): { reason: FileApply['reason']; needsPrompt: boolean; skip: boolean } {
+  claimUnmanaged: boolean,
+): { reason: FileApply['reason']; needsPrompt: boolean; skip: boolean; disk: string | null } {
   const disk = writer.read(file.path);
   if (disk === null) {
-    return { reason: 'missing', needsPrompt: false, skip: false };
+    return { reason: 'missing', needsPrompt: false, skip: false, disk };
   }
   const status = verifyAgainstExpected(disk, file.body).status;
   switch (status) {
     case 'clean':
-      return { reason: 'clean', needsPrompt: false, skip: true };
+      return { reason: 'clean', needsPrompt: false, skip: true, disk };
     case 'stale':
-      return { reason: 'stale', needsPrompt: false, skip: false };
+      return { reason: 'stale', needsPrompt: false, skip: false, disk };
     case 'unmanaged':
-      // An owned path holding a headerless foreign file. `apply` owns these
-      // paths (PRD §10), so it overwrites; the interactive reconciliation of
-      // pre-existing foreign content is init's job (C3, out of scope here).
-      return { reason: 'unmanaged', needsPrompt: false, skip: false };
+      // An owned path holding a hand-written file with no SignedSource header.
+      // PRD §9 forbids overwriting it silently. A standalone apply backs the
+      // original up and prompts (#40); init's chained apply sets
+      // `claimUnmanaged` because it already reconciled foreign files
+      // interactively, so it takes the path over without a prompt or backup.
+      return claimUnmanaged
+        ? { reason: 'unmanaged', needsPrompt: false, skip: false, disk }
+        : { reason: 'unmanaged', needsPrompt: true, skip: false, disk };
     case 'edited':
-      return { reason: 'edited', needsPrompt: true, skip: false };
+      return { reason: 'edited', needsPrompt: true, skip: false, disk };
   }
 }
 
@@ -275,19 +331,19 @@ function planHeaderless(
   file: EmittedFile,
   writer: FileWriter,
   state: ApplyState,
-): { reason: FileApply['reason']; needsPrompt: boolean; skip: boolean } {
+): { reason: FileApply['reason']; needsPrompt: boolean; skip: boolean; disk: string | null } {
   const disk = writer.read(file.path);
   if (disk === null) {
-    return { reason: 'missing', needsPrompt: false, skip: false };
+    return { reason: 'missing', needsPrompt: false, skip: false, disk };
   }
   const verdict = classifyHeaderless(disk, file.body, state.emitted[file.path]);
   switch (verdict) {
     case 'clean':
-      return { reason: 'clean', needsPrompt: false, skip: true };
+      return { reason: 'clean', needsPrompt: false, skip: true, disk };
     case 'stale':
-      return { reason: 'stale', needsPrompt: false, skip: false };
+      return { reason: 'stale', needsPrompt: false, skip: false, disk };
     case 'edited':
-      return { reason: 'edited', needsPrompt: true, skip: false };
+      return { reason: 'edited', needsPrompt: true, skip: false, disk };
   }
 }
 
@@ -343,6 +399,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
       written: [],
       skipped: [],
       blocked: [],
+      backups: [],
       nothingToDo: true,
       dryRun: flags.dryRun,
       exitCode: 1,
@@ -475,7 +532,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
     }
     const headered = detectHeaderPlacement(file.body) !== 'none';
     const decision = headered
-      ? planHeaderBearing(file, providerId, deps.writer)
+      ? planHeaderBearing(file, providerId, deps.writer, flags.claimUnmanaged ?? false)
       : planHeaderless(file, deps.writer, state);
 
     if (decision.skip) {
@@ -483,25 +540,38 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
       continue;
     }
     if (decision.needsPrompt) {
-      // `edited`: prompt unless --non-interactive (UN1). The prompt is awaited
-      // only while planning; no write has happened yet. A dry run never
-      // prompts — a preview reports edited files as blocked without asking.
+      // `edited` (generated then user-touched) and `unmanaged` (hand-written,
+      // no header — #40) both prompt unless --non-interactive (UN1). The prompt
+      // is awaited only while planning; no write has happened yet. A dry run
+      // never prompts — a preview reports these files as blocked without asking.
+      const promptReason: 'edited' | 'unmanaged' =
+        decision.reason === 'unmanaged' ? 'unmanaged' : 'edited';
       const confirmed =
-        flags.dryRun || flags.nonInteractive ? false : await deps.confirm(file.path);
+        flags.dryRun || flags.nonInteractive ? false : await deps.confirm(file.path, promptReason);
       if (!confirmed) {
-        plan.push({ kind: 'block', file: fileApply(file, providerId, 'blocked', 'edited') });
+        plan.push({ kind: 'block', file: fileApply(file, providerId, 'blocked', decision.reason) });
         continue;
+      }
+      const write: PlannedWrite = {
+        path: file.path,
+        providerId,
+        content: file.body,
+        reason: decision.reason,
+        emitKind: 'fully-owned',
+      };
+      // #40: an unmanaged takeover preserves the hand-written original verbatim
+      // before overwriting it (the original has no canonical twin to recover
+      // from — unlike `edited`, whose content derives from canonical sources).
+      if (decision.reason === 'unmanaged' && decision.disk !== null) {
+        write.backup = {
+          path: `${APPLY_BACKUP_DIR}/${sanitizeBackupName(file.path)}`,
+          content: decision.disk,
+        };
       }
       plan.push({
         kind: 'write',
-        file: fileApply(file, providerId, 'written', 'edited'),
-        write: {
-          path: file.path,
-          providerId,
-          content: file.body,
-          reason: 'edited',
-          emitKind: 'fully-owned',
-        },
+        file: fileApply(file, providerId, 'written', decision.reason),
+        write,
       });
       continue;
     }
@@ -532,10 +602,17 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   }
   const written = [...writesByPath.keys()];
   const nothingToDo = written.length === 0;
+  // #40: the unmanaged-takeover backups to write before the overwrites. On a
+  // dry run this is empty — a preview never prompts, so no unmanaged write is
+  // confirmed and none carries a backup.
+  const plannedBackups = planned
+    .map((e) => e.write.backup)
+    .filter((b): b is NonNullable<typeof b> => b !== undefined);
+  const backups = plannedBackups.map((b) => b.path);
 
   // OPT1: dry run computes the full plan + report and returns without writing
   // anything (and without touching the state file). A preview always exits 0 —
-  // it is a plan, not an action; edited files surface as blocked-in-preview.
+  // it is a plan, not an action; edited/unmanaged files surface as blocked-in-preview.
   if (flags.dryRun) {
     return {
       files,
@@ -543,15 +620,23 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
       written,
       skipped,
       blocked,
+      backups,
       nothingToDo,
       dryRun: true,
       exitCode: 0,
     };
   }
 
-  // Real run: write each unique target path once (merge-key groups collapse to
-  // a single physical write of the fully merged content), then persist the
-  // state file recording the hash of every fully-owned emitted path.
+  // Real run: preserve each unmanaged original BEFORE overwriting it (#40), so
+  // an interrupted run never destroys hand-written content it had not yet
+  // backed up. Backup paths live under `.harness-haircut-apply-backup/` and
+  // never collide with a provider emit path.
+  for (const backup of plannedBackups) {
+    deps.writer.write(backup.path, backup.content);
+  }
+  // Then write each unique target path once (merge-key groups collapse to a
+  // single physical write of the fully merged content), then persist the state
+  // file recording the hash of every fully-owned emitted path.
   for (const [path, content] of writesByPath) {
     deps.writer.write(path, content);
   }
@@ -600,7 +685,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
   }
 
   // EV1: nothing to write → exit 0 (the caller prints "nothing to do").
-  // A blocked edit under --non-interactive is the UN1 failure → exit 1.
+  // A blocked edited/unmanaged file under --non-interactive is the UN1 failure → exit 1.
   const exitCode: 0 | 1 | 3 = blocked.length > 0 && flags.nonInteractive ? 1 : 0;
 
   return {
@@ -609,6 +694,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
     written,
     skipped,
     blocked,
+    backups,
     nothingToDo,
     dryRun: false,
     exitCode,

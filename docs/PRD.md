@@ -217,7 +217,7 @@ Verification takes the disk file **and** the current canonical sources, and retu
 | `stale` | body intact, `SOURCES_HASH` ≠ hash(current manifest) | canonical sources changed since emit — safe to overwrite freely |
 | `clean` | both hashes match | up to date |
 
-- On `apply`: `clean` → skip; `stale` → overwrite; `edited` → prompt; `unmanaged` at a target path → refuse with error.
+- On `apply`: `clean` → skip; `stale` → overwrite; `edited` → prompt; `unmanaged` at a target path → **back up the hand-written original** (verbatim, under `.harness-haircut-apply-backup/`) and **prompt** before overwriting, or **refuse with exit 1** under `--non-interactive` — never overwrite an unmanaged file silently (C2/#40). The one exception is `init`'s chained `apply` (C3): it has already reconciled the pre-existing foreign files interactively and backed up the non-chosen candidates, so it claims those paths without re-prompting.
 - On `audit`: any state other than `clean` for an expected emitted file is reported (`stale`/`edited` → drift, exit 1; `unmanaged` → drift with a distinct message).
 
 ### Header placement and carve-outs (v0.3.1)
@@ -239,7 +239,7 @@ For files that `harness-haircut` co-owns with non-hook configuration (e.g., `.cl
 
 - The tool reads the existing file, **only** rewrites keys it owns (e.g., `hooks` for Claude, `[hooks]` for Codex), and preserves all other top-level keys.
 - A `# managed by harness-haircut: hooks` comment (where the format permits) marks owned regions.
-- For files the tool fully owns (e.g., `.github/copilot-instructions.md`), the SignedSource header is the whole file's first line and the tool refuses to merge — it overwrites.
+- For files the tool fully owns (e.g., `.github/copilot-instructions.md`), the SignedSource header is the whole file's first line and the tool refuses to merge — it overwrites. (When such a path already holds a *hand-written* file with no header, the takeover is gated by the §9 `unmanaged` policy: back up + prompt, never a silent overwrite.)
 
 Per-provider details *(v0.3 — verified against current docs; see [`docs/research/provider-matrix.md`](research/provider-matrix.md))*:
 
