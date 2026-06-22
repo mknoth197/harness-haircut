@@ -53,8 +53,11 @@ fenced with markers and never duplicated. Run it from inside a git repository
 
 To fail a PR check on drift, copy [`templates/github-action.yml`](templates/github-action.yml)
 into your repo's `.github/workflows/`. It checks out the repo, sets up Node 24,
-runs `npm ci`, then `npx harness-haircut audit` — a non-zero exit (drift, a
-lossy-translation warning, or invalid config) fails the check.
+runs `npm ci`, then `npx harness-haircut audit --fail-on drift` — which fails the
+check on real drift (exit 1) or invalid config (exit 3) but **tolerates a
+standing lossy-translation warning** (exit 2), matching the pre-commit hook so a
+drift-free repo's CI is never permanently red. Drop `--fail-on drift` to treat
+warnings as failures too.
 
 ## Local development
 

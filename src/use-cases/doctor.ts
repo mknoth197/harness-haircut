@@ -66,8 +66,13 @@ export interface DoctorDeps {
   cwd: string;
   /** All provider adapters; `detectExisting` runs against the snapshot. */
   adapters: readonly ProviderAdapter[];
-  /** Lazily reads the repo snapshot (wide init-style collection). */
-  snapshot: () => Promise<RepoSnapshot>;
+  /**
+   * Reads the repo snapshot (wide init-style collection), honoring the config
+   * `exclude` globs. The use case derives `exclude` from its OWN single config
+   * parse and passes it in — so layer 4 never re-parses the config just to
+   * build the snapshot (the prior double-parse + swallowed error are gone).
+   */
+  snapshot: (exclude: readonly string[]) => Promise<RepoSnapshot>;
   /** Raw `harness-haircut.config.json` text, or `null` when the file is absent. */
   configRaw: string | null;
   /** The config path, used only for error messages. */
@@ -87,16 +92,6 @@ export interface DoctorDeps {
 }
 
 export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
-  const snapshot = await deps.snapshot();
-
-  const detectedProviders: ExistingProviderConfig[] = [];
-  for (const adapter of deps.adapters) {
-    const detected = adapter.detectExisting(snapshot);
-    if (detected !== null) {
-      detectedProviders.push(detected);
-    }
-  }
-
   const warnings: string[] = [];
 
   // A user-specified config that is not on disk is worth surfacing — the run
@@ -107,6 +102,10 @@ export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
     warnings.push(`specified config not found: ${deps.configPath} (using defaults)`);
   }
 
+  // Parse the config ONCE — the authoritative parse that drives both the
+  // exit-3 diagnosis AND the snapshot's `exclude` list (so a fixture/excluded
+  // path is not reported as a detected provider). No second best-effort parse
+  // in layer 4.
   let config: HarnessConfig | null;
   let exitCode: 0 | 3 = 0;
   try {
@@ -119,6 +118,18 @@ export async function doctor(deps: DoctorDeps): Promise<DoctorReport> {
     warnings.push(
       `invalid config: ${err instanceof DomainError ? err.message : String(err)}`,
     );
+  }
+
+  // An invalid config yields no exclude list (the report already flags it); the
+  // snapshot then collects with no exclusions, the safe default.
+  const snapshot = await deps.snapshot(config?.exclude ?? []);
+
+  const detectedProviders: ExistingProviderConfig[] = [];
+  for (const adapter of deps.adapters) {
+    const detected = adapter.detectExisting(snapshot);
+    if (detected !== null) {
+      detectedProviders.push(detected);
+    }
   }
 
   return {

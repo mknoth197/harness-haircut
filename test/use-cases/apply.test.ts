@@ -89,7 +89,10 @@ function runApply(root: string, options: RunApplyOptions = {}): Promise<ApplyRep
       allowDirty: options.allowDirty ?? false,
       dryRun: options.dryRun ?? false,
       nonInteractive: options.nonInteractive ?? false,
-      claimUnmanaged: options.claimUnmanaged ?? false,
+      // Only pass claimUnmanaged when a test sets it, so the many tests that
+      // omit it exercise the OPTIONAL default (false = safe prompt+backup) —
+      // the back-compat shape an external caller of the exported apply() uses.
+      ...(options.claimUnmanaged !== undefined ? { claimUnmanaged: options.claimUnmanaged } : {}),
     },
   });
 }
@@ -290,7 +293,7 @@ describe('apply() — UN2 malformed merge-key target', () => {
           confirm: () => Promise.resolve(false),
           readState: () => parseState(reader.read(APPLY_STATE_PATH)),
           writeState: () => {},
-          flags: { allowDirty: false, dryRun: false, nonInteractive: false, claimUnmanaged: false },
+          flags: { allowDirty: false, dryRun: false, nonInteractive: false },
         }),
       (err: unknown) =>
         err instanceof Error &&
@@ -338,7 +341,7 @@ describe('apply() — prototype-pollution guard (FIX 3, security hardening)', ()
           confirm: () => Promise.resolve(false),
           readState: () => parseState(reader.read(APPLY_STATE_PATH)),
           writeState: () => {},
-          flags: { allowDirty: false, dryRun: false, nonInteractive: false, claimUnmanaged: false },
+          flags: { allowDirty: false, dryRun: false, nonInteractive: false },
         }),
       (err: unknown) =>
         err instanceof Error &&
@@ -589,7 +592,7 @@ describe('apply() — UN3 two overwrite emits target the same path', () => {
           confirm: () => Promise.resolve(false),
           readState: () => parseState(reader.read(APPLY_STATE_PATH)),
           writeState: () => {},
-          flags: { allowDirty: false, dryRun: false, nonInteractive: false, claimUnmanaged: false },
+          flags: { allowDirty: false, dryRun: false, nonInteractive: false },
         }),
       (err: unknown) => err instanceof Error && /same file/.test(err.message),
     );
