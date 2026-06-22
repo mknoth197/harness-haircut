@@ -140,8 +140,14 @@ export interface ApplyFlags {
    * unmanaged file is backed up + prompted (interactive) / refused
    * (--non-interactive), honoring PRD §9 "never overwrite an unmanaged file
    * silently".
+   *
+   * Optional and defaults to `false` (the safe standalone behavior): omitting
+   * it keeps the exported `ApplyFlags` backward-compatible for callers written
+   * against the pre-#40 three-flag shape (DoD: public types stay compatible
+   * within v0.x), and the omitted default is the protective path, never the
+   * silent-overwrite one.
    */
-  claimUnmanaged: boolean;
+  claimUnmanaged?: boolean;
 }
 
 export interface ApplyDeps {
@@ -526,7 +532,7 @@ export async function apply(deps: ApplyDeps): Promise<ApplyReport> {
     }
     const headered = detectHeaderPlacement(file.body) !== 'none';
     const decision = headered
-      ? planHeaderBearing(file, providerId, deps.writer, flags.claimUnmanaged)
+      ? planHeaderBearing(file, providerId, deps.writer, flags.claimUnmanaged ?? false)
       : planHeaderless(file, deps.writer, state);
 
     if (decision.skip) {

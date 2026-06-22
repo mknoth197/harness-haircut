@@ -209,6 +209,8 @@ function deepEqual(a: unknown, b: unknown): boolean {
 function auditMergeKeyFile(file: EmittedFile, reader: ProviderFileReader): DriftStatus {
   const disk = reader.read(file.path);
   if (disk === null) {
+    // The FILE itself is absent — `drift:missing` is accurate (and is what the
+    // absent-provider hint keys on to mean "no presence on disk", #43/gauntlet).
     return 'drift:missing';
   }
   // The merge-key file's body is the JSON of *only* the owned value (the
@@ -234,7 +236,12 @@ function auditMergeKeyFile(file: EmittedFile, reader: ProviderFileReader): Drift
   const mergeKey = file.mergeKey ?? '';
   const { found, value } = resolveOwnedValue(diskJson as Record<string, unknown>, mergeKey);
   if (!found) {
-    return 'drift:missing';
+    // The file EXISTS but lacks the owned key — that is divergence, not a
+    // missing file (gauntlet, Codex+Thermos). Reporting `drift:missing` here
+    // made the absent-provider hint falsely claim e.g. Gemini "has no files"
+    // when the user keeps their own `.gemini/settings.json` without
+    // `context.fileName`. `apply` will merge the key in → `drift:differs`.
+    return 'drift:differs';
   }
   const expected = JSON.parse(file.body) as unknown;
   return deepEqual(value, expected) ? 'clean' : 'drift:differs';
