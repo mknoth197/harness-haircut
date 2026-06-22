@@ -54,7 +54,12 @@ async function setup(
 
 function runAudit(
   root: string,
-  options: { strict?: boolean; disabled?: ProviderId[]; geminiMode?: 'settings' | 'shim' } = {},
+  options: {
+    strict?: boolean;
+    disabled?: ProviderId[];
+    geminiMode?: 'settings' | 'shim';
+    failOn?: 'warn' | 'drift';
+  } = {},
 ) {
   const reader = createProviderFileReader(root);
   const adapters = createAllAdapters().filter(
@@ -67,6 +72,7 @@ function runAudit(
     contextFor: contextFactory(root, reader, options.geminiMode ?? 'settings'),
     aliasOf: createSymlinkAliasProbe(root),
     strict: options.strict,
+    failOn: options.failOn,
   });
 }
 
@@ -199,15 +205,18 @@ describe('audit() — merge-key drift (§9 carve-out 2, §10)', () => {
     assert.equal(report.exitCode, 1);
   });
 
-  it('reports drift:missing when the owned key is absent from disk', async () => {
+  it('reports drift:differs when the owned key is absent but the file EXISTS (gauntlet)', async () => {
     const repo = await setup(CANONICAL);
     const path = join(repo.root, '.claude', 'settings.json');
+    // The file is present (user keeps a `theme` key) but lacks the owned `hooks`
+    // key. That is divergence, not a missing FILE — `drift:differs`, so the
+    // absent-provider hint never claims Claude "has no files".
     await writeFile(path, `${JSON.stringify({ theme: 'dark' }, null, 2)}\n`, 'utf8');
     const report = await runAudit(repo.root);
     const entry = report.files.find(
       (f) => f.path === '.claude/settings.json' && f.mergeKey === 'hooks',
     );
-    assert.equal(entry?.status, 'drift:missing');
+    assert.equal(entry?.status, 'drift:differs');
   });
 });
 
@@ -261,7 +270,7 @@ describe('audit() — merge-key dot-path (context.fileName, §9 carve-out 2)', (
     assert.equal(entry?.status, 'drift:differs');
   });
 
-  it('reports drift:missing when the nested context key is absent', async () => {
+  it('reports drift:differs when the nested context key is absent but the file EXISTS (gauntlet)', async () => {
     const repo = await setup(CANONICAL);
     const path = join(repo.root, '.gemini', 'settings.json');
     const settings = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
@@ -272,7 +281,21 @@ describe('audit() — merge-key dot-path (context.fileName, §9 carve-out 2)', (
     const entry = report.files.find(
       (f) => f.path === '.gemini/settings.json' && f.mergeKey === 'context.fileName',
     );
-    assert.equal(entry?.status, 'drift:missing');
+    // File present, owned key absent → divergence, not a missing file.
+    assert.equal(entry?.status, 'drift:differs');
+  });
+
+  it('the absent-provider hint does NOT fire for a present-but-keyless .gemini/settings.json (gauntlet)', async () => {
+    // The Codex+Thermos false-positive: a hand-kept .gemini/settings.json with
+    // no context.fileName must NOT be reported as "gemini has no files".
+    const repo = await setup(CANONICAL);
+    const path = join(repo.root, '.gemini', 'settings.json');
+    await writeFile(path, `${JSON.stringify({ theme: 'x' }, null, 2)}\n`, 'utf8');
+    const report = await runAudit(repo.root);
+    const gemini = report.files.find(
+      (f) => f.path === '.gemini/settings.json' && f.mergeKey === 'context.fileName',
+    );
+    assert.equal(gemini?.status, 'drift:differs', 'present-but-keyless settings.json is drift:differs, not missing');
   });
 });
 
@@ -307,6 +330,30 @@ describe('audit() — lossy warnings (EV4, OPT1)', () => {
     const report = await runAudit(repo.root, { strict: true });
     assert.equal(report.drift, false);
     assert.equal(report.exitCode, 1);
+  });
+
+  it('--fail-on drift makes a lossy-only warning exit 0, not 2 (#43)', async () => {
+    const repo = await setup(LOSSY);
+    const report = await runAudit(repo.root, { failOn: 'drift' });
+    assert.equal(report.drift, false);
+    // The warning is still reported; only the exit code is de-escalated.
+    assert.ok(report.warnings.some((w) => w.code === 'HH-W007'));
+    assert.equal(report.exitCode, 0);
+  });
+
+  it('--fail-on drift still fails (exit 1) on real drift (#43)', async () => {
+    const repo = await setup(LOSSY);
+    await rm(join(repo.root, '.github', 'copilot-instructions.md'));
+    const report = await runAudit(repo.root, { failOn: 'drift' });
+    assert.equal(report.drift, true);
+    assert.equal(report.exitCode, 1);
+  });
+
+  it('--fail-on drift overrides --strict for warnings (de-escalates to 0) (#43)', async () => {
+    const repo = await setup(LOSSY);
+    const report = await runAudit(repo.root, { strict: true, failOn: 'drift' });
+    assert.equal(report.drift, false);
+    assert.equal(report.exitCode, 0);
   });
 
   // The §9 v0.3.1 amendment exists so an edit to an emitted frontmatter glob

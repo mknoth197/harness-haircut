@@ -106,6 +106,17 @@ export interface AuditDeps {
   aliasOf?: (path: string) => string | null;
   /** `--strict` or config `warningsAsErrors`: escalate any warn to exit 1. */
   strict?: boolean;
+  /**
+   * #43: exit-code policy for the lossy-warning case (PRD §7 exit 2).
+   *   - `'warn'` (default): a standing `HH-Wxxx` warning exits 2 (and exits 1
+   *     under `--strict`) — the historical behavior.
+   *   - `'drift'`: ONLY real drift (1) or invalid config (3) fail; a
+   *     warnings-only run exits 0 (the warnings still print). This lets the CI
+   *     template match the pre-commit hook, which already tolerates exit 2 —
+   *     so a permanent, unfixable W001/W007 no longer wedges a drift-free repo's
+   *     CI. `'drift'` de-escalates warnings even when `--strict` is also set.
+   */
+  failOn?: 'warn' | 'drift';
 }
 
 function statusToDrift(status: VerifyStatus): DriftStatus {
@@ -198,6 +209,8 @@ function deepEqual(a: unknown, b: unknown): boolean {
 function auditMergeKeyFile(file: EmittedFile, reader: ProviderFileReader): DriftStatus {
   const disk = reader.read(file.path);
   if (disk === null) {
+    // The FILE itself is absent — `drift:missing` is accurate (and is what the
+    // absent-provider hint keys on to mean "no presence on disk", #43/gauntlet).
     return 'drift:missing';
   }
   // The merge-key file's body is the JSON of *only* the owned value (the
@@ -223,7 +236,12 @@ function auditMergeKeyFile(file: EmittedFile, reader: ProviderFileReader): Drift
   const mergeKey = file.mergeKey ?? '';
   const { found, value } = resolveOwnedValue(diskJson as Record<string, unknown>, mergeKey);
   if (!found) {
-    return 'drift:missing';
+    // The file EXISTS but lacks the owned key — that is divergence, not a
+    // missing file (gauntlet, Codex+Thermos). Reporting `drift:missing` here
+    // made the absent-provider hint falsely claim e.g. Gemini "has no files"
+    // when the user keeps their own `.gemini/settings.json` without
+    // `context.fileName`. `apply` will merge the key in → `drift:differs`.
+    return 'drift:differs';
   }
   const expected = JSON.parse(file.body) as unknown;
   return deepEqual(value, expected) ? 'clean' : 'drift:differs';
@@ -271,13 +289,18 @@ export async function audit(deps: AuditDeps): Promise<AuditReport> {
   const drift = files.some((file) => file.status !== 'clean' && file.status !== 'aliased');
   const hasWarnings = warnings.length > 0;
   const strictFail = deps.strict === true && hasWarnings;
+  // #43: `--fail-on drift` makes a warnings-only run a non-failure (exit 0). It
+  // overrides --strict's escalation too — the user has explicitly asked that
+  // only drift fail — so both warning branches below are gated off in that mode.
+  const failOnDriftOnly = deps.failOn === 'drift';
 
   // PRD §7 precedence: drift (1) beats lossy warnings (2) beats clean (0).
-  // --strict / warningsAsErrors escalate warnings to a drift-equivalent 1.
+  // --strict / warningsAsErrors escalate warnings to a drift-equivalent 1,
+  // unless `--fail-on drift` de-escalates them to 0.
   let exitCode: 0 | 1 | 2 | 3;
-  if (drift || strictFail) {
+  if (drift || (strictFail && !failOnDriftOnly)) {
     exitCode = 1;
-  } else if (hasWarnings) {
+  } else if (hasWarnings && !failOnDriftOnly) {
     exitCode = 2;
   } else {
     exitCode = 0;
