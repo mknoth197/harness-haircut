@@ -9,6 +9,7 @@ import {
   normalizeForCompare,
   recoverFromAgentsMd,
   recoverFromShim,
+  isMultiImportShim,
   recoverFromCopilotInstructions,
   recoverFragmentFromCopilot,
   recoverFragmentFromClaudeRule,
@@ -85,6 +86,99 @@ describe('recoverFromShim', () => {
       recoverFromShim(mixed),
       '@.github/instructions/testing.instructions.md\n\n# Local notes\nUse npm test.\n',
     );
+  });
+
+  // Finding #1: prose lines that merely BEGIN with `@` are not import lines and
+  // must NOT be dropped. `@TODO real content` has embedded whitespace and no
+  // `.md`, so the old `startsWith('@')` test wrongly collapsed it to '' (silent
+  // data loss). The path-shape regex keeps it.
+  it('keeps prose that begins with @ but is not an import line (@TODO …)', () => {
+    assert.equal(
+      recoverFromShim('@AGENTS.md\n@TODO real content\n'),
+      '@TODO real content\n',
+    );
+  });
+
+  it('keeps prose for @-prefixed lines that are not real imports (mention, JSDoc, CSS)', () => {
+    // None of these match `@<path>.md`: an at-mention (no `.md`), a JSDoc tag
+    // (space), a CSS at-rule (space) — all are genuine prose to preserve.
+    const mixed = '@AGENTS.md\n@channel ping the team\n@param x the thing\n@media screen\n';
+    assert.equal(recoverFromShim(mixed), '@channel ping the team\n@param x the thing\n@media screen\n');
+  });
+
+  // Finding #1, boundary: a single `@…notmd` line that is NOT an import keeps
+  // the file from being a pure shim, so it is preserved rather than dropped.
+  it('does not treat a lone @-prefixed non-import line as a pure shim', () => {
+    assert.equal(recoverFromShim('@AGENTS.md\n@see https://example.com\n'), '@see https://example.com\n');
+  });
+
+  // Finding #2: a BOM-saved pure multi-import shim must still recover '' — the
+  // leading BOM is stripped before the first-line check (mirroring the writer),
+  // so it does not re-manufacture the spurious root-instructions contradiction.
+  it('recovers empty from a BOM-prefixed pure multi-import shim', () => {
+    const shim =
+      '\uFEFF@AGENTS.md\n' +
+      '@.github/instructions/architecture.instructions.md\n' +
+      '@.github/instructions/testing.instructions.md\n';
+    assert.equal(recoverFromShim(shim), '');
+  });
+
+  it('strips a leading BOM before matching the import on a single-line shim', () => {
+    assert.equal(recoverFromShim('\uFEFF@AGENTS.md\n'), '');
+  });
+
+  it('strips a leading BOM and keeps prose below a BOM-saved shim', () => {
+    assert.equal(recoverFromShim('\uFEFF@AGENTS.md\n# Notes\nlocal\n'), '# Notes\nlocal\n');
+  });
+
+  // Finding #4: a genuine multi-import shim with relative `@../….md` import
+  // lines (a valid Claude Code pattern) is still pure → recovers ''.
+  it('recovers empty from a multi-import shim with relative @../ import paths', () => {
+    const shim =
+      '@AGENTS.md\n' +
+      '@../../.github/instructions/ui.instructions.md\n' +
+      '@.github/instructions/security.instructions.md\n';
+    assert.equal(recoverFromShim(shim), '');
+  });
+});
+
+describe('isMultiImportShim (F2: visible drop of a pure multi-import shim)', () => {
+  it('is true for @AGENTS.md followed by additional @… import lines', () => {
+    const shim =
+      '@AGENTS.md\n' +
+      '@.github/instructions/architecture.instructions.md\n' +
+      '@.github/instructions/testing.instructions.md\n';
+    assert.equal(isMultiImportShim(shim), true);
+  });
+
+  it('is true through a leading BOM (mirrors recovery)', () => {
+    assert.equal(
+      isMultiImportShim('\uFEFF@AGENTS.md\n@.github/instructions/testing.instructions.md\n'),
+      true,
+    );
+  });
+
+  // The trivial single-line `@AGENTS.md` shim is the expected, noiseless case —
+  // no note, so this MUST be false even though recovery also returns '' for it.
+  it('is false for the bare single-line @AGENTS.md shim', () => {
+    assert.equal(isMultiImportShim('@AGENTS.md\n'), false);
+    assert.equal(isMultiImportShim('@AGENTS.md'), false);
+  });
+
+  it('is false when blank lines are all that follow @AGENTS.md', () => {
+    assert.equal(isMultiImportShim('@AGENTS.md\n\n\n'), false);
+  });
+
+  it('is false when genuine prose rides along (recovery would keep it)', () => {
+    assert.equal(
+      isMultiImportShim('@AGENTS.md\n@.github/instructions/testing.instructions.md\n# Notes\nx\n'),
+      false,
+    );
+    assert.equal(isMultiImportShim('@AGENTS.md\n@TODO real content\n'), false);
+  });
+
+  it('is false for a non-shim file (no leading @AGENTS.md import)', () => {
+    assert.equal(isMultiImportShim('# Real instructions\nUse npm.\n'), false);
   });
 });
 

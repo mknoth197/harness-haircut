@@ -194,6 +194,30 @@ describe('init() — multi-import CLAUDE.md shim modeling', () => {
     // AGENTS.md content survives as the canonical root (the shim added nothing).
     const written = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
     assert.match(written, /Use npm test\./);
+    // F2 (#3): dropping the multi-import shim must be VISIBLE — a note names the
+    // file and explains it was treated as empty (no silent loss).
+    assert.ok(
+      report.notes.some((n) => /multi-import shim/i.test(n) && n.includes('CLAUDE.md')),
+      `expected a multi-import-shim note naming CLAUDE.md, got: ${JSON.stringify(report.notes)}`,
+    );
+  });
+
+  // F2 (#3) carve-out: the trivial single-line `@AGENTS.md` shim is the expected,
+  // noiseless case — it recovers '' like the multi-import shim but must NOT emit
+  // a note (only files where extra `@…` import lines were collapsed do).
+  it('does NOT emit a multi-import-shim note for a bare single-line @AGENTS.md shim', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      'CLAUDE.md': '@AGENTS.md\n',
+    });
+    const report = await runInit(repo.root);
+
+    assert.equal(report.exitCode, 0);
+    assert.equal(
+      report.notes.some((n) => /multi-import shim/i.test(n)),
+      false,
+      `bare single-line shim must be silent, got: ${JSON.stringify(report.notes)}`,
+    );
   });
 
   // Negative control (requirement 2, last sentence): the shim emptying must not
