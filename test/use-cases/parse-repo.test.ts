@@ -1,7 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { AggregateParseError, ParseError, parseRepo, readRepoSnapshot } from '../../dist/index.js';
+import {
+  AggregateParseError,
+  ParseError,
+  claudeAdapter,
+  copilotAdapter,
+  parseRepo,
+  readRepoSnapshot,
+} from '../../dist/index.js';
 import type { ParseRepoResult } from '../../dist/index.js';
+import { ctxWith } from '../_helpers/ir.ts';
 import { mkTempRepo } from '../_helpers/tmp-repo.ts';
 
 /** Integration per testing.md: real filesystem in os.tmpdir(), real gateway. */
@@ -230,6 +238,63 @@ describe('parseRepo — frontmatter subset honesty', () => {
     });
     assert.equal(warnings[0]?.code, 'HH-W014');
     assert.match(warnings[0]?.message ?? '', /Double-quote the whole value/);
+  });
+
+  // Finding 4 (#60): a value containing BOTH quote characters can wear neither
+  // style faithfully (the subset does no escape processing), so the advisory
+  // must steer to REWORDING — never recommend an unusable quote style.
+  it('advises rewording when the " #" value contains both a single- and double-quote', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: it\'s a "thing", see issue #9\n---\nBody.\n',
+    });
+    assert.equal(ir.skills[0]?.description, 'it\'s a "thing", see issue #9');
+    assert.equal(warnings[0]?.code, 'HH-W014');
+    assert.match(warnings[0]?.message ?? '', /reword it to drop the " #"/);
+    // It must NOT recommend a quote style the value cannot actually wear.
+    assert.doesNotMatch(warnings[0]?.message ?? '', /Single-quote the whole value/);
+    assert.doesNotMatch(warnings[0]?.message ?? '', /Double-quote the whole value/);
+  });
+
+  // Finding 1 (#60): an inline-array value containing " #" in ANY item is NOT
+  // silent — the shared pre-check (warnAmbiguousComment on the whole unquoted
+  // `rest`) sees the bracket string `[a #1, b]`, which contains the " #"
+  // substring, and warns EXACTLY ONCE. (The reviewer suspected this branch
+  // shipped silently; it does not — covered here so a refactor can't regress
+  // it into either silence or a double-warning.)
+  it('warns HH-W014 exactly once for a " #" in the first inline-array item', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: d\ntags: [a #1, b]\n---\nBody.\n',
+    });
+    // The item is kept byte-for-byte, including the comment-like remainder.
+    assert.equal(ir.skills[0]?.frontmatter.includes('tags: [a #1, b]'), true);
+    const w14 = warnings.filter((w) => w.code === 'HH-W014');
+    assert.equal(w14.length, 1, 'expected exactly one HH-W014 (not silent, not doubled)');
+    assert.equal(w14[0]?.canonicalPath, '.agents/skills/demo/SKILL.md');
+    assert.match(w14[0]?.message ?? '', /ambiguous " #"/);
+  });
+
+  // The " #" is equally caught when it sits in a LATER item — the pre-check is
+  // over the whole bracket, so position does not matter.
+  it('warns HH-W014 once for a " #" in a later inline-array item', async () => {
+    const { warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: d\ntags: [a, b #2]\n---\nBody.\n',
+    });
+    assert.equal(warnings.filter((w) => w.code === 'HH-W014').length, 1);
+  });
+
+  // A clean inline array (no " #" in any item) stays warning-free.
+  it('does not warn on an inline array whose items are free of " #"', async () => {
+    const { warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: d\ntags: [a, b, c]\n---\nBody.\n',
+    });
+    assert.deepEqual(
+      warnings.filter((w) => w.code === 'HH-W014'),
+      [],
+    );
   });
 });
 
@@ -589,5 +654,42 @@ describe('parseRepo — HH-W012 (canonical source excluded by .gitignore)', () =
     const w012 = warnings.filter((w) => w.code === 'HH-W012');
     assert.equal(w012.length, 1);
     assert.equal(w012[0]?.canonicalPath, '.agents/');
+  });
+});
+
+// Finding 2 (#60): the parsed IR was checked, but no test followed a
+// " #"-bearing scope THROUGH a projection — exactly the gap that let a broken
+// literal glob reach Claude `paths:` / Copilot `applyTo:` unnoticed. These
+// drive both adapters from the real parsed instruction and assert (a) the
+// emitted glob carries the literal value and (b) parse did NOT stay silent.
+describe('parseRepo — " #" scope projects to provider globs (and is not silent)', () => {
+  it('projects a " #" scope into Claude paths: and Copilot applyTo:, with HH-W014 from parse', async () => {
+    const { ir, warnings } = await parseFixture({
+      'AGENTS.md': '# root\n',
+      '.agents/instructions/c.md': '---\nscope: src/** # only source\n---\nGuidance.\n',
+    });
+    // (b) parse surfaced the ambiguity — the projection is NOT silent.
+    const w14 = warnings.filter((w) => w.code === 'HH-W014');
+    assert.equal(w14.length, 1, 'expected exactly one HH-W014 from parse');
+
+    const fragment = ir.instructions.find((i) => i.path === '.agents/instructions/c.md');
+    assert.ok(fragment, 'expected the scoped fragment in the IR');
+    assert.equal(fragment?.scope, 'src/** # only source');
+
+    // (a) Claude: the literal glob lands verbatim in the rule's paths: frontmatter.
+    const claudeProjection = claudeAdapter.project(ir, ctxWith());
+    const rule = claudeProjection.files.find(
+      (f) => f.path === '.claude/rules/hh.c.md',
+    );
+    assert.ok(rule, 'expected a .claude/rules/hh.c.md rule file');
+    assert.match(rule?.body ?? '', /paths: \["src\/\*\* # only source"\]/);
+
+    // (a) Copilot: same literal lands in applyTo:.
+    const copilotProjection = copilotAdapter.project(ir, ctxWith());
+    const instr = copilotProjection.files.find(
+      (f) => f.path === '.github/instructions/hh.c.instructions.md',
+    );
+    assert.ok(instr, 'expected a .github/instructions/hh.c.instructions.md file');
+    assert.match(instr?.body ?? '', /applyTo: "src\/\*\* # only source"/);
   });
 });
