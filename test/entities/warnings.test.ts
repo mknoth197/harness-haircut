@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import {
   WARNING_CATALOGUE,
   WARNING_CODES,
@@ -7,6 +10,10 @@ import {
   warningDocPath,
 } from '../../dist/index.js';
 import type { Warning } from '../../dist/index.js';
+
+// Repo root resolved from this file (test/entities/ -> ../../), so the check
+// holds regardless of the cwd `npm test` runs from.
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const EXPECTED_CODES = [
   'HH-W001',
@@ -19,6 +26,7 @@ const EXPECTED_CODES = [
   'HH-W011',
   'HH-W012',
   'HH-W013',
+  'HH-W014',
 ];
 
 describe('warning catalogue', () => {
@@ -50,10 +58,24 @@ describe('warning catalogue', () => {
       parsed['HH-W013'],
       'provider path skipped: a symlink aliases it onto another repo path',
     );
+    assert.equal(
+      parsed['HH-W014'],
+      'unquoted frontmatter value contains an ambiguous " #", kept as literal text',
+    );
   });
 
   it('links every code to its docs/warnings page', () => {
     assert.equal(warningDocPath('HH-W003'), 'docs/warnings/HH-W003.md');
+  });
+
+  // #60: warningDocPath advertises a path per code; if the file is missing the
+  // link 404s. Every registered code must have its page on disk so a new code
+  // (HH-W014 was the gap) cannot ship without documentation.
+  it('has a docs/warnings/<code>.md file on disk for every registered code', () => {
+    const missing = WARNING_CODES.filter(
+      (code) => !existsSync(join(REPO_ROOT, warningDocPath(code))),
+    );
+    assert.deepEqual(missing, [], `missing warning doc pages: ${missing.join(', ')}`);
   });
 });
 
