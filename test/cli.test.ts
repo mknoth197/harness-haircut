@@ -253,12 +253,6 @@ describe('audit E2E (spawn dist/bin.js)', () => {
       'AGENTS.md': '# Project standards\n\nUse npm test.\n',
       '.agents/skills/foo/SKILL.md':
         '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
-      // This repo seeds no native provider files, so the new default (derive the
-      // active set from detected provider files, #dogfood-round2 (9)) would
-      // leave NOTHING projected and these audit-mechanics assertions vacuous.
-      // Force the full matrix via the explicit `"all"` escape hatch so the test
-      // continues to exercise drift detection across every provider.
-      'harness-haircut.config.json': '{"providers":"all"}\n',
     });
     repos.push(repo);
     await emitProjection(repo.root);
@@ -329,11 +323,6 @@ describe('audit E2E (spawn dist/bin.js)', () => {
       'AGENTS.md': '# Project\n\nUse npm test.\n',
       '.agents/instructions/testing.md':
         '---\nscope: "test/**/*.ts"\n---\n# Testing\n\nUse node:test.\n',
-      // Force the full matrix (see cleanRepo): the HH-W007 these tests assert on
-      // is gemini's scoped-fragment lossiness, which only fires when gemini is
-      // active. With the new auto-derive default an un-applied repo has no
-      // detected providers, so pin `"all"` to keep gemini in the set.
-      'harness-haircut.config.json': '{"providers":"all"}\n',
     });
     repos.push(repo);
     await emitProjection(repo.root);
@@ -409,15 +398,7 @@ describe('audit E2E (spawn dist/bin.js)', () => {
   });
 
   it('#43 names an absent provider with the providers_disabled remedy', async () => {
-    const repo = await mkTempRepo({
-      'AGENTS.md': '# Project\n\nUse npm test.\n',
-      // `"all"` forces every provider on (escape hatch). Without it the new
-      // auto-derive default (#dogfood-round2 (9)) would never create gemini's
-      // file here, so there would be nothing to remove. With `"all"` gemini stays
-      // enabled but, once its only file is gone and it is undetected, it lands in
-      // the "truly absent" bucket whose remedy is `providers_disabled`.
-      'harness-haircut.config.json': '{"providers":"all"}\n',
-    });
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n\nUse npm test.\n' });
     repos.push(repo);
     // apply creates every enabled provider's files; remove Gemini's only file so
     // gemini is entirely absent — the no-Gemini-repo shape from the dogfood.
@@ -434,17 +415,14 @@ describe('audit E2E (spawn dist/bin.js)', () => {
   });
 
   it('#43 does NOT name gemini absent when .gemini/settings.json exists but lacks the key (gauntlet)', async () => {
-    const repo = await mkTempRepo({
-      'AGENTS.md': '# Project\n\nUse npm test.\n',
-      // Force the full matrix so gemini is applied here (see the test above).
-      'harness-haircut.config.json': '{"providers":"all"}\n',
-    });
+    const repo = await mkTempRepo({ 'AGENTS.md': '# Project\n\nUse npm test.\n' });
     repos.push(repo);
     spawnSync(process.execPath, [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'], {
       encoding: 'utf8',
     });
     // The file EXISTS but the user dropped the owned key → drift:differs, not a
-    // missing file. The absent-provider hint must not claim gemini "has no files".
+    // missing file. The absent-provider hint must not name gemini at all (it has
+    // a file, just not the owned key) — #43 + #dogfood-round2 (10).
     await writeFile(
       join(repo.root, '.gemini', 'settings.json'),
       `${JSON.stringify({ theme: 'x' }, null, 2)}\n`,
@@ -454,7 +432,7 @@ describe('audit E2E (spawn dist/bin.js)', () => {
       encoding: 'utf8',
     });
     assert.equal(r.status, 1); // still drift (the owned key diverges)
-    assert.doesNotMatch(r.stdout, /no files in this repo \(gemini\)/);
+    assert.doesNotMatch(r.stdout, /no in-sync projected files in this repo \(gemini\)/);
     assert.doesNotMatch(r.stdout, /providers_disabled/);
   });
 });
@@ -471,12 +449,6 @@ describe('apply E2E (spawn dist/bin.js)', () => {
       '.agents/skills/foo/SKILL.md':
         '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
       '.agents/hooks/pre-tool-use.lint.sh': '#!/usr/bin/env bash\necho lint\n',
-      // These apply-mechanics tests assert that every provider's files land on
-      // disk (copilot/claude/codex/gemini). The new default derives the active
-      // set from detected provider files (#dogfood-round2 (9)); a fresh
-      // canonical-only repo detects none, so pin `"all"` to keep materializing
-      // the full matrix. A dedicated suite below covers the derive default.
-      'harness-haircut.config.json': '{"providers":"all"}\n',
     });
     repos.push(repo);
     return repo;
@@ -595,10 +567,7 @@ describe('apply E2E (spawn dist/bin.js)', () => {
     const repo = await mkTempRepo({
       'AGENTS.md': '# Project standards\n\nUse npm test.\n',
       'evals/fixtures/codex/cerebro-skill/AGENTS.md': '# Fixture\n\nFixture content.\n',
-      // `"all"` keeps the full matrix projecting (this test predates the
-      // auto-derive default and asserts copilot output lands); it is orthogonal
-      // to the `exclude` behavior under test.
-      'harness-haircut.config.json': '{"providers":"all","exclude":["evals/fixtures/**"]}\n',
+      'harness-haircut.config.json': '{"exclude":["evals/fixtures/**"]}\n',
     });
     repos.push(repo);
     const r = spawnSync(
@@ -623,87 +592,24 @@ describe('apply E2E (spawn dist/bin.js)', () => {
   });
 });
 
-// #dogfood-round2 (9) + (10): with `providers` UNSET, the active set is derived
-// from providers that have files in the repo, so `apply` does not materialize a
-// brand-new provider file for an absent provider, and the audit hint is accurate.
-describe('provider auto-detect default (#dogfood-round2 (9)/(10), spawn dist/bin.js)', () => {
+// #dogfood-round2 (10): the audit absent-provider hint must describe the actual
+// condition — a provider whose every PROJECTED file is missing on disk has "no
+// in-sync projected files", NOT "no files in this repo". The dogfood bug named
+// `claude` as having "no files" though a populated `.claude/` tree existed. With
+// the all-providers default, claude is enabled; its projected `CLAUDE.md` shim
+// is missing here, so it is named — but the corrected wording is accurate and
+// never claims claude has no files at all.
+describe('audit absent-provider hint wording (#dogfood-round2 (10), spawn dist/bin.js)', () => {
   const repos: TempRepo[] = [];
   after(async () => {
     await Promise.all(repos.map((repo) => repo.cleanup()));
   });
 
-  // (9): a repo with NO `.gemini` (and no other gemini presence) + `providers`
-  // unset → apply must NOT create `.gemini/settings.json`. It still projects the
-  // providers that ARE present (here: claude via CLAUDE.md, copilot via the
-  // review file the apply itself writes for detected copilot — see below).
-  it('(9) apply does NOT create .gemini/settings.json when gemini is absent and providers is unset', async () => {
-    // Seed a claude-only repo: a CLAUDE.md import shim is real claude evidence.
+  it('(10) names claude without claiming it "has no files" when .claude/ exists', async () => {
     const repo = await mkTempRepo({
       'AGENTS.md': '# Project standards\n\nUse npm test.\n',
-      'CLAUDE.md': '@AGENTS.md\n',
-    });
-    repos.push(repo);
-    const r = spawnSync(
-      process.execPath,
-      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
-      { encoding: 'utf8' },
-    );
-    assert.equal(r.status, 0, r.stderr || r.stdout);
-    // The absent provider's file is NOT materialized.
-    assert.equal(existsSync(join(repo.root, '.gemini', 'settings.json')), false);
-    // The detected provider (claude) IS projected — its shim is refreshed.
-    assert.equal(existsSync(join(repo.root, 'CLAUDE.md')), true);
-  });
-
-  // (9) escape hatch: an explicit `providers: ["gemini"]` DOES create
-  // `.gemini/settings.json` even though gemini has no presence in the repo.
-  it('(9) explicit providers:["gemini"] DOES create .gemini/settings.json', async () => {
-    const repo = await mkTempRepo({
-      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
-      'harness-haircut.config.json': '{"providers":["gemini"]}\n',
-    });
-    repos.push(repo);
-    const r = spawnSync(
-      process.execPath,
-      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
-      { encoding: 'utf8' },
-    );
-    assert.equal(r.status, 0, r.stderr || r.stdout);
-    assert.equal(existsSync(join(repo.root, '.gemini', 'settings.json')), true);
-    // The explicit pin is gemini-only: copilot's file is NOT written.
-    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
-  });
-
-  // (9): a fresh canonical-only repo (no provider files at all) + providers unset
-  // → apply writes nothing but the state file, exiting 0 with "nothing to do" or
-  // a clean no-op. Critically it does NOT create copilot/claude/gemini files.
-  it('(9) apply on a canonical-only repo with providers unset creates no provider files', async () => {
-    const repo = await mkTempRepo({
-      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
-    });
-    repos.push(repo);
-    const r = spawnSync(
-      process.execPath,
-      [binPath, 'apply', '--cwd', repo.root, '--allow-dirty'],
-      { encoding: 'utf8' },
-    );
-    assert.equal(r.status, 0, r.stderr || r.stdout);
-    assert.equal(existsSync(join(repo.root, '.github', 'copilot-instructions.md')), false);
-    assert.equal(existsSync(join(repo.root, 'CLAUDE.md')), false);
-    assert.equal(existsSync(join(repo.root, '.gemini', 'settings.json')), false);
-  });
-
-  // (10): the audit absent-provider hint must NOT claim a provider "has no files"
-  // when that provider plainly HAS files — the exact dogfood bug, where the hint
-  // named `claude` though a populated `.claude/` tree existed. Here claude is
-  // detected (`.claude/skills/`) but its projected `CLAUDE.md` shim is missing on
-  // disk, so it lands in the "have files but no in-sync projected files" bucket:
-  // the hint must say that, never "no files", and must not suggest disabling it.
-  it('(10) audit hint does not claim claude "has no files" when .claude/ exists', async () => {
-    const repo = await mkTempRepo({
-      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
-      // Populated `.claude/` tree = real claude evidence; NO CLAUDE.md, so the
-      // projected shim target is missing → `drift:missing`.
+      // Populated `.claude/` tree; NO CLAUDE.md, so the projected shim target is
+      // missing → `drift:missing` → claude is named in the hint.
       '.claude/skills/foo/SKILL.md':
         '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
     });
@@ -711,31 +617,10 @@ describe('provider auto-detect default (#dogfood-round2 (9)/(10), spawn dist/bin
     const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
       encoding: 'utf8',
     });
-    // Claude IS named (its shim is missing), but with ACCURATE wording.
-    assert.match(r.stdout, /claude/);
+    // Claude IS named (its projected shim is missing), but with ACCURATE wording:
+    // "no in-sync projected files", never the inaccurate "no files in this repo".
+    assert.match(r.stdout, /no in-sync projected files in this repo \([^)]*claude[^)]*\)/);
     assert.doesNotMatch(r.stdout, /no files in this repo \([^)]*claude[^)]*\)/);
-    assert.match(r.stdout, /have files in this repo but no in-sync projected files \([^)]*claude/);
-    // Never suggest disabling a provider that is clearly in use.
-    assert.doesNotMatch(
-      r.stdout,
-      /claude[^]*providers_disabled/,
-      'must not suggest disabling claude when it has files',
-    );
-  });
-
-  // (10): doctor's config echo shows the auto-detected active set (not a bare
-  // "all") when `providers` is unset, so the derive behavior is visible.
-  it('(10) doctor shows providers as auto-detected when unset', async () => {
-    const repo = await mkTempRepo({
-      'AGENTS.md': '# Project\n',
-      'CLAUDE.md': '@AGENTS.md\n',
-    });
-    repos.push(repo);
-    const r = spawnSync(process.execPath, [binPath, 'doctor', '--cwd', repo.root], {
-      encoding: 'utf8',
-    });
-    assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /providers\s+auto \(detected: [^)]*claude[^)]*\)/);
   });
 });
 
@@ -747,16 +632,7 @@ describe('init E2E (spawn dist/bin.js)', () => {
 
   it('init --non-interactive on a zero-contradiction repo exits 0, then audit exits 0', async () => {
     const body = '@AGENTS.md\n\n# Project standards\n\nUse npm test.\n';
-    // The repo's native files are CLAUDE.md + GEMINI.md only, so the new
-    // auto-derive default (#dogfood-round2 (9)) would onboard just those two and
-    // never produce `.github/copilot-instructions.md`. This test asserts the
-    // full matrix round-trips clean, so pin `"all"`; a dedicated derive-default
-    // test below covers the no-copilot-file case.
-    const repo = await mkTempRepo({
-      'CLAUDE.md': body,
-      'GEMINI.md': body,
-      'harness-haircut.config.json': '{"providers":"all"}\n',
-    });
+    const repo = await mkTempRepo({ 'CLAUDE.md': body, 'GEMINI.md': body });
     repos.push(repo);
     const r = spawnSync(
       process.execPath,
@@ -1145,10 +1021,6 @@ describe('prompt lifecycle E2E (#39, spawn dist/bin.js)', () => {
       'AGENTS.md': '# Project standards\n\nUse npm test.\n',
       '.agents/skills/foo/SKILL.md':
         '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
-      // Force the full matrix so the first apply materializes the claude/copilot
-      // files this test then hand-edits (the new auto-derive default would emit
-      // nothing for a fresh canonical-only repo).
-      'harness-haircut.config.json': '{"providers":"all"}\n',
     });
     repos.push(repo);
     // Emit, then hand-edit TWO generated header-bearing files → two prompts.
@@ -1198,11 +1070,6 @@ describe('symlink-aliased targets E2E (#35, spawn dist/bin.js)', () => {
     const repo = await mkTempRepo({
       'AGENTS.md': '# Project standards\n\nUse npm test.\n',
       '.agents/skills/foo/SKILL.md': CANONICAL_SKILL,
-      // The HH-W013 path under test is claude's aliased `.claude/skills/foo`.
-      // The walk never follows that symlink, so claude has no *non-symlinked*
-      // presence and the new auto-derive default (#dogfood-round2 (9)) would
-      // drop it. Pin `"all"` to keep claude active so the alias is reached.
-      'harness-haircut.config.json': '{"providers":"all"}\n',
     });
     repos.push(repo);
     await mkdir(join(repo.root, '.claude', 'skills'), { recursive: true });
@@ -1335,11 +1202,6 @@ describe('#47 CLI polish E2E (spawn dist/bin.js)', () => {
       'AGENTS.md': '# Project\n\nUse npm test.\n',
       '.github/instructions/testing.instructions.md':
         '---\napplyTo: "test/**/*.ts"\n---\n# Testing\n\nUse node:test.\n',
-      // The warning under test (HH-W007) is gemini's — a scoped fragment is
-      // unrepresentable for Gemini. This repo has no native gemini file, so the
-      // new auto-derive default would drop gemini and the warning would never
-      // fire; pin `"all"` to keep gemini active.
-      'harness-haircut.config.json': '{"providers":"all"}\n',
     });
     repos.push(repo);
     const r = spawnSync(process.execPath, [binPath, 'init', '--cwd', repo.root], {

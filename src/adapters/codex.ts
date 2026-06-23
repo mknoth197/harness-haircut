@@ -122,11 +122,11 @@ export const codexAdapter: ProviderAdapter = {
         code: 'HH-W004',
         severity: 'warn',
         message:
-          `a root→cwd AGENTS.md chain totals ${chainBytes} bytes, over Codex's ` +
-          `${CODEX_PROJECT_DOC_MAX_BYTES}-byte project_doc_max_bytes default; ` +
+          `the heaviest root→cwd AGENTS.md chain totals ${chainBytes} bytes, over ` +
+          `Codex's ${CODEX_PROJECT_DOC_MAX_BYTES}-byte project_doc_max_bytes default; ` +
           'Codex silently stops loading files past the cap for that working ' +
-          'directory (measured along the deepest root→cwd chain, not by summing ' +
-          'sibling AGENTS.md in unrelated subtrees)',
+          'directory (measured as the largest single root→cwd chain by bytes, not ' +
+          'by summing sibling AGENTS.md in unrelated subtrees)',
         providerId: 'codex',
       });
     }

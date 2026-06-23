@@ -185,16 +185,19 @@ describe('codexAdapter — 32 KiB chain cap (EV1 / HH-W004)', () => {
   // one working directory — only the root + the nested files on the path down to
   // a given cwd.
   it('does NOT warn when sibling AGENTS.md sum exceeds the cap but no single chain does', () => {
-    // Three quarter-cap siblings + a small root. Each chain = root + ONE sibling
-    // ≈ cap/4, well under the cap; the SUM (≈ 3·cap/4 + root) exceeds it.
-    const quarter = 'x'.repeat(Math.floor(CODEX_PROJECT_DOC_MAX_BYTES / 4));
+    // Three half-cap siblings + a 7-byte root. Each root→cwd chain is root + ONE
+    // sibling = 16391 B, well under the 32768 B cap (the per-chain check stays
+    // silent). The whole-repo SUM (root + 3·cap/2 = 49159 B) is ~1.5× the cap —
+    // the old whole-repo-summation bug WOULD have warned here, so this now
+    // distinguishes the per-chain fix from that bug.
+    const half = 'x'.repeat(CODEX_PROJECT_DOC_MAX_BYTES / 2);
     const projection = codexAdapter.project(
       ir({
         instructions: [
           rootInstruction('# root\n'),
-          nestedInstruction('packages/a', quarter),
-          nestedInstruction('packages/b', quarter),
-          nestedInstruction('packages/c', quarter),
+          nestedInstruction('packages/a', half),
+          nestedInstruction('packages/b', half),
+          nestedInstruction('packages/c', half),
         ],
       }),
       ctxWith(),
@@ -202,7 +205,7 @@ describe('codexAdapter — 32 KiB chain cap (EV1 / HH-W004)', () => {
     assert.deepEqual(projection.warnings, []);
   });
 
-  // The deepest single chain (root → packages/a → packages/a/web) is what counts.
+  // The heaviest single chain by bytes (root + packages/a) is what counts.
   it('warns for the heaviest root→cwd chain even when siblings stay light', () => {
     const big = 'x'.repeat(CODEX_PROJECT_DOC_MAX_BYTES); // root alone == cap (no warn yet)
     const overflow = 'y'.repeat(64); // any nested file on the chain tips it over
@@ -231,6 +234,11 @@ describe('codexAdapter — 32 KiB chain cap (EV1 / HH-W004)', () => {
     const reported = Number(m![1]);
     assert.ok(reported > CODEX_PROJECT_DOC_MAX_BYTES, 'reported chain is over the cap');
     assert.ok(reported < wholeRepoSum, 'reported chain is a single chain, not the whole-repo sum');
+    // The wording must match what maxChainBytes actually computes — the HEAVIEST
+    // chain by bytes — not the "deepest" chain (review: those differ on a
+    // branching tree, so the message must not claim "deepest").
+    assert.match(projection.warnings[0]?.message ?? '', /heaviest root→cwd AGENTS\.md chain/);
+    assert.doesNotMatch(projection.warnings[0]?.message ?? '', /deepest/);
   });
 
   // A deep linear chain (root → a → a/b → a/b/c) sums past the cap → warn.

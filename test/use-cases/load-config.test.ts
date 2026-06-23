@@ -1,12 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  loadConfig,
-  defaultConfig,
-  defaultAssistConfig,
-  enabledProviders,
-  effectiveProviders,
-} from '../../dist/index.js';
+import { loadConfig, defaultConfig, defaultAssistConfig, enabledProviders } from '../../dist/index.js';
 import { InvalidConfigError } from '../../dist/index.js';
 
 describe('loadConfig — defaults', () => {
@@ -81,6 +75,9 @@ describe('loadConfig — invalid input', () => {
 
   it('throws when providers is not an array', () => {
     assert.throws(() => loadConfig('{"providers":"claude"}'), InvalidConfigError);
+    // `null` (unset) means all four; there is no `"all"` scalar — a string is
+    // never a valid `providers` value.
+    assert.throws(() => loadConfig('{"providers":"all"}'), InvalidConfigError);
   });
 
   it('throws on a non-boolean warningsAsErrors', () => {
@@ -103,69 +100,6 @@ describe('loadConfig — invalid input', () => {
     );
   });
 
-  // #dogfood-round2 (9): `"providers": "all"` is the explicit escape hatch that
-  // forces every provider on regardless of repo evidence.
-  it('parses "providers": "all" as the explicit all-providers escape hatch', () => {
-    const config = loadConfig('{"providers":"all"}');
-    assert.equal(config.providers, 'all');
-    assert.deepEqual(enabledProviders(config), ['copilot', 'claude', 'codex', 'gemini']);
-  });
-
-  it('still throws on a non-"all" providers string (only "all" is a valid scalar)', () => {
-    assert.throws(() => loadConfig('{"providers":"claude"}'), InvalidConfigError);
-    assert.throws(() => loadConfig('{"providers":"none"}'), InvalidConfigError);
-  });
-});
-
-// #dogfood-round2 (9): effectiveProviders derives the active set from detected
-// provider files when `providers` is UNSET, so apply does not materialize files
-// for a provider with zero repo presence. An explicit list or `"all"` overrides
-// detection. enabledProviders keeps the legacy null→all reading for callers
-// without repo evidence (e.g. doctor's static echo).
-describe('effectiveProviders — derive-from-detected vs explicit', () => {
-  it('unset providers → only detected providers are active (in canonical order)', () => {
-    const config = loadConfig(null); // providers === null
-    assert.deepEqual(effectiveProviders(config, ['claude', 'codex']), ['claude', 'codex']);
-    assert.deepEqual(effectiveProviders(config, ['gemini', 'copilot']), ['copilot', 'gemini']);
-  });
-
-  it('unset providers + NOTHING detected → an empty active set (no files materialized)', () => {
-    assert.deepEqual(effectiveProviders(loadConfig(null), []), []);
-  });
-
-  it('"all" forces every provider on even when nothing is detected (escape hatch)', () => {
-    const config = loadConfig('{"providers":"all"}');
-    assert.deepEqual(effectiveProviders(config, []), ['copilot', 'claude', 'codex', 'gemini']);
-  });
-
-  it('an explicit allow-list is honored unchanged, ignoring detection', () => {
-    const config = loadConfig('{"providers":["gemini"]}');
-    // gemini is NOT detected, yet the explicit pin keeps it active.
-    assert.deepEqual(effectiveProviders(config, ['claude', 'copilot']), ['gemini']);
-  });
-
-  it('providers_disabled is subtracted in every mode', () => {
-    assert.deepEqual(
-      effectiveProviders(loadConfig('{"providers_disabled":["gemini"]}'), ['gemini', 'claude']),
-      ['claude'],
-    );
-    assert.deepEqual(
-      effectiveProviders(loadConfig('{"providers":"all","providers_disabled":["codex"]}'), []),
-      ['copilot', 'claude', 'gemini'],
-    );
-    assert.deepEqual(
-      effectiveProviders(loadConfig('{"providers":["claude","gemini"],"providers_disabled":["gemini"]}'), []),
-      ['claude'],
-    );
-  });
-
-  it('ignores duplicate / unknown-order detected ids and dedupes via canonical order', () => {
-    // Detection order does not matter; the result is canonical A-story order.
-    assert.deepEqual(
-      effectiveProviders(loadConfig(null), ['copilot', 'claude', 'copilot', 'codex']),
-      ['copilot', 'claude', 'codex'],
-    );
-  });
 });
 
 describe('loadConfig() init.assist (C4)', () => {
