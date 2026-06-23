@@ -421,7 +421,8 @@ describe('audit E2E (spawn dist/bin.js)', () => {
       encoding: 'utf8',
     });
     // The file EXISTS but the user dropped the owned key → drift:differs, not a
-    // missing file. The absent-provider hint must not claim gemini "has no files".
+    // missing file. The absent-provider hint must not name gemini at all (it has
+    // a file, just not the owned key) — #43 + #dogfood-round2 (10).
     await writeFile(
       join(repo.root, '.gemini', 'settings.json'),
       `${JSON.stringify({ theme: 'x' }, null, 2)}\n`,
@@ -431,7 +432,7 @@ describe('audit E2E (spawn dist/bin.js)', () => {
       encoding: 'utf8',
     });
     assert.equal(r.status, 1); // still drift (the owned key diverges)
-    assert.doesNotMatch(r.stdout, /no files in this repo \(gemini\)/);
+    assert.doesNotMatch(r.stdout, /no in-sync projected files in this repo \(gemini\)/);
     assert.doesNotMatch(r.stdout, /providers_disabled/);
   });
 });
@@ -588,6 +589,38 @@ describe('apply E2E (spawn dist/bin.js)', () => {
       ? readdirSync(instrDir).filter((f) => f.startsWith('hh.nested-'))
       : [];
     assert.deepEqual(nested, [], 'no nested-fixture instructions projection');
+  });
+});
+
+// #dogfood-round2 (10): the audit absent-provider hint must describe the actual
+// condition — a provider whose every PROJECTED file is missing on disk has "no
+// in-sync projected files", NOT "no files in this repo". The dogfood bug named
+// `claude` as having "no files" though a populated `.claude/` tree existed. With
+// the all-providers default, claude is enabled; its projected `CLAUDE.md` shim
+// is missing here, so it is named — but the corrected wording is accurate and
+// never claims claude has no files at all.
+describe('audit absent-provider hint wording (#dogfood-round2 (10), spawn dist/bin.js)', () => {
+  const repos: TempRepo[] = [];
+  after(async () => {
+    await Promise.all(repos.map((repo) => repo.cleanup()));
+  });
+
+  it('(10) names claude without claiming it "has no files" when .claude/ exists', async () => {
+    const repo = await mkTempRepo({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      // Populated `.claude/` tree; NO CLAUDE.md, so the projected shim target is
+      // missing → `drift:missing` → claude is named in the hint.
+      '.claude/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
+    });
+    repos.push(repo);
+    const r = spawnSync(process.execPath, [binPath, 'audit', '--cwd', repo.root], {
+      encoding: 'utf8',
+    });
+    // Claude IS named (its projected shim is missing), but with ACCURATE wording:
+    // "no in-sync projected files", never the inaccurate "no files in this repo".
+    assert.match(r.stdout, /no in-sync projected files in this repo \([^)]*claude[^)]*\)/);
+    assert.doesNotMatch(r.stdout, /no files in this repo \([^)]*claude[^)]*\)/);
   });
 });
 

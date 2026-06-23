@@ -75,6 +75,9 @@ describe('loadConfig — invalid input', () => {
 
   it('throws when providers is not an array', () => {
     assert.throws(() => loadConfig('{"providers":"claude"}'), InvalidConfigError);
+    // `null` (unset) means all four; there is no `"all"` scalar — a string is
+    // never a valid `providers` value.
+    assert.throws(() => loadConfig('{"providers":"all"}'), InvalidConfigError);
   });
 
   it('throws on a non-boolean warningsAsErrors', () => {
@@ -96,6 +99,7 @@ describe('loadConfig — invalid input', () => {
       (err: unknown) => err instanceof InvalidConfigError && /exclude/.test(err.message),
     );
   });
+
 });
 
 describe('loadConfig() init.assist (C4)', () => {

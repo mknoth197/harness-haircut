@@ -563,14 +563,17 @@ function renderAuditReport(report: AuditReport): string {
     }
   }
 
-  // #43: an ENABLED provider whose every expected file is MISSING ON DISK has
-  // no presence here. Name it with the `providers_disabled` remedy, so a
-  // no-Gemini repo's "missing .gemini/settings.json" drift is not read as "I
-  // must create Gemini files I don't want". A provider is absent iff it appears
-  // in the report (non-aliased) but none of its files exists — `drift:missing`
-  // now means the FILE is absent (a present-but-keyless merge file is
-  // `drift:differs`, gauntlet fix), so this no longer false-fires for a
-  // hand-kept `.gemini/settings.json` without the owned key.
+  // #43 + #dogfood-round2 (10): an ENABLED provider whose every PROJECTED file
+  // is MISSING ON DISK gets a hint. The wording must describe exactly that —
+  // "no in-sync projected files" — NOT "no files in this repo": a provider can
+  // have a populated owned tree (a root `CLAUDE.md`, a `.claude/` directory)
+  // while its projected targets are absent or out of sync, and the old "no
+  // files" wording then mis-named such a provider (the dogfood saw `claude`
+  // named though `CLAUDE.md` + `.claude/` plainly existed). A provider lands
+  // here iff it appears in the report (non-aliased) but none of its files
+  // exists — `drift:missing` means the FILE is absent (a present-but-keyless
+  // merge file is `drift:differs`, gauntlet fix), so a hand-kept
+  // `.gemini/settings.json` without the owned key never lands here.
   const seen = new Set<ProviderId>();
   const present = new Set<ProviderId>();
   for (const file of report.files) {
@@ -586,10 +589,10 @@ function renderAuditReport(report: AuditReport): string {
   if (absentProviders.length > 0) {
     lines.push('');
     lines.push(
-      `hint: ${absentProviders.length} enabled provider(s) have no files in this repo ` +
-        `(${absentProviders.join(', ')}). Run \`harness-haircut apply\` to create them, or — if a ` +
-        'provider is not used here — add it to `providers_disabled` in harness-haircut.config.json ' +
-        'so audit stops expecting it.',
+      `hint: ${absentProviders.length} enabled provider(s) have no in-sync projected files in ` +
+        `this repo (${absentProviders.join(', ')}). Run \`harness-haircut apply\` to create or ` +
+        'update them, or — if a provider is not used here — add it to `providers_disabled` in ' +
+        'harness-haircut.config.json so audit stops expecting it.',
     );
   }
 

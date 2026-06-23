@@ -33,6 +33,50 @@ function isAgentsMd(instruction: Instruction): boolean {
   return instruction.path === 'AGENTS.md' || instruction.path.endsWith('/AGENTS.md');
 }
 
+/** The directory of an `AGENTS.md` path (`''` for the root file). */
+function agentsMdDir(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash === -1 ? '' : path.slice(0, slash);
+}
+
+/**
+ * True when directory `ancestor` is on the root→`descendant` path — i.e. it is
+ * the root (`''`) or an ancestor-or-equal of `descendant`. Codex concatenates,
+ * for a given working directory, the root `AGENTS.md` plus every nested
+ * `AGENTS.md` from the root down to that directory; sibling/cousin trees are
+ * never in the same chain.
+ */
+function isOnChain(ancestor: string, descendant: string): boolean {
+  return ancestor === '' || ancestor === descendant || descendant.startsWith(`${ancestor}/`);
+}
+
+/**
+ * Codex applies `project_doc_max_bytes` PER root→cwd chain, not across the
+ * whole repo. For each AGENTS.md directory (each a candidate cwd), sum the
+ * bodies of the AGENTS.md files on its root→cwd chain; return the byte size of
+ * the LARGEST such chain (0 when there are no AGENTS.md files). A repo with
+ * several large sibling AGENTS.md whose *sum* exceeds the cap but whose every
+ * individual chain stays under it must not warn — only a single overweight
+ * chain is a real truncation risk.
+ */
+function maxChainBytes(instructions: readonly Instruction[]): number {
+  const agentsMd = instructions.filter(isAgentsMd);
+  let max = 0;
+  for (const leaf of agentsMd) {
+    const leafDir = agentsMdDir(leaf.path);
+    let chain = 0;
+    for (const candidate of agentsMd) {
+      if (isOnChain(agentsMdDir(candidate.path), leafDir)) {
+        chain += Buffer.byteLength(candidate.body, 'utf8');
+      }
+    }
+    if (chain > max) {
+      max = chain;
+    }
+  }
+  return max;
+}
+
 /**
  * Minimal `[hooks]` table detection over the TOML line grammar (zero npm
  * deps): a `[hooks]` / `[ hooks ]` / `["hooks"]` / `[hooks.<sub>]` /
@@ -65,22 +109,24 @@ export const codexAdapter: ProviderAdapter = {
     const files: EmittedFile[] = [];
     const warnings: Warning[] = [];
 
-    // A1 EV1 / HH-W004: Codex silently stops loading AGENTS.md files past
-    // the combined cap. Scoped fragments (.agents/instructions/) are not
-    // part of the chain and do not count.
-    const chainBytes = ir.instructions
-      .filter(isAgentsMd)
-      .reduce((sum, instruction) => sum + Buffer.byteLength(instruction.body, 'utf8'), 0);
+    // A1 EV1 / HH-W004: Codex silently stops loading AGENTS.md files past the
+    // combined cap, applied PER root→cwd chain — the root AGENTS.md plus every
+    // nested AGENTS.md from the root down to a given directory. We warn only
+    // when some single chain exceeds the cap, not by summing unrelated sibling
+    // AGENTS.md (the old whole-repo sum over-counted; #dogfood-round2). Scoped
+    // fragments (.agents/instructions/) are not part of the chain and never
+    // count.
+    const chainBytes = maxChainBytes(ir.instructions);
     if (chainBytes > CODEX_PROJECT_DOC_MAX_BYTES) {
       warnings.push({
         code: 'HH-W004',
         severity: 'warn',
         message:
-          `combined AGENTS.md content is ${chainBytes} bytes, over Codex's ` +
-          `${CODEX_PROJECT_DOC_MAX_BYTES}-byte project_doc_max_bytes default; ` +
-          'Codex silently stops loading files past the cap (note: this sum is an ' +
-          'over-approximation — it adds every AGENTS.md body in the repo, while ' +
-          'Codex applies the cap per root→cwd chain)',
+          `the heaviest root→cwd AGENTS.md chain totals ${chainBytes} bytes, over ` +
+          `Codex's ${CODEX_PROJECT_DOC_MAX_BYTES}-byte project_doc_max_bytes default; ` +
+          'Codex silently stops loading files past the cap for that working ' +
+          'directory (measured as the largest single root→cwd chain by bytes, not ' +
+          'by summing sibling AGENTS.md in unrelated subtrees)',
         providerId: 'codex',
       });
     }
