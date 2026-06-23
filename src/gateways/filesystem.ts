@@ -404,6 +404,15 @@ async function loadRootGitignore(root: string): Promise<IgnorePattern[]> {
  * (fail-safe: at worst we decline to descend somewhere). Values are normalized
  * to repo-relative POSIX with any leading `./` and trailing `/` stripped so
  * they compare cleanly against the walk's `rel` paths.
+ *
+ * Git config QUOTES a value containing special characters in double-quotes and
+ * C-style-escapes the contents (`\"`, `\\`, `\n`, `\t`) — so a submodule whose
+ * working-tree path contains a space is written `path = "my sub"`. We strip the
+ * surrounding quotes and unescape the contents (`unquoteGitConfigValue`). Git
+ * always uses `/` as the separator inside a `.gitmodules` path, so an unquoted
+ * value is taken verbatim — no backslash-to-slash rewrite (that corrupted a
+ * legitimately backslash-escaped quoted value, and addressed a separator git
+ * never emits in `path`).
  */
 export function parseGitmodules(content: string): string[] {
   const paths: string[] = [];
@@ -419,13 +428,14 @@ export function parseGitmodules(content: string): string[] {
     if (line.slice(0, eq).trim() !== 'path') {
       continue;
     }
-    let value = line.slice(eq + 1).trim();
-    if (value === '') {
+    const raw = line.slice(eq + 1).trim();
+    if (raw === '') {
       continue;
     }
-    // Normalize to bare repo-relative POSIX: drop a leading './' and any
-    // trailing '/', and collapse backslashes a Windows-authored file might use.
-    value = value.replace(/\\/g, '/');
+    // Strip git's optional surrounding double-quotes (used for paths with
+    // special chars) and unescape the contents; an unquoted value is verbatim.
+    let value = unquoteGitConfigValue(raw);
+    // Normalize to bare repo-relative POSIX: drop a leading './' and trailing '/'.
     while (value.startsWith('./')) {
       value = value.slice(2);
     }
@@ -440,18 +450,54 @@ export function parseGitmodules(content: string): string[] {
 }
 
 /**
+ * Unquotes a git-config value. Git wraps a value in double-quotes only when it
+ * needs to (whitespace or special characters) and C-style-escapes the contents:
+ * `\"` → `"`, `\\` → `\`, `\n` → newline, `\t` → tab; an unrecognized escape
+ * keeps the literal following character. A value with no surrounding quotes is
+ * returned verbatim (git never backslash-escapes outside quotes, and a
+ * `.gitmodules` path always uses `/` as its separator). Only a fully
+ * double-quote-wrapped value is treated as quoted; a stray leading quote with
+ * no close is left as-is (malformed — not our job to repair).
+ */
+function unquoteGitConfigValue(raw: string): string {
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) {
+    return raw;
+  }
+  const inner = raw.slice(1, -1);
+  let out = '';
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === '\\' && i + 1 < inner.length) {
+      const next = inner[++i];
+      out += next === 'n' ? '\n' : next === 't' ? '\t' : (next ?? '');
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/**
  * Loads the repo-root `.gitmodules` and returns the set of submodule
  * working-tree paths (repo-relative POSIX). Tolerates a missing or empty file
  * (returns an empty set) — most repos have no submodules. Only the ROOT
  * `.gitmodules` is consulted: nested submodules declare their own inside their
  * own tree, which we never descend into anyway.
+ *
+ * Tolerates the SAME errors the writer's sync `loadSubmodulePathsSync` does —
+ * `ENOENT` (absent) and `EISDIR` (a directory occupies the `.gitmodules` path) —
+ * so the snapshot and the writer cannot disagree about the submodule boundary:
+ * a `.gitmodules`-is-a-directory must not make the snapshot throw while the
+ * writer silently treats it as "no submodules". Either way: no declared
+ * boundaries.
  */
 async function loadSubmodulePaths(root: string): Promise<ReadonlySet<string>> {
   let content: string;
   try {
     content = await readFile(join(root, '.gitmodules'), 'utf8');
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EISDIR') {
       return new Set();
     }
     throw new FileSystemError(join(root, '.gitmodules'), err);
@@ -492,19 +538,24 @@ async function walk(
   }
   for (const entry of entries) {
     const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
+    // Submodule boundary (highest precedence, kind-AGNOSTIC): an entry whose
+    // repo-relative path is declared in the root `.gitmodules` is a SEPARATE
+    // repository with its own canonical config. Never descend into it and never
+    // collect a file beneath it — otherwise a submodule's `AGENTS.md`/skills
+    // would be adopted into (and written under) the parent. Record it so the
+    // boundary surfaces as a note (mirrors skippedSymlinks) rather than
+    // vanishing silently. This runs BEFORE the directory/symlink branching so a
+    // submodule whose working-tree path is itself a SYMLINK (a separate repo
+    // checked out elsewhere and linked in) is still treated as the boundary it
+    // is — NOT followed into the symlink branch (where its target's `AGENTS.md`
+    // would be collected and it would never be recorded as a skipped submodule).
+    // Also runs before every prune so a submodule named `dist`/`node_modules` or
+    // matched by an ignore rule is still reported as the boundary it is.
+    if (state.submodulePaths.has(rel)) {
+      state.skippedSubmodules.push(rel);
+      continue;
+    }
     if (entry.isDirectory()) {
-      // Submodule boundary (highest precedence): a directory whose repo-relative
-      // path is declared in the root `.gitmodules` is a SEPARATE repository with
-      // its own canonical config. Never descend into it and never collect a file
-      // beneath it — otherwise a submodule's `AGENTS.md`/skills would be adopted
-      // into (and written under) the parent. Record it so the boundary surfaces
-      // as a note (mirrors skippedSymlinks) rather than vanishing silently. This
-      // runs BEFORE every other prune so a submodule named `dist`/`node_modules`
-      // or matched by an ignore rule is still reported as the boundary it is.
-      if (state.submodulePaths.has(rel)) {
-        state.skippedSubmodules.push(rel);
-        continue;
-      }
       if (ALWAYS_SKIPPED_DIRS.has(entry.name)) {
         continue;
       }

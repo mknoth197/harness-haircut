@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readRepoSnapshot, readInitSnapshot } from '../../dist/index.js';
 import { isIgnored, parseGitignore, parseGitmodules } from '../../dist/gateways/filesystem.js';
@@ -553,6 +554,66 @@ describe('readRepoSnapshot / readInitSnapshot — submodule boundaries', () => {
     }
   });
 
+  // REGRESSION (symlinked submodule): a submodule whose working-tree path is a
+  // SYMLINK (a separate repo checked out elsewhere and linked in) used to fall
+  // into the walk's symlink branch — never recorded as a skipped submodule, and
+  // its target's AGENTS.md was collected as the parent's. The boundary check now
+  // runs kind-agnostically BEFORE the directory/symlink branching, so the link
+  // is treated as the boundary and never followed.
+  it('treats a SYMLINKED submodule path as a boundary and does not follow it (repo snapshot)', async () => {
+    const repo = await mkTempRepo({
+      '.gitmodules': '[submodule "references/sdlc-next"]\n\tpath = references/sdlc-next\n',
+      'AGENTS.md': '# parent root',
+    });
+    // The submodule's real checkout lives OUTSIDE the repo (a separate repo
+    // linked in); its AGENTS.md must NOT be adopted via the symlink.
+    const external = await mkdtemp(join(tmpdir(), 'harness-haircut-sub-'));
+    await writeFile(join(external, 'AGENTS.md'), '# submodule canonical — not the parent\'s\n', 'utf8');
+    try {
+      await mkdir(join(repo.root, 'references'), { recursive: true });
+      await symlink(external, join(repo.root, 'references', 'sdlc-next'));
+      const snapshot = await readRepoSnapshot(repo.root);
+      // Only the parent's own AGENTS.md is collected (the link is NOT followed).
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md']);
+      assert.equal(
+        snapshot.files.some((f) => f.path.startsWith('references/sdlc-next')),
+        false,
+      );
+      // The symlinked submodule is recorded as the BOUNDARY it is — not as a
+      // bare skipped symlink, and not silently dropped.
+      assert.deepEqual(snapshot.skippedSubmodules, ['references/sdlc-next']);
+      assert.equal((snapshot.skippedSymlinks ?? []).includes('references/sdlc-next'), false);
+    } finally {
+      await rm(external, { recursive: true, force: true });
+      await repo.cleanup();
+    }
+  });
+
+  it('treats a SYMLINKED submodule path as a boundary for the wider init snapshot too', async () => {
+    const repo = await mkTempRepo({
+      '.gitmodules': '[submodule "vendor/lib"]\n\tpath = vendor/lib\n',
+      'AGENTS.md': '# parent',
+    });
+    // Provider files behind the link (CLAUDE.md, .claude/skills) — outside the
+    // repo — must not be adopted either; init uses the wider include filter.
+    const external = await mkdtemp(join(tmpdir(), 'harness-haircut-sub-'));
+    await writeFile(join(external, 'CLAUDE.md'), '@AGENTS.md\n', 'utf8');
+    await mkdir(join(external, '.claude', 'skills', 'x'), { recursive: true });
+    await writeFile(join(external, '.claude', 'skills', 'x', 'SKILL.md'), '---\nname: x\ndescription: d\n---\n', 'utf8');
+    try {
+      await mkdir(join(repo.root, 'vendor'), { recursive: true });
+      await symlink(external, join(repo.root, 'vendor', 'lib'));
+      const snapshot = await readInitSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md']);
+      assert.equal(snapshot.files.some((f) => f.path.startsWith('vendor/lib')), false);
+      assert.deepEqual(snapshot.skippedSubmodules, ['vendor/lib']);
+      assert.equal((snapshot.skippedSymlinks ?? []).includes('vendor/lib'), false);
+    } finally {
+      await rm(external, { recursive: true, force: true });
+      await repo.cleanup();
+    }
+  });
+
   it('a submodule directory that is not actually checked out yields no boundary note', async () => {
     // `.gitmodules` declares a submodule, but the working tree was never
     // checked out (empty/absent dir). We only record what the walk reaches on
@@ -605,6 +666,31 @@ describe('readRepoSnapshot / readInitSnapshot — submodule boundaries', () => {
       await repo.cleanup();
     }
   });
+
+  // REGRESSION (sync/async parity on EISDIR): the writer's sync loader tolerates
+  // `.gitmodules` being a DIRECTORY (ENOENT|EISDIR → no submodules); the async
+  // snapshot loader caught only ENOENT, so this case made the snapshot THROW
+  // while the writer silently succeeded — contradicting the loaders' "the two
+  // cannot disagree" contract. The async loader now tolerates EISDIR too: no
+  // boundaries, and the walk proceeds (nested AGENTS.md still collected).
+  it('tolerates .gitmodules being a directory (matches the writer; no boundaries)', async () => {
+    // A file UNDER `.gitmodules/` forces `.gitmodules` itself to be a directory.
+    const repo = await mkTempRepo({
+      '.gitmodules/keep': 'forces .gitmodules to be a directory\n',
+      'AGENTS.md': '# root',
+      'pkg/web/AGENTS.md': '# nested still collected',
+    });
+    try {
+      const snapshot = await readRepoSnapshot(repo.root);
+      assert.deepEqual(paths(snapshot.files), ['AGENTS.md', 'pkg/web/AGENTS.md']);
+      assert.deepEqual(snapshot.skippedSubmodules ?? [], []);
+      // The wider init reader shares the loader, so it must tolerate it too.
+      const initSnap = await readInitSnapshot(repo.root);
+      assert.deepEqual(initSnap.skippedSubmodules ?? [], []);
+    } finally {
+      await repo.cleanup();
+    }
+  });
 });
 
 describe('parseGitmodules (pure parser)', () => {
@@ -624,15 +710,40 @@ describe('parseGitmodules (pure parser)', () => {
     assert.deepEqual(parseGitmodules('# just a comment\n; another\n'), []);
   });
 
-  it('normalizes leading ./ and trailing / and Windows backslashes', () => {
+  it('normalizes a leading ./ and a trailing /', () => {
     const content =
-      '[submodule "a"]\n\tpath = ./sub/a/\n[submodule "b"]\n\tpath = sub\\b\n';
+      '[submodule "a"]\n\tpath = ./sub/a/\n[submodule "b"]\n\tpath = sub/b\n';
     assert.deepEqual(parseGitmodules(content), ['sub/a', 'sub/b']);
   });
 
   it('ignores non-path keys and blank values', () => {
     const content = '[submodule "a"]\n\turl = x\n\tpath = \n\tpath = sub/a\n';
     assert.deepEqual(parseGitmodules(content), ['sub/a']);
+  });
+
+  // Git quotes a value with special chars (e.g. a space) in DOUBLE quotes and
+  // C-style-escapes the contents. The surrounding quotes are not part of the
+  // path and must be stripped, or the captured value never matches the walk's
+  // real `rel` path (`"my sub"` vs `my sub`) — defeating the boundary.
+  it('strips surrounding double-quotes from a quoted path (space in name)', () => {
+    const content = '[submodule "x"]\n\tpath = "my sub"\n';
+    assert.deepEqual(parseGitmodules(content), ['my sub']);
+  });
+
+  // A backslash inside a quoted value is a C-style escape: `\"` is a literal
+  // quote, `\\` a literal backslash. The old `replace(/\\/g,'/')` corrupted
+  // these (turning `\"` → `/"`, `\\` → `//`); git always uses `/` as the path
+  // separator anyway, so there is no backslash-as-separator to rewrite.
+  it('unescapes a backslash-escaped quoted value (literal quote / backslash)', () => {
+    assert.deepEqual(parseGitmodules('[submodule "x"]\n\tpath = "a\\"b"\n'), ['a"b']);
+    assert.deepEqual(parseGitmodules('[submodule "y"]\n\tpath = "a\\\\b"\n'), ['a\\b']);
+  });
+
+  // An UNQUOTED value is taken verbatim — a backslash is a literal char, not a
+  // separator (git would have quoted+escaped it if it were special). This is
+  // the case the old separator-rewrite silently corrupted.
+  it('takes an unquoted value verbatim (no backslash-to-slash rewrite)', () => {
+    assert.deepEqual(parseGitmodules('[submodule "z"]\n\tpath = a\\b\n'), ['a\\b']);
   });
 });
 
