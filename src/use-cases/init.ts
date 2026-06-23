@@ -66,6 +66,7 @@ import type {
 import type { FileWriter } from '../entities/file-writer.js';
 import {
   fragmentNameFromSource,
+  isMultiImportShim,
   normalizeForCompare,
   recoverFragmentFromCanonical,
   recoverFragmentFromClaudeRule,
@@ -338,18 +339,43 @@ function hasCanonicalShape(snapshot: RepoSnapshot): boolean {
   return snapshot.files.some((file) => file.path.startsWith('.agents/'));
 }
 
+/** Result of gathering root-instruction candidates from the provider files. */
+interface RootCandidateGather {
+  /** Candidate canonical texts, sorted by provider. */
+  candidates: CandidateText[];
+  /**
+   * Paths of PURE multi-import `CLAUDE.md`/`GEMINI.md` shims that recovery
+   * collapsed to '' (so they yield no candidate). Surfaced as a note (F2 "no
+   * silent loss") so dropping them is visible. Excludes the trivial single-line
+   * `@AGENTS.md` shim — only files where additional `@…` import lines rode along.
+   */
+  collapsedMultiImportShims: string[];
+}
+
 /** Gathers candidate root-instruction texts from each existing provider file. */
-function gatherRootCandidates(reader: ProviderFileReader): CandidateText[] {
+function gatherRootCandidates(reader: ProviderFileReader): RootCandidateGather {
   const candidates: CandidateText[] = [];
+  const collapsedMultiImportShims: string[] = [];
   for (const source of ROOT_INSTRUCTION_SOURCES) {
     const raw = reader.read(source.path);
     if (raw === null) {
       continue;
     }
     const text = source.recover(raw);
-    // A shim with no user content below the import (or an emptied file) carries
-    // no candidate — skip it rather than offering an empty choice.
+    // A shim with no user content below the import carries no candidate — skip
+    // it rather than offering an empty choice. This covers a single-line
+    // `@AGENTS.md` shim, an emptied file, AND a PURE multi-import CLAUDE.md
+    // (`@AGENTS.md` + `@…/instructions/*.md` lines), which `recoverFromShim`
+    // now collapses to '' — its `@`-import lines are pointers to fragments
+    // captured separately, not prose, so they must not manufacture a spurious
+    // `root-instructions` contradiction with AGENTS.md / copilot-instructions.md.
     if (text.trim() === '') {
+      // F2 (#3): when MORE than the bare `@AGENTS.md` line was collapsed (extra
+      // `@…` import lines), record the path so the caller emits a note — the
+      // drop must be visible. The trivial single-line shim is expected and silent.
+      if (isMultiImportShim(raw)) {
+        collapsedMultiImportShims.push(source.path);
+      }
       continue;
     }
     candidates.push({
@@ -359,7 +385,7 @@ function gatherRootCandidates(reader: ProviderFileReader): CandidateText[] {
       normalizedText: normalizeForCompare(text),
     });
   }
-  return candidates.sort(byProvider);
+  return { candidates: candidates.sort(byProvider), collapsedMultiImportShims };
 }
 
 /** `.../<name>/SKILL.md` → `<name>`; null when the path is not a SKILL.md entry. */
@@ -597,7 +623,9 @@ export async function init(deps: InitDeps): Promise<InitReport> {
   }
 
   // ---- step 3: build candidate canonical IR by union ----
-  const rootCandidates = gatherRootCandidates(deps.reader);
+  const { candidates: rootCandidates, collapsedMultiImportShims } = gatherRootCandidates(
+    deps.reader,
+  );
   const { byName: skillsByName, rejected: rejectedSkills } = discoverSkills(snapshot);
   const {
     byName: fragmentsByName,
@@ -868,6 +896,22 @@ export async function init(deps: InitDeps): Promise<InitReport> {
         `their content was NOT imported (${[...skippedSymlinks].sort().join(', ')}). Replace a ` +
         'symlink with the real file/directory to bring it under canonical ownership, or ignore ' +
         'this if the link points at content already collected elsewhere.',
+    );
+  }
+  // F2 (#3): a PURE multi-import CLAUDE.md/GEMINI.md shim (`@AGENTS.md` plus only
+  // more `@…` import lines) recovers '' and contributes no candidate, so it is
+  // dropped before the contradiction step. Those import lines are pointers to
+  // fragments captured separately, not prose — nothing is lost — but the drop
+  // must still be VISIBLE (no silent loss). Surface it as a note. The trivial
+  // single-line `@AGENTS.md` shim is excluded by `isMultiImportShim`.
+  if (collapsedMultiImportShims.length > 0) {
+    notes.push(
+      `treated ${collapsedMultiImportShims.length} multi-import shim(s) ` +
+        `(${[...collapsedMultiImportShims].sort().join(', ')}) as empty: each begins with ` +
+        '`@AGENTS.md` and otherwise contains only `@…` import lines pointing at instruction ' +
+        'files captured separately, so it carries no root-instruction prose of its own and was ' +
+        'not used as a candidate. No content was lost; the imported files are consolidated under ' +
+        'their own canonical fragments.',
     );
   }
   // C4: surface which candidate's sibling attachments an AI-merged skill carried.

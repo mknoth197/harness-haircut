@@ -48,14 +48,94 @@ export function recoverFromAgentsMd(content: string): string {
  * shim, returning the user content below it. When the file is not a shim (no
  * leading import) the whole content is returned — it is genuine instruction
  * text the user kept in that file.
+ *
+ * Multi-import carve-out: a root `CLAUDE.md` may follow `@AGENTS.md` with
+ * several more `@…/instructions/*.md` import lines — a valid Claude Code
+ * pattern, and the very layout harness-haircut promotes. Those `@`-import lines
+ * are mere POINTERS to instruction files already captured separately as scoped
+ * fragments; they are NOT original prose. So once the leading `@AGENTS.md` is
+ * stripped, if EVERY remaining non-blank line is itself an `@`-import line the
+ * file is a PURE shim and contributes no instruction content — we recover `''`
+ * (treated by the caller as "no candidate", so it cannot manufacture a spurious
+ * root-instructions contradiction). A file that mixes imports with genuine
+ * prose keeps that prose verbatim (the imports ride along — they round-trip as
+ * harmless text rather than risking silent loss of the prose around them).
  */
 export function recoverFromShim(content: string): string {
-  const newlineAt = content.indexOf('\n');
-  const firstLine = (newlineAt === -1 ? content : content.slice(0, newlineAt)).trimEnd();
-  if (firstLine === AGENTS_IMPORT_LINE) {
-    return newlineAt === -1 ? '' : content.slice(newlineAt + 1);
+  // Strip a leading UTF-8 BOM before the first-line check — mirror the shim
+  // WRITER (adapters/shim.ts). An editor adds it invisibly, and without this a
+  // BOM-saved shim's first line is `<BOM>@AGENTS.md` !== `@AGENTS.md`, so the
+  // whole file (import lines and all) would be returned as content and
+  // re-manufacture the spurious root-instructions contradiction this fixes.
+  const stripped = content.startsWith('\uFEFF') ? content.slice(1) : content;
+  const newlineAt = stripped.indexOf('\n');
+  const firstLine = (newlineAt === -1 ? stripped : stripped.slice(0, newlineAt)).trimEnd();
+  if (firstLine !== AGENTS_IMPORT_LINE) {
+    return stripped;
   }
-  return content;
+  const rest = newlineAt === -1 ? '' : stripped.slice(newlineAt + 1);
+  if (isPureImportBlock(rest)) {
+    return '';
+  }
+  return rest;
+}
+
+/**
+ * Matches a real `@`-import line: `@` followed by a path-like token with NO
+ * embedded whitespace, ending in `.md`. The real imports are `@AGENTS.md`,
+ * `@.github/instructions/foo.instructions.md`, and relative forms like
+ * `@../../.github/instructions/ui.instructions.md` — all of which match.
+ *
+ * Crucially this EXCLUDES prose that merely begins with `@`: `@TODO rewrite`
+ * (embedded space), `@channel ping the team` (no `.md`), a JSDoc `@param x`
+ * (space), a CSS `@media screen` (space), an at-mention `@alice` (no `.md`).
+ * The previous `startsWith('@')` test treated all of those as droppable
+ * imports, so a CLAUDE.md mixing such prose with `@AGENTS.md` collapsed to `''`
+ * and the prose was silently lost — the data-loss bug this regex fixes.
+ */
+const IMPORT_LINE_RE = /^@\S+\.md$/;
+
+/**
+ * True when every non-blank line is a real `@`-import line (see
+ * `IMPORT_LINE_RE`). An all-blank/empty string qualifies — a single-line
+ * `@AGENTS.md` shim recovers `''` exactly as before. Any non-blank line that is
+ * NOT an import (i.e. genuine prose, even prose that starts with `@`) means the
+ * block is NOT a pure import shim and its content must be kept verbatim.
+ */
+function isPureImportBlock(text: string): boolean {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .every((line) => IMPORT_LINE_RE.test(line));
+}
+
+/**
+ * Finding #3 (F2 "no silent loss") classifier for the `init` use case: true
+ * when `content` is a PURE multi-import `CLAUDE.md`/`GEMINI.md` shim that
+ * `recoverFromShim` collapses to `''` AND more than the bare `@AGENTS.md` line
+ * was collapsed (i.e. at least one additional `@…/….md` import line rode along).
+ *
+ * The caller uses this to emit a user-visible note WHEN it drops such a shim, so
+ * the action is never silent. It deliberately returns `false` for the trivial
+ * single-line `@AGENTS.md` shim (and an emptied file): that is the expected,
+ * noiseless case and warrants no note. Returns `false` for anything
+ * `recoverFromShim` would keep (a non-shim, or a shim with genuine prose).
+ */
+export function isMultiImportShim(content: string): boolean {
+  const stripped = content.startsWith('\uFEFF') ? content.slice(1) : content;
+  const newlineAt = stripped.indexOf('\n');
+  const firstLine = (newlineAt === -1 ? stripped : stripped.slice(0, newlineAt)).trimEnd();
+  if (firstLine !== AGENTS_IMPORT_LINE) {
+    return false;
+  }
+  const rest = newlineAt === -1 ? '' : stripped.slice(newlineAt + 1);
+  if (!isPureImportBlock(rest)) {
+    return false;
+  }
+  // Pure shim: a note is warranted only when an import line beyond `@AGENTS.md`
+  // was collapsed. The bare single-line shim leaves `rest` all-blank.
+  return rest.split('\n').some((line) => line.trim() !== '');
 }
 
 /**
