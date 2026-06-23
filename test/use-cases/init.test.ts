@@ -165,6 +165,66 @@ describe('init() — zero-contradiction onboarding (U1, EV1)', () => {
   });
 });
 
+describe('init() — multi-import CLAUDE.md shim modeling', () => {
+  // A root CLAUDE.md that is a pure multi-import shim (`@AGENTS.md` then several
+  // `@.github/instructions/*.instructions.md` pointers) must contribute NO
+  // root-instruction content: its imports point at fragments captured
+  // separately, so it must not collide with AGENTS.md as a spurious answer.
+  it('a pure multi-import CLAUDE.md alongside AGENTS.md yields no root-instructions contradiction', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# Project standards\n\nUse npm test.\n',
+      'CLAUDE.md':
+        '@AGENTS.md\n' +
+        '@.github/instructions/architecture.instructions.md\n' +
+        '@.github/instructions/testing.instructions.md\n' +
+        '@.github/instructions/commit-style.instructions.md\n' +
+        '@.github/instructions/security.instructions.md\n' +
+        '@.github/instructions/docs.instructions.md\n',
+    });
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, { resolverCalls });
+
+    assert.equal(report.exitCode, 0);
+    // No CLAUDE-vs-AGENTS conflict: init --adopt can proceed unblocked.
+    assert.equal(
+      report.contradictions.some((c) => c.slot === 'root-instructions'),
+      false,
+    );
+    assert.deepEqual(resolverCalls, []);
+    // AGENTS.md content survives as the canonical root (the shim added nothing).
+    const written = await readFile(join(repo.root, 'AGENTS.md'), 'utf8');
+    assert.match(written, /Use npm test\./);
+  });
+
+  // Negative control (requirement 2, last sentence): the shim emptying must not
+  // mask a GENUINE disagreement between AGENTS.md and a copilot file that holds
+  // real bespoke prose — that contradiction still surfaces.
+  it('still surfaces a genuine AGENTS.md vs copilot-instructions contradiction', async () => {
+    const repo = await setup({
+      'AGENTS.md': '# A\nUse npm test.\n',
+      'CLAUDE.md': '@AGENTS.md\n@.github/instructions/testing.instructions.md\n',
+      '.github/copilot-instructions.md': '# A\nUse pnpm test.\n',
+    });
+    const resolverCalls: string[] = [];
+    const report = await runInit(repo.root, {
+      resolverCalls,
+      resolve: { 'root-instructions': { kind: 'choose', index: 0 } },
+    });
+    const rootContradiction = report.contradictions.find((c) => c.slot === 'root-instructions');
+    assert.ok(rootContradiction !== undefined);
+    assert.deepEqual(resolverCalls, ['root-instructions']);
+    // Exactly the two REAL-content candidates collide — the pure shim is absent.
+    assert.deepEqual(
+      rootContradiction.candidates.map((c) => c.providerId).sort(),
+      ['codex', 'copilot'],
+    );
+    assert.equal(
+      rootContradiction.candidates.some((c) => c.providerId === 'claude'),
+      false,
+    );
+  });
+});
+
 describe('init() — single contradiction (EV2, EV3)', () => {
   async function drifted(): Promise<TempRepo> {
     return setup({

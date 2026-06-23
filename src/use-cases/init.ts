@@ -347,8 +347,13 @@ function gatherRootCandidates(reader: ProviderFileReader): CandidateText[] {
       continue;
     }
     const text = source.recover(raw);
-    // A shim with no user content below the import (or an emptied file) carries
-    // no candidate — skip it rather than offering an empty choice.
+    // A shim with no user content below the import carries no candidate — skip
+    // it rather than offering an empty choice. This covers a single-line
+    // `@AGENTS.md` shim, an emptied file, AND a PURE multi-import CLAUDE.md
+    // (`@AGENTS.md` + `@…/instructions/*.md` lines), which `recoverFromShim`
+    // now collapses to '' — its `@`-import lines are pointers to fragments
+    // captured separately, not prose, so they must not manufacture a spurious
+    // `root-instructions` contradiction with AGENTS.md / copilot-instructions.md.
     if (text.trim() === '') {
       continue;
     }

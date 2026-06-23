@@ -48,14 +48,45 @@ export function recoverFromAgentsMd(content: string): string {
  * shim, returning the user content below it. When the file is not a shim (no
  * leading import) the whole content is returned — it is genuine instruction
  * text the user kept in that file.
+ *
+ * Multi-import carve-out: a root `CLAUDE.md` may follow `@AGENTS.md` with
+ * several more `@…/instructions/*.md` import lines — a valid Claude Code
+ * pattern, and the very layout harness-haircut promotes. Those `@`-import lines
+ * are mere POINTERS to instruction files already captured separately as scoped
+ * fragments; they are NOT original prose. So once the leading `@AGENTS.md` is
+ * stripped, if EVERY remaining non-blank line is itself an `@`-import line the
+ * file is a PURE shim and contributes no instruction content — we recover `''`
+ * (treated by the caller as "no candidate", so it cannot manufacture a spurious
+ * root-instructions contradiction). A file that mixes imports with genuine
+ * prose keeps that prose verbatim (the imports ride along — they round-trip as
+ * harmless text rather than risking silent loss of the prose around them).
  */
 export function recoverFromShim(content: string): string {
   const newlineAt = content.indexOf('\n');
   const firstLine = (newlineAt === -1 ? content : content.slice(0, newlineAt)).trimEnd();
-  if (firstLine === AGENTS_IMPORT_LINE) {
-    return newlineAt === -1 ? '' : content.slice(newlineAt + 1);
+  if (firstLine !== AGENTS_IMPORT_LINE) {
+    return content;
   }
-  return content;
+  const rest = newlineAt === -1 ? '' : content.slice(newlineAt + 1);
+  if (isPureImportBlock(rest)) {
+    return '';
+  }
+  return rest;
+}
+
+/**
+ * True when every non-blank line is an `@`-import line (e.g.
+ * `@.github/instructions/testing.instructions.md`). An all-blank/empty string
+ * qualifies — a single-line `@AGENTS.md` shim recovers `''` exactly as before.
+ * Any line that is not blank and does not start with `@` is genuine prose, so
+ * the block is NOT a pure import shim and the content must be kept.
+ */
+function isPureImportBlock(text: string): boolean {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .every((line) => line.startsWith('@'));
 }
 
 /**

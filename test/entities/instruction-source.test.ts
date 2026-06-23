@@ -51,6 +51,41 @@ describe('recoverFromShim', () => {
   it('returns empty when the shim has only the import line', () => {
     assert.equal(recoverFromShim('@AGENTS.md\n'), '');
   });
+
+  // Multi-import shim: `@AGENTS.md` followed only by more `@…` import lines is
+  // a PURE shim (the trailing imports are pointers to fragments captured
+  // separately, not prose) → recover '' so it manufactures no candidate.
+  it('recovers empty from a pure multi-import shim (@AGENTS.md + @…instructions lines)', () => {
+    const shim =
+      '@AGENTS.md\n' +
+      '@.github/instructions/architecture.instructions.md\n' +
+      '@.github/instructions/testing.instructions.md\n' +
+      '@.github/instructions/commit-style.instructions.md\n' +
+      '@.github/instructions/security.instructions.md\n' +
+      '@.github/instructions/docs.instructions.md\n';
+    assert.equal(recoverFromShim(shim), '');
+  });
+
+  it('ignores blank lines between imports when deciding a shim is pure', () => {
+    const shim =
+      '@AGENTS.md\n\n' +
+      '@.github/instructions/architecture.instructions.md\n\n' +
+      '@.github/instructions/testing.instructions.md\n';
+    assert.equal(recoverFromShim(shim), '');
+  });
+
+  // A file that mixes imports with genuine prose keeps the prose verbatim (the
+  // imports ride along as harmless text rather than risking silent loss).
+  it('keeps real prose around imports (@AGENTS.md + imports + prose)', () => {
+    const mixed =
+      '@AGENTS.md\n' +
+      '@.github/instructions/testing.instructions.md\n\n' +
+      '# Local notes\nUse npm test.\n';
+    assert.equal(
+      recoverFromShim(mixed),
+      '@.github/instructions/testing.instructions.md\n\n# Local notes\nUse npm test.\n',
+    );
+  });
 });
 
 describe('recoverFromCopilotInstructions', () => {
