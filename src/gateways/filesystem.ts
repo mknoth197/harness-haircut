@@ -1,6 +1,10 @@
 /**
  * Filesystem gateway — walks a repo and snapshots the canonical sources
  * (`AGENTS.md` at any depth, everything under root `.agents/`).
+ * Git SUBMODULE working trees declared in the repo-root `.gitmodules` are hard
+ * boundaries: the walk never descends into one and collects no file beneath it
+ * (a submodule is a separate repo with its own canonical config), surfacing
+ * each as `skippedSubmodules`.
  * OS errors are converted to domain errors before crossing the layer
  * boundary (architecture rules).
  */
@@ -383,12 +387,93 @@ async function loadRootGitignore(root: string): Promise<IgnorePattern[]> {
   return parseGitignore(content);
 }
 
+/*
+ * Minimal `.gitmodules` parser (hand-rolled — zero runtime npm deps, PRD goal
+ * 5). `.gitmodules` is a git-config (INI-like) file: `[submodule "name"]`
+ * stanzas, each with `key = value` lines, e.g.
+ *
+ *   [submodule "references/sdlc-next"]
+ *       path = references/sdlc-next
+ *       url = https://example.com/sdlc-next.git
+ *
+ * We capture every `path = <relpath>` value. The submodule NAME (the quoted
+ * stanza header) is irrelevant to the boundary — git records the working-tree
+ * location in `path`, which is what the walk compares against. We do not tie a
+ * `path` to its enclosing stanza: a bare `path = …` outside any stanza is not
+ * valid `.gitmodules`, and collecting a stray one only ever ADDS a boundary
+ * (fail-safe: at worst we decline to descend somewhere). Values are normalized
+ * to repo-relative POSIX with any leading `./` and trailing `/` stripped so
+ * they compare cleanly against the walk's `rel` paths.
+ */
+export function parseGitmodules(content: string): string[] {
+  const paths: string[] = [];
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#') || line.startsWith(';') || line.startsWith('[')) {
+      continue;
+    }
+    const eq = line.indexOf('=');
+    if (eq === -1) {
+      continue;
+    }
+    if (line.slice(0, eq).trim() !== 'path') {
+      continue;
+    }
+    let value = line.slice(eq + 1).trim();
+    if (value === '') {
+      continue;
+    }
+    // Normalize to bare repo-relative POSIX: drop a leading './' and any
+    // trailing '/', and collapse backslashes a Windows-authored file might use.
+    value = value.replace(/\\/g, '/');
+    while (value.startsWith('./')) {
+      value = value.slice(2);
+    }
+    while (value.endsWith('/')) {
+      value = value.slice(0, -1);
+    }
+    if (value !== '' && value !== '.') {
+      paths.push(value);
+    }
+  }
+  return paths;
+}
+
+/**
+ * Loads the repo-root `.gitmodules` and returns the set of submodule
+ * working-tree paths (repo-relative POSIX). Tolerates a missing or empty file
+ * (returns an empty set) — most repos have no submodules. Only the ROOT
+ * `.gitmodules` is consulted: nested submodules declare their own inside their
+ * own tree, which we never descend into anyway.
+ */
+async function loadSubmodulePaths(root: string): Promise<ReadonlySet<string>> {
+  let content: string;
+  try {
+    content = await readFile(join(root, '.gitmodules'), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return new Set();
+    }
+    throw new FileSystemError(join(root, '.gitmodules'), err);
+  }
+  return new Set(parseGitmodules(content));
+}
+
 interface WalkState {
   out: FileSnapshot[];
   /** Canonical-shaped paths excluded by an ignore rule (drives HH-W012). */
   excludedCanonical: string[];
   /** #45: symlinked entries at a collected location the walk did not follow. */
   skippedSymlinks: string[];
+  /**
+   * Submodule working-tree roots (repo-relative POSIX) declared in the root
+   * `.gitmodules`. The walk treats each as a hard boundary: it does not descend
+   * into one and collects nothing beneath it. A submodule is a separate repo
+   * with its own canonical config, so its files are never the parent's.
+   */
+  submodulePaths: ReadonlySet<string>;
+  /** Submodule roots actually encountered on disk during the walk (surfaced). */
+  skippedSubmodules: string[];
 }
 
 async function walk(
@@ -408,6 +493,18 @@ async function walk(
   for (const entry of entries) {
     const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
     if (entry.isDirectory()) {
+      // Submodule boundary (highest precedence): a directory whose repo-relative
+      // path is declared in the root `.gitmodules` is a SEPARATE repository with
+      // its own canonical config. Never descend into it and never collect a file
+      // beneath it — otherwise a submodule's `AGENTS.md`/skills would be adopted
+      // into (and written under) the parent. Record it so the boundary surfaces
+      // as a note (mirrors skippedSymlinks) rather than vanishing silently. This
+      // runs BEFORE every other prune so a submodule named `dist`/`node_modules`
+      // or matched by an ignore rule is still reported as the boundary it is.
+      if (state.submodulePaths.has(rel)) {
+        state.skippedSubmodules.push(rel);
+        continue;
+      }
       if (ALWAYS_SKIPPED_DIRS.has(entry.name)) {
         continue;
       }
@@ -542,11 +639,11 @@ export async function readRepoSnapshot(root: string, exclude: readonly string[] 
 }
 
 /**
- * Shared snapshot core for both readers: load the root `.gitignore`, compile
- * the config `exclude` globs once, walk under `include`, and finish. The two
- * public readers differ ONLY in the `include` predicate (canonical-only vs the
- * wider init set), so the gitignore/exclude compilation + WalkState boilerplate
- * lives here once.
+ * Shared snapshot core for both readers: load the root `.gitignore` and
+ * `.gitmodules`, compile the config `exclude` globs once, walk under `include`,
+ * and finish. The two public readers differ ONLY in the `include` predicate
+ * (canonical-only vs the wider init set), so the gitignore/gitmodules/exclude
+ * compilation + WalkState boilerplate lives here once.
  */
 async function snapshot(
   root: string,
@@ -554,8 +651,15 @@ async function snapshot(
   include: (relPath: string) => boolean,
 ): Promise<RepoSnapshot> {
   const patterns = await loadRootGitignore(root);
+  const submodulePaths = await loadSubmodulePaths(root);
   const excludePatterns = parseGitignore(exclude.join('\n'));
-  const state: WalkState = { out: [], excludedCanonical: [], skippedSymlinks: [] };
+  const state: WalkState = {
+    out: [],
+    excludedCanonical: [],
+    skippedSymlinks: [],
+    submodulePaths,
+    skippedSubmodules: [],
+  };
   await walk(root, '', patterns, excludePatterns, include, state);
   return finishSnapshot(root, state);
 }
@@ -573,11 +677,12 @@ export async function readInitSnapshot(root: string, exclude: readonly string[] 
   return snapshot(root, exclude, isInitPath);
 }
 
-/** Sort the collected files + deduped excluded-canonical / skipped-symlink paths into a snapshot. */
+/** Sort the collected files + deduped excluded-canonical / skipped-symlink / skipped-submodule paths into a snapshot. */
 function finishSnapshot(root: string, state: WalkState): RepoSnapshot {
   const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
   state.out.sort((a, b) => cmp(a.path, b.path));
   const excludedCanonicalPaths = [...new Set(state.excludedCanonical)].sort(cmp);
   const skippedSymlinks = [...new Set(state.skippedSymlinks)].sort(cmp);
-  return { root, files: state.out, excludedCanonicalPaths, skippedSymlinks };
+  const skippedSubmodules = [...new Set(state.skippedSubmodules)].sort(cmp);
+  return { root, files: state.out, excludedCanonicalPaths, skippedSymlinks, skippedSubmodules };
 }

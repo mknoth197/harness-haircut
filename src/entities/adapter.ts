@@ -121,6 +121,17 @@ export interface RepoSnapshot {
    * empty when no relevant symlink was skipped.
    */
   skippedSymlinks?: string[];
+  /**
+   * Repo-relative POSIX paths of git SUBMODULE roots declared in the repo-root
+   * `.gitmodules` that the walk treated as hard boundaries — it did not descend
+   * into them and collected no provider/canonical file beneath them. A
+   * submodule is a separate repository with its own canonical configuration, so
+   * its `AGENTS.md` / skills must never be adopted into (or written under) the
+   * parent. Mirrors `skippedSymlinks`: surfaced as a note rather than silently
+   * pruned, so the boundary is visible. Sorted; absent or empty when the repo
+   * declares no submodules whose declared path exists on disk.
+   */
+  skippedSubmodules?: string[];
 }
 
 export interface ExistingProviderConfig {

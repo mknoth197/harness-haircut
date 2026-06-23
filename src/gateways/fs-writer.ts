@@ -10,6 +10,12 @@
  * and the writes. OS errors are converted to `FileSystemError` before they
  * cross the layer boundary (architecture rules); a directory at a read path,
  * like a missing file, reads as `null`.
+ *
+ * `write`/`remove` additionally refuse any path that is a git submodule root
+ * (declared in the repo-root `.gitmodules`) or falls beneath one — a submodule
+ * is a separate repository with its own canonical config, so the parent's
+ * projection must never land a file inside it. This is defense-in-depth behind
+ * the snapshot walk's submodule boundary.
  */
 import {
   readFileSync,
@@ -24,6 +30,7 @@ import {
 import { dirname, join, resolve, sep } from 'node:path';
 import type { FileWriter } from '../entities/file-writer.js';
 import { FileSystemError } from '../entities/errors.js';
+import { parseGitmodules } from './filesystem.js';
 
 function toAbsolute(root: string, relPath: string): string {
   return join(root, ...relPath.split('/'));
@@ -215,6 +222,62 @@ function assertContained(realRoot: string, relPath: string): string {
   return toAbsolute(realRoot, relPath);
 }
 
+/**
+ * Loads the repo-root `.gitmodules` submodule working-tree paths (repo-relative
+ * POSIX), tolerating a missing/empty file. Synchronous to fit the writer's
+ * sync construction; uses the SAME parser the snapshot walk uses so the two
+ * cannot disagree about what counts as a submodule boundary.
+ */
+function loadSubmodulePathsSync(realRoot: string): readonly string[] {
+  let content: string;
+  try {
+    content = readFileSync(join(realRoot, '.gitmodules'), 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EISDIR') {
+      return [];
+    }
+    throw new FileSystemError(join(realRoot, '.gitmodules'), err);
+  }
+  return parseGitmodules(content);
+}
+
+/**
+ * SECURITY + submodule boundaries: refuse to write/remove a path that is a
+ * submodule root or falls beneath one. A submodule is a separate repository
+ * with its own canonical config, so the parent's projection must never land a
+ * file inside it. This is defense-in-depth alongside the snapshot's walk
+ * boundary: even if a path slips past collection (a future caller, a hand-built
+ * `EmittedFile`), nothing is ever written into a submodule tree. `relPath` is
+ * the lexically-contained repo-relative POSIX path (already `..`/absolute-safe).
+ */
+function assertNotUnderSubmodule(
+  realRoot: string,
+  relPath: string,
+  submodulePaths: readonly string[],
+): void {
+  // Normalize the candidate the way the snapshot's `rel` paths are shaped:
+  // POSIX separators, no leading './', no trailing '/'.
+  let rel = relPath.replace(/\\/g, '/');
+  while (rel.startsWith('./')) {
+    rel = rel.slice(2);
+  }
+  while (rel.endsWith('/')) {
+    rel = rel.slice(0, -1);
+  }
+  for (const sub of submodulePaths) {
+    if (rel === sub || rel.startsWith(`${sub}/`)) {
+      throw new FileSystemError(
+        toAbsolute(realRoot, relPath),
+        new Error(
+          `refusing to write inside git submodule '${sub}': ${relPath} — a submodule is a ` +
+            'separate repository with its own canonical config; manage its files there.',
+        ),
+      );
+    }
+  }
+}
+
 /** Creates a `FileWriter` over the real filesystem rooted at `root`. */
 export function createFileWriter(root: string): FileWriter {
   // `root` is trusted; resolve it once so containment compares real paths
@@ -226,6 +289,10 @@ export function createFileWriter(root: string): FileWriter {
   } catch (err) {
     throw new FileSystemError(root, err);
   }
+  // Submodule roots are read once at construction (the writer outlives a single
+  // call). Reads/exists are unaffected — only the two MUTATORS are guarded, so
+  // verify-reads still work, but no write/remove can land inside a submodule.
+  const submodulePaths = loadSubmodulePathsSync(realRoot);
   return {
     read(relPath: string): string | null {
       const abs = toAbsolute(realRoot, relPath);
@@ -265,6 +332,9 @@ export function createFileWriter(root: string): FileWriter {
       // SECURITY: lexical containment first — reject `..`/absolute escapes
       // before any filesystem access (throws FileSystemError).
       const abs = assertContained(realRoot, relPath);
+      // Submodule boundary: refuse to write a submodule root or anything under
+      // one (defense-in-depth — nothing is ever written into a separate repo).
+      assertNotUnderSubmodule(realRoot, relPath, submodulePaths);
       // SECURITY: then realpath the deepest existing ancestor and require it is
       // inside realRoot BEFORE mkdir, so we never create directories or write
       // through an escaping symlinked parent (the symlinked-parent-dir bypass).
@@ -290,6 +360,8 @@ export function createFileWriter(root: string): FileWriter {
       // the LINK (never its target); `force` makes a missing file a no-op so
       // callers need not pre-check existence.
       const abs = assertContained(realRoot, relPath);
+      // Submodule boundary: never remove a submodule root or a path under one.
+      assertNotUnderSubmodule(realRoot, relPath, submodulePaths);
       assertParentContained(realRoot, abs);
       try {
         rmSync(abs, { force: true });
