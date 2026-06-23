@@ -27,7 +27,7 @@ import {
   mkdirSync,
   rmSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { FileWriter } from '../entities/file-writer.js';
 import { FileSystemError } from '../entities/errors.js';
 import { parseGitmodules } from './filesystem.js';
@@ -248,27 +248,32 @@ function loadSubmodulePathsSync(realRoot: string): readonly string[] {
  * with its own canonical config, so the parent's projection must never land a
  * file inside it. This is defense-in-depth alongside the snapshot's walk
  * boundary: even if a path slips past collection (a future caller, a hand-built
- * `EmittedFile`), nothing is ever written into a submodule tree. `relPath` is
- * the lexically-contained repo-relative POSIX path (already `..`/absolute-safe).
+ * `EmittedFile`), nothing is ever written into a submodule tree.
+ *
+ * `absResolved` is the FULLY RESOLVED physical destination (`resolve(realRoot,
+ * relPath)`, already confirmed in-repo by `assertContained`). We MUST compare
+ * against this, not the raw POSIX `relPath`: a `..`-traversal such as
+ * `foo/../references/sub/X` is in-repo but a naive string-prefix check on the
+ * raw text never matches `references/sub` (the literal `..` is still present),
+ * while the OS collapses `..` at write time and lands the file INSIDE the
+ * submodule. Deriving `rel` from the resolved path collapses `..` first, so the
+ * boundary check sees the same location the write actually targets. `relPath` is
+ * carried only for the error message (what the caller asked for).
  */
 function assertNotUnderSubmodule(
   realRoot: string,
+  absResolved: string,
   relPath: string,
   submodulePaths: readonly string[],
 ): void {
-  // Normalize the candidate the way the snapshot's `rel` paths are shaped:
-  // POSIX separators, no leading './', no trailing '/'.
-  let rel = relPath.replace(/\\/g, '/');
-  while (rel.startsWith('./')) {
-    rel = rel.slice(2);
-  }
-  while (rel.endsWith('/')) {
-    rel = rel.slice(0, -1);
-  }
+  // The resolved path is guaranteed at-or-under realRoot (assertContained threw
+  // otherwise), so path.relative yields a '..'-free relative path. Convert to
+  // the POSIX shape the snapshot's `rel` paths use so comparisons line up.
+  const rel = relative(realRoot, absResolved).split(sep).join('/');
   for (const sub of submodulePaths) {
     if (rel === sub || rel.startsWith(`${sub}/`)) {
       throw new FileSystemError(
-        toAbsolute(realRoot, relPath),
+        absResolved,
         new Error(
           `refusing to write inside git submodule '${sub}': ${relPath} — a submodule is a ` +
             'separate repository with its own canonical config; manage its files there.',
@@ -334,7 +339,10 @@ export function createFileWriter(root: string): FileWriter {
       const abs = assertContained(realRoot, relPath);
       // Submodule boundary: refuse to write a submodule root or anything under
       // one (defense-in-depth — nothing is ever written into a separate repo).
-      assertNotUnderSubmodule(realRoot, relPath, submodulePaths);
+      // Check against the RESOLVED destination so a `..`-traversal that the OS
+      // would collapse INTO a submodule is caught (assertContained already
+      // proved it stays in-repo).
+      assertNotUnderSubmodule(realRoot, resolve(realRoot, relPath), relPath, submodulePaths);
       // SECURITY: then realpath the deepest existing ancestor and require it is
       // inside realRoot BEFORE mkdir, so we never create directories or write
       // through an escaping symlinked parent (the symlinked-parent-dir bypass).
@@ -361,7 +369,8 @@ export function createFileWriter(root: string): FileWriter {
       // callers need not pre-check existence.
       const abs = assertContained(realRoot, relPath);
       // Submodule boundary: never remove a submodule root or a path under one.
-      assertNotUnderSubmodule(realRoot, relPath, submodulePaths);
+      // Resolved destination (see write) so `..`-traversal cannot slip past.
+      assertNotUnderSubmodule(realRoot, resolve(realRoot, relPath), relPath, submodulePaths);
       assertParentContained(realRoot, abs);
       try {
         rmSync(abs, { force: true });

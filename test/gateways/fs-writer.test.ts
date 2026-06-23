@@ -273,6 +273,55 @@ describe('createFileWriter()', () => {
     assert.throws(() => writer.write('sub/s', 'x\n'), /submodule/);
   });
 
+  // Regression for the `..`-traversal bypass: a path like
+  // `foo/../references/sdlc-next/CLAUDE.md` is in-repo (assertContained passes)
+  // and the OS collapses `..` AT WRITE TIME so the file lands INSIDE the
+  // submodule — but the boundary check used to compare the raw POSIX string,
+  // where the literal `..` never matched the submodule prefix, so the write
+  // slipped through. The guard must compare the RESOLVED destination.
+  it('refuses to write under a submodule via a `..`-traversal path (resolved, not lexical)', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "references/sdlc-next"]\n\tpath = references/sdlc-next\n',
+      'references/sdlc-next/AGENTS.md': '# submodule canonical\n',
+    });
+    const writer = createFileWriter(repo.root);
+    assert.throws(
+      () => writer.write('foo/../references/sdlc-next/CLAUDE.md', '@AGENTS.md\n'),
+      /submodule/,
+    );
+    // Deeper traversal that resolves to the same in-submodule location.
+    assert.throws(
+      () => writer.write('a/x/../../references/sdlc-next/EVIL.md', 'evil\n'),
+      /submodule/,
+    );
+    // Nothing landed inside the submodule, and its own files are intact.
+    assert.equal(existsSync(join(repo.root, 'references', 'sdlc-next', 'CLAUDE.md')), false);
+    assert.equal(existsSync(join(repo.root, 'references', 'sdlc-next', 'EVIL.md')), false);
+    assert.equal(
+      await readFile(join(repo.root, 'references', 'sdlc-next', 'AGENTS.md'), 'utf8'),
+      '# submodule canonical\n',
+    );
+  });
+
+  it('refuses to remove under a submodule via a `..`-traversal path', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n',
+      'sub/s/SKILL.md': 'submodule file\n',
+    });
+    const writer = createFileWriter(repo.root);
+    assert.throws(() => writer.remove('sub/q/../s/SKILL.md'), /submodule/);
+    assert.equal(existsSync(join(repo.root, 'sub', 's', 'SKILL.md')), true);
+  });
+
+  // The fix must not over-block: a `..`-traversal that resolves to a NON-submodule
+  // path (sub/server, prefix-shares with submodule sub/s) still writes fine.
+  it('still writes a `..`-traversal path that resolves OUTSIDE any submodule', async () => {
+    const repo = await freshRepo({ '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n' });
+    const writer = createFileWriter(repo.root);
+    writer.write('sub/tmp/../server/AGENTS.md', '# not a submodule\n');
+    assert.equal(writer.read('sub/server/AGENTS.md'), '# not a submodule\n');
+  });
+
   it('refuses to remove a path under a declared submodule root', async () => {
     const repo = await freshRepo({
       '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n',
