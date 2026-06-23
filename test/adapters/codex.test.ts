@@ -178,6 +178,102 @@ describe('codexAdapter — 32 KiB chain cap (EV1 / HH-W004)', () => {
     );
     assert.deepEqual(projection.warnings, []);
   });
+
+  // #dogfood-round2 (7): the cap is PER root→cwd chain, not a whole-repo sum.
+  // Several large SIBLING nested AGENTS.md (different subtrees) whose bodies SUM
+  // past the cap must NOT warn, because Codex never loads two sibling chains for
+  // one working directory — only the root + the nested files on the path down to
+  // a given cwd.
+  it('does NOT warn when sibling AGENTS.md sum exceeds the cap but no single chain does', () => {
+    // Three quarter-cap siblings + a small root. Each chain = root + ONE sibling
+    // ≈ cap/4, well under the cap; the SUM (≈ 3·cap/4 + root) exceeds it.
+    const quarter = 'x'.repeat(Math.floor(CODEX_PROJECT_DOC_MAX_BYTES / 4));
+    const projection = codexAdapter.project(
+      ir({
+        instructions: [
+          rootInstruction('# root\n'),
+          nestedInstruction('packages/a', quarter),
+          nestedInstruction('packages/b', quarter),
+          nestedInstruction('packages/c', quarter),
+        ],
+      }),
+      ctxWith(),
+    );
+    assert.deepEqual(projection.warnings, []);
+  });
+
+  // The deepest single chain (root → packages/a → packages/a/web) is what counts.
+  it('warns for the heaviest root→cwd chain even when siblings stay light', () => {
+    const big = 'x'.repeat(CODEX_PROJECT_DOC_MAX_BYTES); // root alone == cap (no warn yet)
+    const overflow = 'y'.repeat(64); // any nested file on the chain tips it over
+    const projection = codexAdapter.project(
+      ir({
+        instructions: [
+          rootInstruction(big),
+          // A heavy descendant chain: root + this nested = cap + 64 > cap.
+          nestedInstruction('packages/a', overflow),
+          // A light sibling whose own chain (root + this) also exceeds — but the
+          // point is the warning fires and names a real over-cap chain size.
+          nestedInstruction('packages/b', '# tiny\n'),
+        ],
+      }),
+      ctxWith(),
+    );
+    assert.equal(projection.warnings.length, 1);
+    assert.equal(projection.warnings[0]?.code, 'HH-W004');
+    assert.equal(projection.warnings[0]?.providerId, 'codex');
+    // The reported size is a real chain total, not the whole-repo sum: it must be
+    // <= the sum of every AGENTS.md body (root + a + b).
+    const wholeRepoSum =
+      CODEX_PROJECT_DOC_MAX_BYTES + overflow.length + Buffer.byteLength('# tiny\n', 'utf8');
+    const m = /(\d+) bytes/.exec(projection.warnings[0]?.message ?? '');
+    assert.ok(m, 'message reports a byte count');
+    const reported = Number(m![1]);
+    assert.ok(reported > CODEX_PROJECT_DOC_MAX_BYTES, 'reported chain is over the cap');
+    assert.ok(reported < wholeRepoSum, 'reported chain is a single chain, not the whole-repo sum');
+  });
+
+  // A deep linear chain (root → a → a/b → a/b/c) sums past the cap → warn.
+  it('warns when a deep linear root→cwd chain exceeds the cap', () => {
+    const third = 'z'.repeat(Math.floor(CODEX_PROJECT_DOC_MAX_BYTES / 3) + 16);
+    const projection = codexAdapter.project(
+      ir({
+        instructions: [
+          rootInstruction('# root\n'),
+          nestedInstruction('a', third),
+          nestedInstruction('a/b', third),
+          nestedInstruction('a/b/c', third),
+        ],
+      }),
+      ctxWith(),
+    );
+    assert.equal(projection.warnings.length, 1);
+    assert.equal(projection.warnings[0]?.code, 'HH-W004');
+  });
+
+  // A nested AGENTS.md that is NOT an ancestor (a/b is not on x/y's chain) must
+  // not contribute to x/y's chain — guards the prefix check against substring
+  // false positives (e.g. "a" vs "ab").
+  it('does not treat a sibling-prefixed directory as an ancestor (ab is not under a)', () => {
+    const big = 'x'.repeat(CODEX_PROJECT_DOC_MAX_BYTES); // each alone == cap
+    const projection = codexAdapter.project(
+      ir({
+        instructions: [
+          rootInstruction('# root\n'),
+          nestedInstruction('a', big),
+          nestedInstruction('ab', big), // "ab" must NOT be seen as under "a"
+        ],
+      }),
+      ctxWith(),
+    );
+    // Each chain is root(7) + cap = cap+7 > cap, so it DOES warn — but the point
+    // is correctness: if "ab" were wrongly folded under "a", the chain would be
+    // root + a + ab = cap*2+7. Assert the reported size is a single chain.
+    assert.equal(projection.warnings[0]?.code, 'HH-W004');
+    const m = /(\d+) bytes/.exec(projection.warnings[0]?.message ?? '');
+    const reported = Number(m![1]);
+    assert.equal(reported, CODEX_PROJECT_DOC_MAX_BYTES + Buffer.byteLength('# root\n', 'utf8'));
+  });
 });
 
 describe('codexAdapter — existing [hooks] table (UN2 / HH-W005)', () => {

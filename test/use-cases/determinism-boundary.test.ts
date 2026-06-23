@@ -91,6 +91,11 @@ describe('PRD §17 / C4 determinism boundary', () => {
         '.agents/skills/foo/SKILL.md':
           '---\nname: foo\ndescription: Use when fooing\n---\n# Foo\n\nDo it.\n',
         '.agents/hooks/pre-tool-use.lint.sh': '#!/usr/bin/env bash\necho lint\n',
+        // The apply assertion below checks `.github/copilot-instructions.md` is
+        // written. The new auto-derive default (#dogfood-round2 (9)) projects
+        // nothing for a fresh canonical-only repo, so pin `"all"` to force the
+        // full matrix — orthogonal to this suite's no-spawn determinism check.
+        'harness-haircut.config.json': '{"providers":"all"}\n',
       };
       for (const [rel, content] of Object.entries(files)) {
         const abs = join(repoRootTmp, ...rel.split('/'));

@@ -42,8 +42,20 @@ export interface AssistConfig {
 }
 
 export interface HarnessConfig {
-  /** Providers explicitly listed as enabled; `null` means "all four". */
-  providers: ProviderId[] | null;
+  /**
+   * Provider activation policy:
+   *   - `ProviderId[]` — an explicit allow-list; exactly these (minus
+   *     `providers_disabled`) are active, regardless of repo evidence.
+   *   - `'all'` — explicitly force all four providers on (the escape hatch for
+   *     "materialize every provider even where none exists yet").
+   *   - `null` — UNSET. The active set is DERIVED from providers that have
+   *     evidence in the repo (detected provider files), so `apply` does not
+   *     create brand-new files for a provider with zero presence (e.g. a
+   *     `.gemini/settings.json` in a repo that never used Gemini). See
+   *     {@link effectiveProviders}; {@link enabledProviders} keeps the legacy
+   *     "all four" reading for callers without repo evidence to hand.
+   */
+  providers: ProviderId[] | 'all' | null;
   /** Providers to skip entirely (subtracted from the enabled set). */
   providersDisabled: ProviderId[];
   /** When true, any `warn` severity is escalated to a failure (PRD §11). */
@@ -165,7 +177,15 @@ export function loadConfig(raw: string | null, path = 'harness-haircut.config.js
   const config = defaultConfig();
 
   if (obj['providers'] !== undefined) {
-    config.providers = readProviderArray(obj['providers'], 'providers', path);
+    // `"providers": "all"` is the explicit escape hatch that forces every
+    // provider on even where none has files yet. Any other string is invalid;
+    // an array is the allow-list. Leaving it unset (`null`) DERIVES the active
+    // set from detected provider files (see effectiveProviders).
+    if (obj['providers'] === 'all') {
+      config.providers = 'all';
+    } else {
+      config.providers = readProviderArray(obj['providers'], 'providers', path);
+    }
   }
   if (obj['providers_disabled'] !== undefined) {
     config.providersDisabled = readProviderArray(
@@ -287,10 +307,47 @@ function readAssistConfig(value: unknown, path: string): AssistConfig {
 }
 
 /**
- * The effective enabled provider set: the `providers` allow-list (or all
- * four when unset) minus `providers_disabled`, in canonical A-story order.
+ * The statically-enabled provider set with NO repo evidence to hand: the
+ * `providers` allow-list (or all four when unset or `'all'`) minus
+ * `providers_disabled`, in canonical A-story order. Used where deriving from
+ * detected files is not meaningful (e.g. `doctor`'s config echo). Commands that
+ * write or audit provider files use {@link effectiveProviders} instead, so an
+ * unset `providers` does not materialize files for an absent provider.
  */
 export function enabledProviders(config: HarnessConfig): ProviderId[] {
-  const base = config.providers ?? [...ALL_PROVIDERS];
+  const base = config.providers === null || config.providers === 'all'
+    ? [...ALL_PROVIDERS]
+    : config.providers;
+  return base.filter((id) => !config.providersDisabled.includes(id));
+}
+
+/**
+ * The EFFECTIVE active provider set for a real repo, given the providers
+ * `detected` to have files there (in any order):
+ *
+ *   - explicit allow-list → exactly that list (repo evidence is ignored — the
+ *     user pinned it);
+ *   - `'all'` → all four (the escape hatch);
+ *   - unset (`null`) → only providers with detected evidence, so `apply` never
+ *     creates brand-new files for a provider that has zero presence.
+ *
+ * `providers_disabled` is always subtracted last, and the result is returned in
+ * canonical A-story order. This is the seam that fixes the default-on-everything
+ * noise (#dogfood-round2): an explicit config is honored unchanged, only the
+ * unset default changed.
+ */
+export function effectiveProviders(
+  config: HarnessConfig,
+  detected: readonly ProviderId[],
+): ProviderId[] {
+  let base: readonly ProviderId[];
+  if (config.providers === 'all') {
+    base = ALL_PROVIDERS;
+  } else if (config.providers === null) {
+    const present = new Set(detected);
+    base = ALL_PROVIDERS.filter((id) => present.has(id));
+  } else {
+    base = config.providers;
+  }
   return base.filter((id) => !config.providersDisabled.includes(id));
 }

@@ -49,7 +49,7 @@ import { isWorkingTreeDirty } from './gateways/git.js';
 import { createAllAdapters } from './adapters/index.js';
 import { parseRepo } from './use-cases/parse-repo.js';
 import { readRepoSnapshot, readInitSnapshot } from './gateways/filesystem.js';
-import { loadConfig, enabledProviders } from './use-cases/load-config.js';
+import { loadConfig, effectiveProviders } from './use-cases/load-config.js';
 import type { HarnessConfig } from './use-cases/load-config.js';
 import { audit } from './use-cases/audit.js';
 import type { AuditReport, FileAudit } from './use-cases/audit.js';
@@ -367,9 +367,20 @@ function renderDoctorReport(report: DoctorReport): string {
   if (report.config === null) {
     lines.push('config: invalid (see warnings)');
   } else {
-    const enabled = report.config.providers ?? 'all';
+    const { providers } = report.config;
     lines.push('config:');
-    lines.push(`  providers     ${Array.isArray(enabled) ? enabled.join(', ') : enabled}`);
+    if (Array.isArray(providers)) {
+      lines.push(`  providers     ${providers.join(', ')}`);
+    } else if (providers === 'all') {
+      lines.push('  providers     all (forced)');
+    } else {
+      // Unset: the active set is derived from detected provider files
+      // (#dogfood-round2 (9)). Show what is effectively active so the auto-detect
+      // behavior is visible rather than implied.
+      const detected = report.detectedProviders.map((entry) => entry.providerId);
+      const active = effectiveProviders(report.config, detected);
+      lines.push(`  providers     auto (detected: ${active.join(', ') || 'none'})`);
+    }
     lines.push(`  disabled      ${report.config.providersDisabled.join(', ') || '(none)'}`);
     lines.push(`  exclude       ${report.config.exclude.join(', ') || '(none)'}`);
     lines.push(`  gemini.mode   ${report.config.gemini.mode}`);
@@ -461,6 +472,27 @@ async function readConfigText(
   }
 }
 
+/**
+ * Provider ids that have evidence (detected config files) in the repo at `cwd`.
+ * Runs the WIDE init-style snapshot — which collects provider-owned files
+ * (`CLAUDE.md`, `.claude/`, `.gemini/settings.json`, the Copilot review files,
+ * …), not just canonical sources — and each adapter's `detectExisting` against
+ * it. This drives `effectiveProviders` so an unset `providers` config does not
+ * materialize files for a provider with zero presence (#dogfood-round2 (9)).
+ * Honors the config `exclude` globs so a fixture's provider files are not read
+ * as real evidence.
+ */
+async function detectProviderIds(cwd: string, exclude: readonly string[]): Promise<ProviderId[]> {
+  const snapshot = await readInitSnapshot(cwd, exclude);
+  const detected: ProviderId[] = [];
+  for (const adapter of createAllAdapters()) {
+    if (adapter.detectExisting(snapshot) !== null) {
+      detected.push(adapter.id);
+    }
+  }
+  return detected;
+}
+
 async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const cwdFlag = parsed.flags['--cwd'];
   const cwd = typeof cwdFlag === 'string' ? resolve(cwdFlag) : process.cwd();
@@ -481,10 +513,20 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   const failOn: 'warn' | 'drift' = failOnFlag === 'drift' ? 'drift' : 'warn';
 
   let report: AuditReport;
+  // Detected provider ids are needed both to derive the active set (#9) and to
+  // word the absent-provider hint accurately (#10); hoisted so the renderer can
+  // read them after the try.
+  let detected: ProviderId[] = [];
   try {
     const config = await readConfig(cwd, configFlag);
     const reader = createProviderFileReader(cwd);
-    const enabled = enabledProviders(config);
+    // #dogfood-round2 (9): when `providers` is unset, the active set is derived
+    // from providers that have files in the repo, so a no-Gemini repo does not
+    // perpetually report a missing `.gemini/settings.json` as drift (#10) and
+    // `apply` would not create it. An explicit allow-list or `"all"` is honored
+    // unchanged (detection is ignored for those).
+    detected = await detectProviderIds(cwd, config.exclude);
+    const enabled = effectiveProviders(config, detected);
     const adapters = createAllAdapters().filter((adapter) => enabled.includes(adapter.id));
     const contextFor = (id: ProviderId): ProjectionContext => {
       const ctx: ProjectionContext = { cwd, providerFiles: reader };
@@ -515,7 +557,7 @@ async function runAudit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
   if (json) {
     io.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    io.stdout.write(renderAuditReport(report));
+    io.stdout.write(renderAuditReport(report, detected));
   }
   return report.exitCode;
 }
@@ -535,7 +577,7 @@ function warningLines(warnings: readonly Warning[], indent: string): string[] {
   });
 }
 
-function renderAuditReport(report: AuditReport): string {
+function renderAuditReport(report: AuditReport, detected: readonly ProviderId[] = []): string {
   const lines: string[] = [];
   // `aliased` (#35) is neither clean nor drift — those paths were skipped, so
   // they are excluded from the clean/drift accounting and listed separately.
@@ -563,14 +605,22 @@ function renderAuditReport(report: AuditReport): string {
     }
   }
 
-  // #43: an ENABLED provider whose every expected file is MISSING ON DISK has
-  // no presence here. Name it with the `providers_disabled` remedy, so a
-  // no-Gemini repo's "missing .gemini/settings.json" drift is not read as "I
-  // must create Gemini files I don't want". A provider is absent iff it appears
-  // in the report (non-aliased) but none of its files exists — `drift:missing`
-  // now means the FILE is absent (a present-but-keyless merge file is
-  // `drift:differs`, gauntlet fix), so this no longer false-fires for a
-  // hand-kept `.gemini/settings.json` without the owned key.
+  // #43 + #dogfood-round2 (10): an ENABLED provider whose every projected file
+  // is MISSING ON DISK gets a hint. The OLD wording ("N provider(s) have no
+  // files in this repo (claude, …)") was inaccurate — it named `claude` even
+  // when a root `CLAUDE.md` and a populated `.claude/` tree existed, because it
+  // only inspected the PROJECTED targets, not the provider's actual presence.
+  // We now split on real evidence (`detected`, from each adapter's
+  // detectExisting over the wide snapshot):
+  //   - present-but-unprojected: the provider HAS files, but its projected
+  //     targets are missing/out of sync → say exactly that, recommend `apply`,
+  //     and never suggest disabling a provider that is plainly in use.
+  //   - truly-absent: no projected files AND no detected evidence → the
+  //     historical "not used here → providers_disabled" remedy is correct.
+  // `drift:missing` means the FILE itself is absent (a present-but-keyless
+  // merge file is `drift:differs`, gauntlet fix), so a hand-kept
+  // `.gemini/settings.json` without the owned key never lands here.
+  const detectedSet = new Set(detected);
   const seen = new Set<ProviderId>();
   const present = new Set<ProviderId>();
   for (const file of report.files) {
@@ -582,12 +632,22 @@ function renderAuditReport(report: AuditReport): string {
       present.add(file.providerId);
     }
   }
-  const absentProviders = [...seen].filter((id) => !present.has(id));
-  if (absentProviders.length > 0) {
+  const missingProjection = [...seen].filter((id) => !present.has(id));
+  const trulyAbsent = missingProjection.filter((id) => !detectedSet.has(id));
+  const presentUnprojected = missingProjection.filter((id) => detectedSet.has(id));
+  if (presentUnprojected.length > 0) {
     lines.push('');
     lines.push(
-      `hint: ${absentProviders.length} enabled provider(s) have no files in this repo ` +
-        `(${absentProviders.join(', ')}). Run \`harness-haircut apply\` to create them, or — if a ` +
+      `hint: ${presentUnprojected.length} provider(s) have files in this repo but no in-sync ` +
+        `projected files (${presentUnprojected.join(', ')}). Run \`harness-haircut apply\` to ` +
+        'create or update them from the canonical sources.',
+    );
+  }
+  if (trulyAbsent.length > 0) {
+    lines.push('');
+    lines.push(
+      `hint: ${trulyAbsent.length} enabled provider(s) have no files in this repo ` +
+        `(${trulyAbsent.join(', ')}). Run \`harness-haircut apply\` to create them, or — if a ` +
         'provider is not used here — add it to `providers_disabled` in harness-haircut.config.json ' +
         'so audit stops expecting it.',
     );
@@ -747,7 +807,12 @@ async function runApply(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
     const config = await readConfig(cwd, configFlag);
     const reader = createProviderFileReader(cwd);
     const writer = createFileWriter(cwd);
-    const enabled = enabledProviders(config);
+    // #dogfood-round2 (9): unset `providers` derives the active set from
+    // detected provider files, so a standalone apply never materializes a
+    // brand-new provider file (e.g. `.gemini/settings.json`) for a provider
+    // with zero presence. `"all"` / an explicit list still forces those.
+    const detected = await detectProviderIds(cwd, config.exclude);
+    const enabled = effectiveProviders(config, detected);
     const adapters = createAllAdapters().filter((adapter) => enabled.includes(adapter.id));
     const contextFor = (id: ProviderId): ProjectionContext => {
       const ctx: ProjectionContext = { cwd, providerFiles: reader };
@@ -1206,7 +1271,11 @@ async function runInit(parsed: ParsedArgs, io: RunIO): Promise<ExitCode> {
 
     const reader = createProviderFileReader(cwd);
     const writer = createFileWriter(cwd);
-    const enabled = enabledProviders(config);
+    // #dogfood-round2 (9): unset `providers` onboards only the providers the
+    // repo actually uses (detected files) instead of materializing every
+    // provider's files. `"all"` / an explicit list still forces those.
+    const detected = await detectProviderIds(cwd, config.exclude);
+    const enabled = effectiveProviders(config, detected);
     const adapters = createAllAdapters().filter((adapter) => enabled.includes(adapter.id));
     const contextFor = (id: ProviderId): ProjectionContext => {
       const ctx: ProjectionContext = { cwd, providerFiles: reader };

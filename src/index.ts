@@ -118,7 +118,7 @@ export type { DoctorReport, DoctorDeps, DoctorAssistSource } from './use-cases/d
 export { isWorkingTreeDirty } from './gateways/git.js';
 export { createFileWriter, createSymlinkAliasProbe } from './gateways/fs-writer.js';
 
-export { loadConfig, defaultConfig, defaultAssistConfig, enabledProviders } from './use-cases/load-config.js';
+export { loadConfig, defaultConfig, defaultAssistConfig, enabledProviders, effectiveProviders } from './use-cases/load-config.js';
 export type {
   HarnessConfig,
   GeminiMode,
