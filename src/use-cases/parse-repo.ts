@@ -47,15 +47,16 @@ interface Frontmatter {
  *   - blank lines and full-line `#` comments
  *   - ` #` inside a cleanly-quoted scalar (`description: "fix issue #12"`)
  *     is literal text — YAML cannot start a comment inside quotes (#36)
+ *   - ` #` inside an UNQUOTED scalar (`description: work on issue #N`) is
+ *     ALSO kept as literal text, matching the real consumer: Claude Code
+ *     reads the whole description, it does NOT treat ` #` as a comment here.
+ *     The round-trip stays byte-stable and HH-W014 advises quoting it (#58).
  * Rejected (exit code 3, F1 UN2) rather than silently mis-parsed:
- *   - UNQUOTED values containing ` #` — YAML trailing comments are outside
- *     the supported subset, and providers genuinely mis-parse these (Claude
- *     Code truncates an unquoted description at the `#`)
  *   - inline array items containing `"` or `'` — quoted items may embed
  *     commas, which the comma-split cannot handle faithfully
  *   - anything else (nested maps, multi-line scalars, anchors, …)
  */
-function parseFrontmatter(content: string, filePath: string): Frontmatter {
+function parseFrontmatter(content: string, filePath: string, warnings: Warning[]): Frontmatter {
   const lines = content.split('\n');
   if ((lines[0] ?? '').trimEnd() !== '---') {
     return { present: false, data: emptyData(), body: content, raw: '' };
@@ -87,7 +88,7 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
     const key = keyMatch[1] ?? '';
     const rest = (keyMatch[2] ?? '').trim();
     if (!isCleanlyQuoted(rest)) {
-      rejectTrailingComment(rest, key, lineNo, filePath);
+      warnAmbiguousComment(rest, key, lineNo, filePath, warnings);
     }
     if (rest === '') {
       const items: string[] = [];
@@ -98,7 +99,7 @@ function parseFrontmatter(content: string, filePath: string): Frontmatter {
         }
         const item = (itemMatch[1] ?? '').trim();
         if (!isCleanlyQuoted(item)) {
-          rejectTrailingComment(item, key, i + 1, filePath);
+          warnAmbiguousComment(item, key, i + 1, filePath, warnings);
         }
         items.push(unquote(item));
         i += 1;
@@ -163,16 +164,55 @@ function isCleanlyQuoted(value: string): boolean {
   return value.endsWith(quote) && !value.slice(1, -1).includes(quote);
 }
 
-/** The subset has no trailing-comment support; silently keeping the text would mis-parse. */
-function rejectTrailingComment(value: string, key: string, lineNo: number, filePath: string): void {
-  if (value.includes(' #')) {
-    throw new ParseError(
-      filePath,
-      `value for frontmatter key "${key}" (line ${lineNo}) contains " #": ` +
-        'YAML comments are outside the supported subset. Double-quote the whole ' +
-        `value to keep a literal " #" (e.g. ${key}: "fixes issue #12"), or reword it`,
-    );
+/**
+ * An unquoted value containing ` #` is AMBIGUOUS — a strict YAML parser would
+ * read it as a trailing comment, but the real consumer (Claude Code) keeps the
+ * whole value. We match the consumer: the caller keeps the full text literal,
+ * and we mint HH-W014 advising the user to quote it so the intent is explicit
+ * for every reader. Not thrown — a working skill must not abort the whole audit
+ * (#58). Cleanly-quoted values never reach here (see isCleanlyQuoted, #36).
+ */
+function warnAmbiguousComment(
+  value: string,
+  key: string,
+  lineNo: number,
+  filePath: string,
+  warnings: Warning[],
+): void {
+  if (!value.includes(' #')) {
+    return;
   }
+  warnings.push({
+    code: 'HH-W014',
+    severity: 'warn',
+    message:
+      `${filePath}: value for frontmatter key "${key}" (line ${lineNo}) contains an ` +
+      'ambiguous " #". A strict YAML parser would treat the rest as a comment, but ' +
+      'it was kept as literal text to match the consumer. ' +
+      `${quoteAdvice(value, key)}`,
+    canonicalPath: filePath,
+  });
+}
+
+/**
+ * Advise a quoting style the value can actually wear. Quotes don't nest in the
+ * subset (no escape processing), so a value with a literal `"` can't be
+ * double-quoted, and one with a literal `'` can't be single-quoted — suggest
+ * the OTHER style (or rewording). When the value is quote-free, either works.
+ */
+function quoteAdvice(value: string, key: string): string {
+  const hasDouble = value.includes('"');
+  const hasSingle = value.includes("'");
+  if (hasDouble && hasSingle) {
+    return 'It already contains both quote characters, so reword it to drop the " #".';
+  }
+  if (hasDouble) {
+    return `Single-quote the whole value to keep it literal (e.g. ${key}: 'fixes issue #12'), or reword it.`;
+  }
+  if (hasSingle) {
+    return `Double-quote the whole value to keep it literal (e.g. ${key}: "fixes issue #12"), or reword it.`;
+  }
+  return `Quote the whole value to keep it literal (e.g. ${key}: "fixes issue #12"), or reword it.`;
 }
 
 function unquote(value: string): string {
@@ -228,8 +268,8 @@ function hasFrontmatterBlock(content: string): boolean {
 }
 
 /** F1 EV2 + UN5: scoped fragments require `scope:` frontmatter. */
-function parseInstructionFragment(file: FileSnapshot): Instruction {
-  const fm = parseFrontmatter(file.content, file.path);
+function parseInstructionFragment(file: FileSnapshot, warnings: Warning[]): Instruction {
+  const fm = parseFrontmatter(file.content, file.path, warnings);
   const scope = fm.data['scope'];
   if (!fm.present || scope === undefined) {
     throw new ParseError(
@@ -344,7 +384,7 @@ function assembleSkills(
     // walk). A skill that failed here contributes nothing to the IR — the
     // run never proceeds past parse when parseErrors is non-empty.
     try {
-      assembleSkill(entry, folderFiles, pathByName, skills);
+      assembleSkill(entry, folderFiles, pathByName, skills, warnings);
     } catch (err) {
       if (err instanceof ParseError) {
         parseErrors.push(err);
@@ -361,8 +401,9 @@ function assembleSkill(
   folderFiles: readonly FileSnapshot[],
   pathByName: Map<string, string>,
   skills: Skill[],
+  warnings: Warning[],
 ): void {
-  const fm = parseFrontmatter(entry.content, entry.path);
+  const fm = parseFrontmatter(entry.content, entry.path, warnings);
   const name = fm.data['name'];
   const description = fm.data['description'];
   if (!fm.present || typeof name !== 'string' || name === '') {
@@ -469,7 +510,7 @@ export async function parseRepo(deps: ParseRepoDeps): Promise<ParseRepoResult> {
     }
     const segments = file.path.split('/');
     if (segments[1] === 'instructions' && segments.length === 3 && file.path.endsWith('.md')) {
-      const fragment = collecting(() => parseInstructionFragment(file));
+      const fragment = collecting(() => parseInstructionFragment(file, warnings));
       if (fragment !== undefined) {
         instructions.push(fragment);
       }

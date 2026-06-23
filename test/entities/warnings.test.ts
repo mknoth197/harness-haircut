@@ -19,6 +19,7 @@ const EXPECTED_CODES = [
   'HH-W011',
   'HH-W012',
   'HH-W013',
+  'HH-W014',
 ];
 
 describe('warning catalogue', () => {
@@ -49,6 +50,10 @@ describe('warning catalogue', () => {
     assert.equal(
       parsed['HH-W013'],
       'provider path skipped: a symlink aliases it onto another repo path',
+    );
+    assert.equal(
+      parsed['HH-W014'],
+      'unquoted frontmatter value contains an ambiguous " #", kept as literal text',
     );
   });
 

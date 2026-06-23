@@ -14,7 +14,8 @@ export type WarningCode =
   | 'HH-W010'
   | 'HH-W011'
   | 'HH-W012'
-  | 'HH-W013';
+  | 'HH-W013'
+  | 'HH-W014';
 
 export type WarningSeverity = 'warn' | 'error';
 
@@ -40,6 +41,7 @@ export const WARNING_CATALOGUE: Readonly<Record<WarningCode, string>> = {
   'HH-W011': 'frontmatter in AGENTS.md leaks verbatim into provider prompts',
   'HH-W012': 'canonical source excluded by .gitignore',
   'HH-W013': 'provider path skipped: a symlink aliases it onto another repo path',
+  'HH-W014': 'unquoted frontmatter value contains an ambiguous " #", kept as literal text',
 };
 
 /**

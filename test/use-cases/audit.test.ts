@@ -99,6 +99,25 @@ describe('audit() — clean repo (EV3, EV1)', () => {
     const afterState = await snapshotDir(repo.root);
     assert.deepEqual(afterState, before);
   });
+
+  // #58: a skill whose description carries an unquoted " #" (a VALID, working
+  // Claude Code skill — Claude reads the whole description) must NOT abort the
+  // audit with exit 3. It parses leniently, mints HH-W014, and the audit
+  // proceeds to a normal verdict (exit 2 lossy-warning, no drift).
+  it('does not exit 3 on a skill description containing " #"; warns HH-W014 and proceeds', async () => {
+    const repo = await setup({
+      ...CANONICAL,
+      '.agents/skills/foo/SKILL.md':
+        '---\nname: foo\ndescription: work on issue #N from the template\n---\n# Foo\n\nDo the thing.\n',
+    });
+    const report = await runAudit(repo.root);
+    assert.notEqual(report.exitCode, 3);
+    assert.equal(report.drift, false);
+    assert.equal(report.exitCode, 2);
+    const w14 = report.warnings.find((w) => w.code === 'HH-W014');
+    assert.ok(w14, 'expected HH-W014 in the audit report');
+    assert.equal(w14?.canonicalPath, '.agents/skills/foo/SKILL.md');
+  });
 });
 
 describe('audit() — overwrite-file drift (EV1, §9 verify-by-class)', () => {

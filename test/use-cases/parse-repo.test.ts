@@ -96,11 +96,22 @@ describe('parseRepo — instructions', () => {
 });
 
 describe('parseRepo — frontmatter subset honesty', () => {
-  it('fails with exit code 3 on a scalar containing a YAML trailing comment', () =>
-    assertParseError(
-      { '.agents/instructions/c.md': '---\nscope: src/** # applies to source\n---\nbody\n' },
-      /YAML comments are outside the supported subset/,
-    ));
+  // #58: an unquoted value containing " #" is NO LONGER a hard error. A strict
+  // YAML parser reads " #..." as a comment, but the real consumer (Claude Code)
+  // keeps the whole value, so we match the consumer: the FULL text is preserved
+  // literally and HH-W014 advises quoting it. A working skill must never abort
+  // the whole audit over this.
+  it('keeps an unquoted scalar with " #" literal and warns HH-W014 (not exit 3)', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/instructions/c.md': '---\nscope: src/** # applies to source\n---\nbody\n',
+    });
+    // The " #..." remainder is part of the value, byte-for-byte.
+    assert.equal(ir.instructions[0]?.scope, 'src/** # applies to source');
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]?.code, 'HH-W014');
+    assert.equal(warnings[0]?.canonicalPath, '.agents/instructions/c.md');
+    assert.match(warnings[0]?.message ?? '', /ambiguous " #"/);
+  });
 
   it('fails with exit code 3 on inline array items containing quotes', () =>
     assertParseError(
@@ -144,43 +155,93 @@ describe('parseRepo — frontmatter subset honesty', () => {
   });
 
   it('accepts a single-quoted scalar containing " #" as literal text', async () => {
-    const { ir } = await parseFixture({
+    const { ir, warnings } = await parseFixture({
       '.agents/skills/demo/SKILL.md':
         "---\nname: demo\ndescription: 'fixes issue #12'\n---\nBody.\n",
     });
     assert.equal(ir.skills[0]?.description, 'fixes issue #12');
+    // #36: a cleanly-quoted value is unambiguous — no HH-W014.
+    assert.deepEqual(warnings, []);
   });
 
   it('accepts a quoted block-sequence item containing " #"', async () => {
-    const { ir } = await parseFixture({
+    const { ir, warnings } = await parseFixture({
       '.agents/skills/demo/SKILL.md':
         '---\nname: demo\ndescription: d\nnotes:\n- "see issue #3"\n---\nBody.\n',
     });
     assert.equal(ir.skills.length, 1);
+    assert.deepEqual(warnings, []);
   });
 
-  it('still rejects an AMBIGUOUSLY quoted scalar (" #" after an interior quote)', () =>
-    assertParseError(
-      {
-        '.agents/skills/demo/SKILL.md':
-          '---\nname: demo\ndescription: "a" #x"\n---\nBody.\n',
-      },
-      /YAML comments are outside the supported subset/,
-    ));
+  // #36/#47 exemption preserved: a fully-quoted value carrying a "#47" issue
+  // ref parses with NO warning — only AMBIGUOUS (unquoted / dirty-quoted) " #"
+  // earns HH-W014.
+  it('does not warn on a cleanly double-quoted value containing "#47"', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: d\nargument-hint: "address #47"\n---\nBody.\n',
+    });
+    assert.equal(ir.skills.length, 1);
+    assert.deepEqual(warnings, []);
+  });
 
-  it('names the remediation (quote the value) in the unquoted " #" rejection', () =>
-    assertParseError(
-      { '.agents/instructions/c.md': '---\nscope: src/** # comment\n---\nbody\n' },
-      /Double-quote the whole value/,
-    ));
+  // #58: a value that is NOT cleanly quoted but contains " #" (here an interior
+  // quote leaves " #x" looking comment-like) is no longer rejected — it warns
+  // and the full text is kept, same as any other ambiguous " #".
+  it('warns (not exit 3) on an ambiguously quoted scalar with " #" after an interior quote', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md': '---\nname: demo\ndescription: "a" #x"\n---\nBody.\n',
+    });
+    // No exit 3: it warns. unquote() strips the outer matching quote pair
+    // (`"a" #x"` -> `a" #x`); the " #" is no longer treated as a comment.
+    assert.equal(ir.skills[0]?.description, 'a" #x');
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]?.code, 'HH-W014');
+  });
+
+  it('names a quoting remediation in the HH-W014 advisory for an unquoted " #"', async () => {
+    const { warnings } = await parseFixture({
+      '.agents/instructions/c.md': '---\nscope: src/** # comment\n---\nbody\n',
+    });
+    // Quote-free value: either quote style works, so advise "Quote the whole value".
+    assert.match(warnings[0]?.message ?? '', /Quote the whole value/);
+  });
+
+  // (c) When the value already contains a literal double-quote, double-quoting
+  // it would not round-trip (the subset does no escape processing), so the
+  // advisory must steer the user to SINGLE quotes (or rewording) instead.
+  it('advises single-quoting when the " #" value already contains a double-quote', async () => {
+    const { ir, warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        '---\nname: demo\ndescription: say "hi" before issue #9\n---\nBody.\n',
+    });
+    assert.equal(ir.skills[0]?.description, 'say "hi" before issue #9');
+    assert.equal(warnings[0]?.code, 'HH-W014');
+    assert.match(warnings[0]?.message ?? '', /Single-quote the whole value/);
+    assert.doesNotMatch(warnings[0]?.message ?? '', /Double-quote the whole value/);
+  });
+
+  // Symmetric to (c): a value with a literal single-quote can't be single-quoted,
+  // so advise double-quoting.
+  it('advises double-quoting when the " #" value already contains a single-quote', async () => {
+    const { warnings } = await parseFixture({
+      '.agents/skills/demo/SKILL.md':
+        "---\nname: demo\ndescription: it's done, see issue #9\n---\nBody.\n",
+    });
+    assert.equal(warnings[0]?.code, 'HH-W014');
+    assert.match(warnings[0]?.message ?? '', /Double-quote the whole value/);
+  });
 });
 
 describe('parseRepo \u2014 aggregated parse errors (#36)', () => {
   it('reports EVERY unparseable file in one pass instead of aborting on the first', async () => {
+    // #58: " #" in a description is no longer a parse error (it warns), so the
+    // unparseable fixtures use a genuine, still-rejected fault: a missing
+    // `description:` key. The point of the test is aggregation across files.
     const repo = await mkTempRepo({
       'AGENTS.md': '# T\n',
-      '.agents/skills/alpha/SKILL.md': '---\nname: alpha\ndescription: bad #1 here\n---\nB.\n',
-      '.agents/skills/beta/SKILL.md': '---\nname: beta\ndescription: bad #2 here\n---\nB.\n',
+      '.agents/skills/alpha/SKILL.md': '---\nname: alpha\n---\nB.\n',
+      '.agents/skills/beta/SKILL.md': '---\nname: beta\n---\nB.\n',
       '.agents/instructions/ok.md': '---\nscope: "src/**"\n---\nfine\n',
     });
     try {
@@ -205,7 +266,7 @@ describe('parseRepo \u2014 aggregated parse errors (#36)', () => {
   it('throws the single ParseError unchanged when only one file fails', () =>
     assertParseError(
       {
-        '.agents/skills/alpha/SKILL.md': '---\nname: alpha\ndescription: bad #1 here\n---\nB.\n',
+        '.agents/skills/alpha/SKILL.md': '---\nname: alpha\n---\nB.\n',
         '.agents/skills/beta/SKILL.md': '---\nname: beta\ndescription: fine\n---\nB.\n',
       },
       /alpha\/SKILL\.md/,
