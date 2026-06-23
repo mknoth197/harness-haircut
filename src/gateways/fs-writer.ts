@@ -10,6 +10,12 @@
  * and the writes. OS errors are converted to `FileSystemError` before they
  * cross the layer boundary (architecture rules); a directory at a read path,
  * like a missing file, reads as `null`.
+ *
+ * `write`/`remove` additionally refuse any path that is a git submodule root
+ * (declared in the repo-root `.gitmodules`) or falls beneath one — a submodule
+ * is a separate repository with its own canonical config, so the parent's
+ * projection must never land a file inside it. This is defense-in-depth behind
+ * the snapshot walk's submodule boundary.
  */
 import {
   readFileSync,
@@ -21,9 +27,10 @@ import {
   mkdirSync,
   rmSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { FileWriter } from '../entities/file-writer.js';
 import { FileSystemError } from '../entities/errors.js';
+import { parseGitmodules } from './filesystem.js';
 
 function toAbsolute(root: string, relPath: string): string {
   return join(root, ...relPath.split('/'));
@@ -215,6 +222,114 @@ function assertContained(realRoot: string, relPath: string): string {
   return toAbsolute(realRoot, relPath);
 }
 
+/**
+ * Loads the repo-root `.gitmodules` submodule working-tree paths (repo-relative
+ * POSIX), tolerating a missing/empty file. Synchronous to fit the writer's
+ * sync construction; uses the SAME parser the snapshot walk uses so the two
+ * cannot disagree about what counts as a submodule boundary.
+ */
+function loadSubmodulePathsSync(realRoot: string): readonly string[] {
+  let content: string;
+  try {
+    content = readFileSync(join(realRoot, '.gitmodules'), 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EISDIR') {
+      return [];
+    }
+    throw new FileSystemError(join(realRoot, '.gitmodules'), err);
+  }
+  return parseGitmodules(content);
+}
+
+/**
+ * Resolves where a write to `abs` would PHYSICALLY land, as a repo-relative
+ * POSIX path, collapsing BOTH `..` segments AND any symlink in the parent
+ * chain. Walks up to the deepest existing ancestor directory and realpaths it
+ * (the not-yet-created leaf segments are appended verbatim), so an in-repo
+ * symlink alias such as `alias/sub` (where `alias -> references`) resolves to
+ * its true location `references/sub`. Returns `null` when the landing escapes
+ * `realRoot` or no in-repo ancestor exists — both cases are left to
+ * `assertParentContained`, which produces the precise escape/alias message.
+ *
+ * This is what lets the submodule guard see the REAL destination: a lexical
+ * `resolve()` collapses `..` but NOT symlinks, so a write through a symlinked
+ * alias to a submodule would otherwise miss the boundary entirely (caught only
+ * incidentally by the #35 parent-containment check, with an unrelated message).
+ */
+function resolveDestRelPath(realRoot: string, abs: string): string | null {
+  let ancestor = dirname(abs);
+  for (;;) {
+    if (existsSync(ancestor)) {
+      let realAncestor: string;
+      try {
+        realAncestor = realpathSync(ancestor);
+      } catch {
+        return null;
+      }
+      const landing = realAncestor + abs.slice(ancestor.length);
+      if (landing !== realRoot && !landing.startsWith(realRoot + sep)) {
+        return null;
+      }
+      return relative(realRoot, landing).split(sep).join('/');
+    }
+    const parent = dirname(ancestor);
+    if (parent === ancestor) {
+      return null;
+    }
+    ancestor = parent;
+  }
+}
+
+/**
+ * SECURITY + submodule boundaries: refuse to write/remove a path that is a
+ * submodule root or falls beneath one. A submodule is a separate repository
+ * with its own canonical config, so the parent's projection must never land a
+ * file inside it. This is defense-in-depth alongside the snapshot's walk
+ * boundary: even if a path slips past collection (a future caller, a hand-built
+ * `EmittedFile`), nothing is ever written into a submodule tree.
+ *
+ * `realRelDest` is the destination's REALPATH-resolved repo-relative POSIX path
+ * (`resolveDestRelPath`) — `..` collapsed AND symlinks in the parent chain
+ * resolved. We MUST compare against this, not the raw POSIX `relPath` nor a
+ * merely lexical `resolve()`:
+ *   - a `..`-traversal such as `foo/../references/sub/X` is in-repo but a naive
+ *     string-prefix check on the raw text never matches `references/sub` (the
+ *     literal `..` is still present), while the OS collapses `..` at write time
+ *     and lands the file INSIDE the submodule;
+ *   - a write through an in-repo symlink ALIAS such as `alias/sub/X` (where
+ *     `alias -> references` and `references/sub` is a submodule) lexically
+ *     resolves to `alias/sub/X`, which a lexical check never matches either —
+ *     yet the OS follows the link and lands the file INSIDE the submodule.
+ * Resolving the realpath first makes the boundary check see the same location
+ * the write actually targets. When the destination cannot be realpath-resolved
+ * to an in-repo path (escape / no existing ancestor), `realRelDest` is `null`
+ * and the submodule check is skipped — `assertParentContained` refuses those
+ * with the precise escape/alias message. `relPath` is carried only for the
+ * error message (what the caller asked for).
+ */
+function assertNotUnderSubmodule(
+  realRoot: string,
+  realRelDest: string | null,
+  relPath: string,
+  submodulePaths: readonly string[],
+): void {
+  if (realRelDest === null) {
+    return;
+  }
+  for (const sub of submodulePaths) {
+    if (realRelDest === sub || realRelDest.startsWith(`${sub}/`)) {
+      throw new FileSystemError(
+        toAbsolute(realRoot, realRelDest),
+        new Error(
+          `refusing to write inside git submodule '${sub}': ${relPath} — a submodule is a ` +
+            'separate repository with its own canonical config; manage its files there.',
+        ),
+      );
+    }
+  }
+}
+
 /** Creates a `FileWriter` over the real filesystem rooted at `root`. */
 export function createFileWriter(root: string): FileWriter {
   // `root` is trusted; resolve it once so containment compares real paths
@@ -226,6 +341,10 @@ export function createFileWriter(root: string): FileWriter {
   } catch (err) {
     throw new FileSystemError(root, err);
   }
+  // Submodule roots are read once at construction (the writer outlives a single
+  // call). Reads/exists are unaffected — only the two MUTATORS are guarded, so
+  // verify-reads still work, but no write/remove can land inside a submodule.
+  const submodulePaths = loadSubmodulePathsSync(realRoot);
   return {
     read(relPath: string): string | null {
       const abs = toAbsolute(realRoot, relPath);
@@ -265,6 +384,12 @@ export function createFileWriter(root: string): FileWriter {
       // SECURITY: lexical containment first — reject `..`/absolute escapes
       // before any filesystem access (throws FileSystemError).
       const abs = assertContained(realRoot, relPath);
+      // Submodule boundary: refuse to write a submodule root or anything under
+      // one (defense-in-depth — nothing is ever written into a separate repo).
+      // Check against the REALPATH-resolved destination so both a `..`-traversal
+      // AND an in-repo symlink alias the OS would collapse/follow INTO a
+      // submodule are caught (assertContained already proved it stays in-repo).
+      assertNotUnderSubmodule(realRoot, resolveDestRelPath(realRoot, abs), relPath, submodulePaths);
       // SECURITY: then realpath the deepest existing ancestor and require it is
       // inside realRoot BEFORE mkdir, so we never create directories or write
       // through an escaping symlinked parent (the symlinked-parent-dir bypass).
@@ -290,6 +415,10 @@ export function createFileWriter(root: string): FileWriter {
       // the LINK (never its target); `force` makes a missing file a no-op so
       // callers need not pre-check existence.
       const abs = assertContained(realRoot, relPath);
+      // Submodule boundary: never remove a submodule root or a path under one.
+      // Realpath-resolved destination (see write) so neither a `..`-traversal
+      // nor an in-repo symlink alias can slip past.
+      assertNotUnderSubmodule(realRoot, resolveDestRelPath(realRoot, abs), relPath, submodulePaths);
       assertParentContained(realRoot, abs);
       try {
         rmSync(abs, { force: true });

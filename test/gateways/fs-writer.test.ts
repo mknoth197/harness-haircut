@@ -243,6 +243,147 @@ describe('createFileWriter()', () => {
     assert.equal(await readFile(externalFile, 'utf8'), 'EXTERNAL\n');
     await rm(outside, { recursive: true, force: true });
   });
+
+  // Submodule boundaries (CRITICAL), defense-in-depth: even if a path slips
+  // past the snapshot walk's submodule boundary (a hand-built EmittedFile, a
+  // future caller), the writer must NEVER land a file inside a submodule tree.
+  // The dogfood bug: `apply` wrote references/sdlc-next/CLAUDE.md INSIDE the
+  // pinned submodule. `.gitmodules` is read once at construction.
+  it('refuses to write a file under a declared submodule root (submodule content untouched)', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "references/sdlc-next"]\n\tpath = references/sdlc-next\n',
+      'references/sdlc-next/AGENTS.md': '# submodule canonical\n',
+    });
+    const writer = createFileWriter(repo.root);
+    assert.throws(
+      () => writer.write('references/sdlc-next/CLAUDE.md', '@AGENTS.md\n'),
+      /submodule/,
+    );
+    // Nothing was written inside the submodule, and its own files are intact.
+    assert.equal(existsSync(join(repo.root, 'references', 'sdlc-next', 'CLAUDE.md')), false);
+    assert.equal(
+      await readFile(join(repo.root, 'references', 'sdlc-next', 'AGENTS.md'), 'utf8'),
+      '# submodule canonical\n',
+    );
+  });
+
+  it('refuses to write the submodule root path itself', async () => {
+    const repo = await freshRepo({ '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n' });
+    const writer = createFileWriter(repo.root);
+    assert.throws(() => writer.write('sub/s', 'x\n'), /submodule/);
+  });
+
+  // Regression for the `..`-traversal bypass: a path like
+  // `foo/../references/sdlc-next/CLAUDE.md` is in-repo (assertContained passes)
+  // and the OS collapses `..` AT WRITE TIME so the file lands INSIDE the
+  // submodule — but the boundary check used to compare the raw POSIX string,
+  // where the literal `..` never matched the submodule prefix, so the write
+  // slipped through. The guard must compare the RESOLVED destination.
+  it('refuses to write under a submodule via a `..`-traversal path (resolved, not lexical)', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "references/sdlc-next"]\n\tpath = references/sdlc-next\n',
+      'references/sdlc-next/AGENTS.md': '# submodule canonical\n',
+    });
+    const writer = createFileWriter(repo.root);
+    assert.throws(
+      () => writer.write('foo/../references/sdlc-next/CLAUDE.md', '@AGENTS.md\n'),
+      /submodule/,
+    );
+    // Deeper traversal that resolves to the same in-submodule location.
+    assert.throws(
+      () => writer.write('a/x/../../references/sdlc-next/EVIL.md', 'evil\n'),
+      /submodule/,
+    );
+    // Nothing landed inside the submodule, and its own files are intact.
+    assert.equal(existsSync(join(repo.root, 'references', 'sdlc-next', 'CLAUDE.md')), false);
+    assert.equal(existsSync(join(repo.root, 'references', 'sdlc-next', 'EVIL.md')), false);
+    assert.equal(
+      await readFile(join(repo.root, 'references', 'sdlc-next', 'AGENTS.md'), 'utf8'),
+      '# submodule canonical\n',
+    );
+  });
+
+  // REGRESSION (#3 realpath, not lexical): a write through an in-repo symlink
+  // ALIAS — `alias -> references`, `references/sdlc-next` a submodule — lands
+  // PHYSICALLY inside the submodule, but the old guard compared a merely lexical
+  // `resolve()` (which collapses `..` but NOT symlinks), so `alias/sdlc-next/X`
+  // never matched the `references/sdlc-next` prefix. It was only incidentally
+  // blocked by the #35 parent-containment check, with an unrelated message. The
+  // guard now realpaths the parent chain, so an aliased submodule write is
+  // refused with the clear SUBMODULE message.
+  it('refuses to write under a submodule via an in-repo symlink ALIAS (realpath, not lexical)', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "references/sdlc-next"]\n\tpath = references/sdlc-next\n',
+      'references/sdlc-next/AGENTS.md': '# submodule canonical\n',
+    });
+    // `alias` is an in-repo symlink to the real `references` directory, so
+    // `alias/sdlc-next` resolves to the submodule `references/sdlc-next`.
+    await symlink('references', join(repo.root, 'alias'));
+    const writer = createFileWriter(repo.root);
+    assert.throws(
+      () => writer.write('alias/sdlc-next/CLAUDE.md', '@AGENTS.md\n'),
+      /submodule/,
+    );
+    assert.throws(
+      () => writer.remove('alias/sdlc-next/AGENTS.md'),
+      /submodule/,
+    );
+    // Nothing landed inside the submodule and its own file is intact.
+    assert.equal(existsSync(join(repo.root, 'references', 'sdlc-next', 'CLAUDE.md')), false);
+    assert.equal(
+      await readFile(join(repo.root, 'references', 'sdlc-next', 'AGENTS.md'), 'utf8'),
+      '# submodule canonical\n',
+    );
+  });
+
+  it('refuses to remove under a submodule via a `..`-traversal path', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n',
+      'sub/s/SKILL.md': 'submodule file\n',
+    });
+    const writer = createFileWriter(repo.root);
+    assert.throws(() => writer.remove('sub/q/../s/SKILL.md'), /submodule/);
+    assert.equal(existsSync(join(repo.root, 'sub', 's', 'SKILL.md')), true);
+  });
+
+  // The fix must not over-block: a `..`-traversal that resolves to a NON-submodule
+  // path (sub/server, prefix-shares with submodule sub/s) still writes fine.
+  it('still writes a `..`-traversal path that resolves OUTSIDE any submodule', async () => {
+    const repo = await freshRepo({ '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n' });
+    const writer = createFileWriter(repo.root);
+    writer.write('sub/tmp/../server/AGENTS.md', '# not a submodule\n');
+    assert.equal(writer.read('sub/server/AGENTS.md'), '# not a submodule\n');
+  });
+
+  it('refuses to remove a path under a declared submodule root', async () => {
+    const repo = await freshRepo({
+      '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n',
+      'sub/s/SKILL.md': 'submodule file\n',
+    });
+    const writer = createFileWriter(repo.root);
+    assert.throws(() => writer.remove('sub/s/SKILL.md'), /submodule/);
+    // The submodule file was NOT deleted.
+    assert.equal(existsSync(join(repo.root, 'sub', 's', 'SKILL.md')), true);
+  });
+
+  it('still writes a sibling path that is NOT under any submodule', async () => {
+    // A directory whose name merely shares a PREFIX with the submodule path
+    // (sub/server vs submodule sub/s) must not be falsely blocked.
+    const repo = await freshRepo({ '.gitmodules': '[submodule "s"]\n\tpath = sub/s\n' });
+    const writer = createFileWriter(repo.root);
+    writer.write('sub/server/AGENTS.md', '# not a submodule\n');
+    assert.equal(writer.read('sub/server/AGENTS.md'), '# not a submodule\n');
+    // And the parent's own canonical write still works.
+    writer.write('.github/instructions/hh.foo.instructions.md', 'body\n');
+    assert.equal(writer.read('.github/instructions/hh.foo.instructions.md'), 'body\n');
+  });
+
+  it('writes normally when the repo has no .gitmodules (no regression)', async () => {
+    const repo = await freshRepo();
+    const writer = createFileWriter(repo.root);
+    writer.write('references/sdlc-next/CLAUDE.md', '@AGENTS.md\n');
+    assert.equal(writer.read('references/sdlc-next/CLAUDE.md'), '@AGENTS.md\n');
+  });
 });
 
 describe('createSymlinkAliasProbe()', () => {
